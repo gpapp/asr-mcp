@@ -1,0 +1,63 @@
+{
+  "diarization": {
+    "default_threshold": 0.35,
+    "max_clusters": 15,
+    "merge_threshold": 0.25,
+    "close_match_threshold": 0.17,
+    "min_segment_duration": 0.5
+  },
+  "matching": {
+    "accept_threshold": 0.35,
+    "clear_winner_gap": 0.02,
+    "embed_only_threshold": 0.16,
+    "confidence_threshold": 0.3,
+    "embed_only_accept_threshold": 0.22
+  },
+  "weights": {
+    "embedding": 0.6,
+    "pitch": 0.15,
+    "energy": 0.0,
+    "spectral": 0.1,
+    "mfcc": 0.1
+  },
+  "normalization": {
+    "pitch_hz_per_unit": 50,
+    "energy_rms_per_unit": 0.05,
+    "spectral_centroid_per_unit": 500,
+    "spectral_rolloff_per_unit": 1000,
+    "mfcc0_mean_per_unit": 10,
+    "mfcc0_std_per_unit": 5,
+    "mfcc1_mean_per_unit": 8,
+    "mfcc1_std_per_unit": 4,
+    "mfcc2_mean_per_unit": 6,
+    "mfcc2_std_per_unit": 3,
+    "mfcc3_mean_per_unit": 5,
+    "mfcc3_std_per_unit": 3,
+    "mfcc4_mean_per_unit": 5,
+    "mfcc4_std_per_unit": 3,
+    "mfcc5_mean_per_unit": 5,
+    "mfcc5_std_per_unit": 3,
+    "mfcc6_mean_per_unit": 5,
+    "mfcc6_std_per_unit": 3,
+    "mfcc7_mean_per_unit": 5,
+    "mfcc7_std_per_unit": 3,
+    "mfcc8_mean_per_unit": 5,
+    "mfcc8_std_per_unit": 3,
+    "mfcc9_mean_per_unit": 5,
+    "mfcc9_std_per_unit": 3,
+    "mfcc10_mean_per_unit": 5,
+    "mfcc10_std_per_unit": 3,
+    "mfcc11_mean_per_unit": 5,
+    "mfcc11_std_per_unit": 3,
+    "mfcc12_mean_per_unit": 5,
+    "mfcc12_std_per_unit": 3,
+    "confidence_max_distance": 0.5
+  },
+  "vad": {
+    "default_threshold": 0.5,
+    "min_speech_duration_ms": 250,
+    "chunk_duration": 30,
+    "overlap": 5
+  },
+  "debug": false
+}

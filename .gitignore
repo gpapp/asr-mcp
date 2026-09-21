@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+build/
+
+# Virtual environment
+.venv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project data (local only)
+data/
+logs/
+models/
+voices/

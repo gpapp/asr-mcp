@@ -1,0 +1,42 @@
+# Web framework
+fastapi
+uvicorn[standard]
+fastmcp
+python-multipart
+
+# Configuration
+pydantic
+pydantic-settings
+python-dotenv
+pyyaml
+
+# HTTP
+httpx
+aiohttp
+
+# ML/Audio
+numpy
+torch
+torchaudio
+soundfile
+librosa
+scikit-learn
+
+# ONNX Runtime (GPU — CUDA 12)
+onnxruntime-gpu>=1.22.0
+
+# Tokenizer & model download
+tokenizers
+huggingface-hub
+
+# Database
+sqlalchemy
+
+# Logging
+structlog
+
+# Rate limiting
+slowapi
+
+# CLI
+tqdm
