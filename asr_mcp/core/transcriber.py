@@ -10,6 +10,7 @@ from typing import Optional
 
 import numpy as np
 import librosa
+from scipy.signal import spectrogram
 
 from asr_mcp.core.model_state import state
 
