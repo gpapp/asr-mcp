@@ -152,7 +152,9 @@ def is_clear_winner(matches: List[Tuple], voiceprints: Dict, cfg: Dict = None) -
 
     best = matches[0][1]
     second = matches[1][1]
-    return (second - best) > gap_threshold
+    best_val = best["total"] if isinstance(best, dict) else best
+    second_val = second["total"] if isinstance(second, dict) else second
+    return (second_val - best_val) > gap_threshold
 
 
 def match_clusters(
