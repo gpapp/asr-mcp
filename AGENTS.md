@@ -43,6 +43,44 @@ After completing any code changes:
 - **Silero VAD**: ONNX Runtime CPU — with state/sr inputs, h/c hidden state updates
 - Peak VRAM: ~2.6GB
 
+### Transcription Chunking (Long Audio)
+
+Long diarized segments (>30s) are split at **VAD energy-dip boundaries** before encoding, never at arbitrary time points. This prevents cutting mid-word.
+
+**Router-level splitting** (`asr_router.py`):
+1. Each diarized segment is extracted from the full audio
+2. If segment > 30s: `split_at_energy_dips()` finds natural pause boundaries (dip_ratio=0.35, min_dip_dur=0.3s)
+3. Sub-segments are accumulated into a buffer up to 30s
+4. **Buffer flushes at >0.5s pauses**: if gap between consecutive sub-segments > 0.5s, the buffer is flushed and a new chunk starts — this preserves speaker-change boundaries within diarized segments
+5. Each buffer is concatenated and sent to `transcribe_audio_sync()`
+
+**Encoder-level chunking** (`transcriber.py`) — safety fallback if router chunking is bypassed:
+- Mel spectrogram is split into overlapping windows (MAX_ENCODER_SEC=30s, 25% overlap)
+- Each window is encoded independently
+- Encoder outputs are concatenated along sequence dimension
+- Overlap is trimmed from non-first chunks to avoid duplication
+
+**Decoder interface**: The decoder ONNX model requires `encoder_hidden_states` as a direct input (not just KV caches). `_parse_encoder_outputs()` extracts the hidden states tensor from encoder output and passes it through. Cross-attention KV caches (8 layers × key/value) are initialized as empty (seq_len=0).
+
+### Diarization Pipeline (13 steps)
+
+```
+1. VAD (Silero ONNX) → speech regions
+1b. Merge nearby speech (<1s silence gap)
+2. Energy-dip splitting (dip_ratio=0.35, min_dip_dur=0.5s, min_split_piece=2.0s)
+3. Sliding windows (3.0s window, 2.5s stride) → fbank features
+4. ECAPA-TDNN512 embedding per window (192-dim, ONNX CUDA)
+5. AgglomerativeClustering (distance_threshold=0.50, cosine, average linkage)
+6. Greedy merge clusters (merge_threshold=0.25)
+7. Map labels → segments ("Speaker 1", "Speaker 2", ...)
+8. Collapse same-speaker (max_gap=0.5s) + absorb islands
+9. Boundary refinement (re-embed boundary frames)
+10. Speaker profiling (pitch, energy, MFCC)
+11. Relabel by pitch (highest = Speaker 1)
+12. Ghost elimination (total_dur < 5s → absorb to nearest neighbor)
+13. Known-speaker matching (multi-feature: 60% embedding + 15% pitch + 10% spectral + 10% MFCC)
+```
+
 ### Audio Format Support
 - Input: mp3, mp4, mkv, flac, ogg, m4a, wav, webm, opus
 - Auto-converts to WAV PCM 16kHz mono via ffmpeg before processing
@@ -92,7 +130,7 @@ asr-mcp/
 │   │   └── handler.py         # WebSocket dual-channel real-time transcription
 │   ├── config/
 │   │   ├── settings.py        # Pydantic BaseSettings (TRANSCRIBE_ prefix)
-│   │   ├── logging.py         # Structured logging (structlog)
+│   │   ├── logging.py         # Structured logging (stdlib)
 │   │   └── thresholds.json    # All tunable diarization/matching/VAD params
 │   ├── static/
 │   └── templates/
