@@ -12,7 +12,9 @@ RUN python3 -m pip install --no-cache-dir \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cu121 \
+    -r requirements.txt
 
 COPY asr_mcp ./asr_mcp
 
