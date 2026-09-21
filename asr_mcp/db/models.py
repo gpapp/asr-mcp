@@ -20,6 +20,7 @@ class Base(DeclarativeBase):
 class VoiceprintModel(Base):
     __tablename__ = "voiceprints"
 
+    user_id = Column(String(255), primary_key=True, default="default")
     name = Column(String(255), primary_key=True)
     embedding = Column(LargeBinary, nullable=False)
     mfcc = Column(LargeBinary, nullable=True)
@@ -51,6 +52,20 @@ class TranscriptModel(Base):
     session_id = Column(String(255), nullable=True)
     audio_filename = Column(String(512), nullable=False)
     result = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class SnippetModel(Base):
+    __tablename__ = "snippets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(255), nullable=False, default="default", index=True)
+    speaker_name = Column(String(255), nullable=False, index=True)
+    file_path = Column(String(1024), nullable=False)
+    duration_sec = Column(Float, default=0.0)
+    source_audio = Column(String(1024), nullable=True)
+    start_sec = Column(Float, nullable=True)
+    end_sec = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 

@@ -15,6 +15,7 @@ services:
       - TRANSCRIBE_PORT=8080
       - TRANSCRIBE_DATA_DIR=/app/data
       - TRANSCRIBE_LOG_DIR=/app/logs
+      - TRANSCRIBE_VOICES_DIR=/app/voices
       - TRANSCRIBE_MODEL_CACHE_DIR=/app/models
       - TRANSCRIBE_DB_PATH=/app/data/asr_mcp.db
       - TRANSCRIBE_HTPASSWD_PATH=/app/htpasswd
@@ -22,6 +23,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./models:/app/models
+      - ./voices:/app/voices
     deploy:
       resources:
         reservations:
@@ -29,16 +31,4 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    restart: unless-stopped
-
-  nginx:
-    image: nginx:alpine
-    container_name: asr-mcp-nginx
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./htpasswd:/app/htpasswd:ro
-    depends_on:
-      - asr-mcp
     restart: unless-stopped

@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
     app.state.speaker_service = SpeakerService(settings.data_dir, db_manager)
     app.state.session_manager = SessionManager(db_manager)
     app.state.voiceprint_service = VoiceprintService(settings.data_dir, db_manager)
+    app.state.voiceprint_service.set_voices_dir(settings.voices_dir)
 
     # Initialize thread pool
     ms.executor = ThreadPoolExecutor(max_workers=2)

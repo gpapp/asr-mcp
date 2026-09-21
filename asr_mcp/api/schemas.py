@@ -93,6 +93,52 @@ class SpeakerListResponse(BaseModel):
     count: int
 
 
+class SpeakerRenameRequest(BaseModel):
+    new_name: str
+
+
+class SpeakerMergeRequest(BaseModel):
+    primary: str
+    secondary: str
+
+
+class SpeakerSnippetInfo(BaseModel):
+    id: int
+    speaker_name: str
+    file_path: str
+    duration_sec: float
+    source_audio: Optional[str] = None
+    start_sec: Optional[float] = None
+    end_sec: Optional[float] = None
+    created_at: Optional[str] = None
+
+
+class VoiceprintSpeakerInfo(BaseModel):
+    name: str
+    snippet_count: int = 0
+    total_duration_sec: float = 0.0
+    has_voiceprint: bool = False
+    pitch_hz: float = 0.0
+    energy_rms: float = 0.0
+
+
+class VoiceprintSpeakerListResponse(BaseModel):
+    speakers: list[VoiceprintSpeakerInfo]
+    count: int
+
+
+class VoiceprintSnippetListResponse(BaseModel):
+    speaker_name: str
+    snippets: list[SpeakerSnippetInfo]
+    count: int
+
+
+class RescanResponse(BaseModel):
+    scanned: int = 0
+    added: int = 0
+    speakers: list[str] = []
+
+
 class HealthResponse(BaseModel):
     status: str
     model_status: str

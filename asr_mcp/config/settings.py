@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("./data")
     log_dir: Path = Path("./logs")
     model_cache_dir: Path = Path("./models")
+    voices_dir: Path = Path("./voices")
     db_path: str = ""
 
     # Diarization defaults
@@ -79,7 +80,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "data_dir", "log_dir", "model_dir", "embedding_model_dir",
-        "vad_model_dir", "model_cache_dir", mode="before"
+        "vad_model_dir", "model_cache_dir", "voices_dir", mode="before"
     )
     @classmethod
     def ensure_paths(cls, v):
@@ -97,6 +98,7 @@ class Settings(BaseSettings):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.model_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.voices_dir.mkdir(parents=True, exist_ok=True)
 
 
 _settings: Optional[Settings] = None

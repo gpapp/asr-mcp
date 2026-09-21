@@ -1,3 +1,4 @@
+import hashlib
 import logging
 from pathlib import Path
 from typing import Optional
@@ -7,6 +8,8 @@ from fastapi import Depends, Header, HTTPException
 from asr_mcp.config.settings import Settings, get_settings
 
 logger = logging.getLogger("asr_mcp.api.security")
+
+DEFAULT_USER = "default"
 
 
 async def verify_api_key(
@@ -18,6 +21,18 @@ async def verify_api_key(
     if not x_api_key or x_api_key not in settings.api_key_set:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return x_api_key
+
+
+async def get_current_user(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    settings: Settings = Depends(get_settings),
+) -> str:
+    if not settings.api_keys:
+        return DEFAULT_USER
+    if not x_api_key or x_api_key not in settings.api_key_set:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    h = hashlib.sha256(x_api_key.encode()).hexdigest()[:16]
+    return f"user_{h}"
 
 
 def validate_path_security(path: str, settings: Settings) -> Path:

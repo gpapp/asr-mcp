@@ -9,7 +9,7 @@ from asr_mcp.api.schemas import (
     DiarizeRequest, DiarizeResponse, DiarizeResult,
     TranscribeResponse, TranscribeResult,
 )
-from asr_mcp.api.security import verify_api_key
+from asr_mcp.api.security import verify_api_key, get_current_user
 from asr_mcp.config.settings import Settings, get_settings
 
 logger = logging.getLogger("asr_mcp.api.asr_router")
@@ -20,6 +20,7 @@ router = APIRouter(prefix="/asr", tags=["ASR"])
 async def diarize_endpoint(
     req: DiarizeRequest,
     settings: Settings = Depends(get_settings),
+    user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
 ):
     from asr_mcp.core.model_state import state
@@ -37,12 +38,25 @@ async def diarize_endpoint(
     if "error" in result:
         return DiarizeResponse(segments=[], total_time_sec=0, error=result["error"])
 
-    segments = [
-        DiarizeResult(start=s["start"], end=s["end"], speaker=s["speaker"])
-        for s in result.get("segments", [])
-    ]
+    segments = result.get("segments", [])
+
+    try:
+        from asr_mcp.db.manager import DatabaseManager
+        from asr_mcp.voiceprint.service import VoiceprintService
+        db = DatabaseManager(settings.db_path)
+        vp_service = VoiceprintService(settings.data_dir, db)
+        vp_service.set_voices_dir(settings.voices_dir)
+        vp_service.set_embedding_session(state.embedding_session)
+        collected = vp_service.auto_collect_from_diarization(
+            audio_path=req.wav_path, segments=segments, user_id=user_id,
+        )
+        if collected:
+            logger.info("Auto-collected %d snippets for user %s", len(collected), user_id)
+    except Exception as e:
+        logger.warning("Auto-collect failed: %s", e)
+
     return DiarizeResponse(
-        segments=segments,
+        segments=[DiarizeResult(start=s["start"], end=s["end"], speaker=s["speaker"]) for s in segments],
         total_time_sec=result.get("total_time_sec", 0),
         total_speakers=result.get("total_speakers", 0),
         audio_duration_sec=result.get("audio_duration_sec", 0),
