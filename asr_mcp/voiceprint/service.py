@@ -13,7 +13,7 @@ from asr_mcp.db.manager import DatabaseManager, SnippetDB, VoiceprintDB, DEFAULT
 from asr_mcp.speaker.embedding import (
     extract_embedding, batch_embed_files, compute_pitch, compute_energy,
 )
-from asr_mcp.voiceprint.utils import load_audio, load_audio_segment
+from asr_mcp.voiceprint.utils import load_audio, load_audio_segment, generate_segment_hash, format_time_short
 
 logger = logging.getLogger("asr_mcp.voiceprint.service")
 
@@ -68,8 +68,14 @@ class VoiceprintService:
         if duration < MIN_SNIPPET_DURATION:
             return {"error": f"Snippet too short ({duration:.1f}s < {MIN_SNIPPET_DURATION}s)"}
 
-        audio_hash = hashlib.md5(audio_data.tobytes()).hexdigest()[:12]
-        filename = f"{int(time.time())}_{audio_hash}.flac"
+        if source_audio:
+            audio_hash = generate_segment_hash(source_audio)
+            time_part = format_time_short(start_sec) if start_sec is not None else "00-00"
+            dur_part = f"{duration:02.0f}"
+            filename = f"{audio_hash}_{time_part}_{dur_part}.flac"
+        else:
+            audio_hash = hashlib.md5(audio_data.tobytes()).hexdigest()[:6].upper()
+            filename = f"{audio_hash}_manual.flac"
         file_path = speaker_dir / filename
 
         sf.write(str(file_path), audio_data.astype(np.float32), sample_rate, format="FLAC")

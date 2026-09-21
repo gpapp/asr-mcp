@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import subprocess
 import tempfile
@@ -11,6 +12,25 @@ import torch
 logger = logging.getLogger("asr_mcp.voiceprint.utils")
 
 SAMPLE_RATE = 16000
+
+
+def generate_segment_hash(audio_path: str) -> str:
+    """Generate a short 6-char alphanumeric hash from audio filename (stable across runs)."""
+    key = Path(audio_path).stem
+    hash_int = int(hashlib.md5(key.encode()).hexdigest(), 16)
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    result = []
+    for _ in range(6):
+        hash_int, idx = divmod(hash_int, 32)
+        result.append(chars[idx])
+    return "".join(result)
+
+
+def format_time_short(seconds: float) -> str:
+    """Format seconds as MM-SS."""
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins:02d}-{secs:02d}"
 
 
 def load_audio(wav_path: str, target_sr: int = SAMPLE_RATE) -> tuple[torch.Tensor, int]:

@@ -16,6 +16,21 @@ logger = logging.getLogger("asr_mcp.api.asr_router")
 router = APIRouter(prefix="/asr", tags=["ASR"])
 
 
+def _load_known_speakers(settings, user_id: str) -> dict:
+    """Load all stored voiceprints from DB for speaker matching."""
+    try:
+        from asr_mcp.db.manager import DatabaseManager, VoiceprintDB
+        db = DatabaseManager(settings.db_path)
+        vp_db = VoiceprintDB(db)
+        all_vps = vp_db.list_all(user_id=user_id)
+        if all_vps:
+            logger.info("Loaded %d known voiceprints for user %s", len(all_vps), user_id)
+        return all_vps
+    except Exception as e:
+        logger.warning("Failed to load known voiceprints: %s", e)
+        return {}
+
+
 @router.post("/diarize", response_model=DiarizeResponse)
 async def diarize_endpoint(
     req: DiarizeRequest,
@@ -28,12 +43,13 @@ async def diarize_endpoint(
 
     state.ensure_ready()
     diarizer = Diarizer(state, settings)
+    known_speakers = req.known_speakers or _load_known_speakers(settings, user_id)
     result = await diarizer.run(
         audio_path=req.wav_path,
         num_speakers=req.num_speakers,
         diarization_threshold=req.diarization_threshold,
         vad_threshold=req.vad_threshold,
-        known_speakers=req.known_speakers,
+        known_speakers=known_speakers,
     )
 
     if "error" in result:
@@ -89,9 +105,11 @@ async def diarize_upload(
     wav_path = convert_to_wav(str(tmp_path), tmp_dir)
     try:
         diarizer = Diarizer(state, settings)
+        known_speakers = _load_known_speakers(settings, user_id)
         result = await diarizer.run(
             audio_path=str(wav_path),
             num_speakers=num_speakers,
+            known_speakers=known_speakers or None,
         )
 
         segments = result.get("segments", [])
@@ -134,7 +152,11 @@ async def transcribe_endpoint(
         )
 
     diarizer = Diarizer(state, settings)
-    diarization = await diarizer.run(audio_path=req.wav_path, num_speakers=req.num_speakers)
+    known_speakers = req.known_speakers or _load_known_speakers(settings, "default")
+    diarization = await diarizer.run(
+        audio_path=req.wav_path, num_speakers=req.num_speakers,
+        known_speakers=known_speakers,
+    )
 
     waveform, sr = load_audio(req.wav_path)
     audio_np = waveform.numpy().squeeze().astype(np.float32)
@@ -195,7 +217,11 @@ async def transcribe_upload(
             return JSONResponse(status_code=503, content={"detail": "Models not loaded. CUDA GPU required."})
 
         diarizer = Diarizer(state, settings)
-        diarization = await diarizer.run(audio_path=str(wav_path), num_speakers=num_speakers)
+        known_speakers = _load_known_speakers(settings, user_id)
+        diarization = await diarizer.run(
+            audio_path=str(wav_path), num_speakers=num_speakers,
+            known_speakers=known_speakers or None,
+        )
 
         waveform, sr = load_audio(str(wav_path))
         audio_np = waveform.numpy().squeeze().astype(np.float32)

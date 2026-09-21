@@ -129,8 +129,9 @@ def transcribe_audio_sync(
         return {"text": "", "error": "No audio provided"}
 
     try:
+        encoder_input_name = state.encoder_session.get_inputs()[0].name
         encoder_outputs = state.encoder_session.run(
-            None, {"input": mel_spectrogram[np.newaxis]}
+            None, {encoder_input_name: mel_spectrogram[np.newaxis]}
         )
     except Exception as e:
         logger.error("Encoder inference failed: %s", e)
