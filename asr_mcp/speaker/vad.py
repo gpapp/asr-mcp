@@ -201,13 +201,28 @@ def run_vad_onnx(
     frame_size = 512
     min_speech_samples = int(min_speech_duration_ms / 1000 * sample_rate)
 
+    input_name = vad_session.get_inputs()[0].name
+    input_names = [inp.name for inp in vad_session.get_inputs()]
+
+    h = np.zeros((2, 1, 128), dtype=np.float32)
+    c = np.zeros((2, 1, 128), dtype=np.float32)
+    sr_np = np.array([sample_rate], dtype=np.int64)
+
     speech_probs = []
     for i in range(0, len(audio_np) - frame_size, frame_size):
         frame = audio_np[i:i + frame_size]
         if len(frame) < frame_size:
             frame = np.pad(frame, (0, frame_size - len(frame)))
-        input_name = vad_session.get_inputs()[0].name
-        prob = vad_session.run(None, {input_name: frame[np.newaxis].astype(np.float32)})[0]
+        feed = {input_name: frame[np.newaxis]}
+        if "state" in input_names:
+            feed["state"] = h
+        if "sr" in input_names:
+            feed["sr"] = sr_np
+        outputs = vad_session.run(None, feed)
+        prob = outputs[0]
+        if len(outputs) >= 3:
+            h = outputs[1]
+            c = outputs[2]
         speech_probs.append({
             "start": i,
             "end": i + frame_size,
