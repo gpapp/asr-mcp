@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project data (local only)
+data/
+logs/
+models/
+
+# ONNX cache
+openvino_model_cache/
+
+# Segment files
+segments_trained/
+segments/
+
+# Voiceprints (contain biometric data)
+voiceprints.json
+voiceprints_*.json
