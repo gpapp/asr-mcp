@@ -29,6 +29,8 @@ NUM_LAYERS = 8
 NUM_HEADS = 8
 HEAD_DIM = 128
 
+MAX_ENCODER_SEC = 30.0
+
 
 def _get_mel_filterbank() -> np.ndarray:
     global _mel_filterbank_cache
@@ -122,6 +124,7 @@ def clean_transcript(text: str) -> str:
 def _parse_encoder_outputs(encoder_outputs, encoder_session):
     enc_output_names = [o.name for o in encoder_session.get_outputs()]
     cross_kv = {}
+    hidden_states = None
 
     if len(encoder_outputs) == 2 and "cross" in str(enc_output_names).lower():
         cross_k = encoder_outputs[0]
@@ -136,19 +139,29 @@ def _parse_encoder_outputs(encoder_outputs, encoder_session):
             cross_kv[f"past_key_values.{i}.encoder.value"] = v
     else:
         for name, val in zip(enc_output_names, encoder_outputs):
-            if "encoder" in name.lower():
-                cross_kv[name] = val.astype(np.float32)
+            val = val.astype(np.float32)
+            if "encoder" in name.lower() and "key" not in name.lower() and "value" not in name.lower():
+                hidden_states = val
+            if "key" in name.lower() and "encoder" in name.lower():
+                cross_kv[name] = val
+            elif "value" in name.lower() and "encoder" in name.lower():
+                cross_kv[name] = val
+            else:
+                hidden_states = val
+
+    if hidden_states is None and not cross_kv:
+        hidden_states = encoder_outputs[0].astype(np.float32)
 
     if not cross_kv:
         for i in range(NUM_LAYERS):
             cross_kv[f"past_key_values.{i}.encoder.key"] = np.zeros(
-                (1, NUM_HEADS, 1, HEAD_DIM), dtype=np.float32
+                (1, NUM_HEADS, 0, HEAD_DIM), dtype=np.float32
             )
             cross_kv[f"past_key_values.{i}.encoder.value"] = np.zeros(
-                (1, NUM_HEADS, 1, HEAD_DIM), dtype=np.float32
+                (1, NUM_HEADS, 0, HEAD_DIM), dtype=np.float32
             )
 
-    return cross_kv
+    return hidden_states, cross_kv
 
 
 def _init_self_kv_cache():
@@ -163,7 +176,7 @@ def _init_self_kv_cache():
     return self_kv
 
 
-def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv, num_logits_to_keep=1):
+def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv, encoder_hidden_states=None, num_logits_to_keep=1):
     batch_size = input_ids.shape[0]
     seq_len = input_ids.shape[1]
 
@@ -172,6 +185,9 @@ def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_k
     inputs["attention_mask"] = np.ones((batch_size, seq_len), dtype=np.int64)
     inputs["position_ids"] = np.arange(position, position + seq_len, dtype=np.int64).reshape(1, -1)
     inputs["num_logits_to_keep"] = np.array(num_logits_to_keep, dtype=np.int64)
+
+    if encoder_hidden_states is not None:
+        inputs["encoder_hidden_states"] = encoder_hidden_states.astype(np.float32)
 
     inputs.update(cross_kv)
     inputs.update(self_kv)
@@ -204,16 +220,48 @@ def transcribe_audio_sync(
     if mel_spectrogram is None:
         return {"text": "", "error": "No audio provided"}
 
+    max_frames = int(MAX_ENCODER_SEC * (SAMPLE_RATE / HOP_LENGTH))
+
     try:
         encoder_input_name = state.encoder_session.get_inputs()[0].name
-        encoder_outputs = state.encoder_session.run(
-            None, {encoder_input_name: mel_spectrogram[np.newaxis]}
-        )
+        if mel_spectrogram.shape[0] <= max_frames:
+            encoder_outputs = state.encoder_session.run(
+                None, {encoder_input_name: mel_spectrogram[np.newaxis]}
+            )
+        else:
+            enc_output_names = [o.name for o in state.encoder_session.get_outputs()]
+            all_parts = {name: [] for name in enc_output_names}
+            overlap_frames = max_frames // 4
+            pos = 0
+
+            while pos < mel_spectrogram.shape[0]:
+                end = min(pos + max_frames, mel_spectrogram.shape[0])
+                chunk = mel_spectrogram[pos:end]
+                chunk_out = state.encoder_session.run(
+                    None, {encoder_input_name: chunk[np.newaxis]}
+                )
+                for name, val in zip(enc_output_names, chunk_out):
+                    arr = val.astype(np.float32)
+                    if arr.ndim >= 3 and pos > 0:
+                        trim = min(overlap_frames, arr.shape[-2])
+                        arr = arr[..., trim:, :]
+                    all_parts[name].append(arr)
+                pos = end - overlap_frames if end < mel_spectrogram.shape[0] else mel_spectrogram.shape[0]
+
+            encoder_outputs = []
+            for name in enc_output_names:
+                parts = all_parts[name]
+                arr = parts[0]
+                if arr.ndim >= 3 and arr.shape[-2] > 1:
+                    encoder_outputs.append(np.concatenate(parts, axis=-2))
+                else:
+                    encoder_outputs.append(parts[-1])
+            logger.info("Chunked encoder for %d mel frames", mel_spectrogram.shape[0])
     except Exception as e:
         logger.error("Encoder inference failed: %s", e)
         return {"text": "", "error": str(e)}
 
-    cross_kv = _parse_encoder_outputs(encoder_outputs, state.encoder_session)
+    encoder_hidden_states, cross_kv = _parse_encoder_outputs(encoder_outputs, state.encoder_session)
 
     if past_kv_cache_ort is not None:
         self_kv = past_kv_cache_ort.get("self_kv", _init_self_kv_cache())
@@ -222,6 +270,9 @@ def transcribe_audio_sync(
 
     dec_input_names = [inp.name for inp in state.decoder_session.get_inputs()]
     dec_output_names = [out.name for out in state.decoder_session.get_outputs()]
+
+    if "encoder_hidden_states" not in dec_input_names:
+        encoder_hidden_states = None
 
     if prefix_ids is not None:
         input_ids = np.array([prefix_ids], dtype=np.int64)
@@ -233,7 +284,10 @@ def transcribe_audio_sync(
     max_new = state.settings.max_new_tokens if state.settings else 448
 
     for step in range(max_new):
-        feed = _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv)
+        feed = _build_decoder_inputs(
+            dec_input_names, input_ids, position, cross_kv, self_kv,
+            encoder_hidden_states=encoder_hidden_states,
+        )
 
         try:
             outputs = state.decoder_session.run(None, feed)

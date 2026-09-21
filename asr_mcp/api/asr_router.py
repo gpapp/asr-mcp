@@ -11,6 +11,7 @@ from asr_mcp.api.schemas import (
 )
 from asr_mcp.api.security import verify_api_key, get_current_user
 from asr_mcp.config.settings import Settings, get_settings
+from asr_mcp.speaker.vad import split_at_energy_dips
 
 logger = logging.getLogger("asr_mcp.api.asr_router")
 router = APIRouter(prefix="/asr", tags=["ASR"])
@@ -182,9 +183,56 @@ async def transcribe_endpoint(
         chunk = audio_np[start_sample:end_sample]
         if len(chunk) < 1600:
             continue
-        result = transcribe_audio_sync(audio=chunk)
-        result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
-        results.append(TranscribeResult(**result))
+
+        max_samples = int(30.0 * 16000)
+        if len(chunk) > max_samples:
+            sub_segments = split_at_energy_dips(
+                [{"start": 0, "end": len(chunk)}],
+                chunk, sample_rate=16000,
+                min_segment_dur=5.0, dip_ratio=0.35, min_dip_dur=0.3,
+                min_split_piece=3.0,
+            )
+            buffer = []
+            buffer_dur = 0.0
+            for i, sub in enumerate(sub_segments):
+                sub_len = sub["end"] - sub["start"]
+                if buffer:
+                    prev_end = buffer[-1]["end"]
+                    gap = sub["start"] - prev_end
+                    if gap > int(0.5 * 16000) and buffer_dur > 0:
+                        buf_audio = np.concatenate([
+                            audio_np[start_sample + b["start"]:start_sample + b["end"]] for b in buffer
+                        ])
+                        if len(buf_audio) >= 1600:
+                            result = transcribe_audio_sync(audio=buf_audio)
+                            result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+                            results.append(TranscribeResult(**result))
+                        buffer = []
+                        buffer_dur = 0.0
+                if buffer_dur + sub_len > max_samples and buffer:
+                    buf_audio = np.concatenate([
+                        audio_np[start_sample + b["start"]:start_sample + b["end"]] for b in buffer
+                    ])
+                    if len(buf_audio) >= 1600:
+                        result = transcribe_audio_sync(audio=buf_audio)
+                        result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+                        results.append(TranscribeResult(**result))
+                    buffer = []
+                    buffer_dur = 0.0
+                buffer.append(sub)
+                buffer_dur += sub_len
+            if buffer:
+                buf_audio = np.concatenate([
+                    audio_np[start_sample + b["start"]:start_sample + b["end"]] for b in buffer
+                ])
+                if len(buf_audio) >= 1600:
+                    result = transcribe_audio_sync(audio=buf_audio)
+                    result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+                    results.append(TranscribeResult(**result))
+        else:
+            result = transcribe_audio_sync(audio=chunk)
+            result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+            results.append(TranscribeResult(**result))
 
     total_time = sum(r.inference_time_sec for r in results)
     return TranscribeResponse(results=results, total_time_sec=total_time)
@@ -261,9 +309,56 @@ async def transcribe_upload(
             chunk = audio_np[start_sample:end_sample]
             if len(chunk) < 1600:
                 continue
-            result = transcribe_audio_sync(audio=chunk)
-            result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
-            results.append(TranscribeResult(**result))
+
+            max_samples = int(30.0 * 16000)
+            if len(chunk) > max_samples:
+                sub_segments = split_at_energy_dips(
+                    [{"start": 0, "end": len(chunk)}],
+                    chunk, sample_rate=16000,
+                    min_segment_dur=5.0, dip_ratio=0.35, min_dip_dur=0.3,
+                    min_split_piece=3.0,
+                )
+                buffer = []
+                buffer_dur = 0.0
+                for i, sub in enumerate(sub_segments):
+                    sub_len = sub["end"] - sub["start"]
+                    if buffer:
+                        prev_end = buffer[-1]["end"]
+                        gap = sub["start"] - prev_end
+                        if gap > int(0.5 * 16000) and buffer_dur > 0:
+                            buf_audio = np.concatenate([
+                                audio_np[start_sample + b["start"]:start_sample + b["end"]] for b in buffer
+                            ])
+                            if len(buf_audio) >= 1600:
+                                result = transcribe_audio_sync(audio=buf_audio)
+                                result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+                                results.append(TranscribeResult(**result))
+                            buffer = []
+                            buffer_dur = 0.0
+                    if buffer_dur + sub_len > max_samples and buffer:
+                        buf_audio = np.concatenate([
+                            audio_np[start_sample + b["start"]:start_sample + b["end"]] for b in buffer
+                        ])
+                        if len(buf_audio) >= 1600:
+                            result = transcribe_audio_sync(audio=buf_audio)
+                            result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+                            results.append(TranscribeResult(**result))
+                        buffer = []
+                        buffer_dur = 0.0
+                    buffer.append(sub)
+                    buffer_dur += sub_len
+                if buffer:
+                    buf_audio = np.concatenate([
+                        audio_np[start_sample + b["start"]:start_sample + b["end"]] for b in buffer
+                    ])
+                    if len(buf_audio) >= 1600:
+                        result = transcribe_audio_sync(audio=buf_audio)
+                        result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+                        results.append(TranscribeResult(**result))
+            else:
+                result = transcribe_audio_sync(audio=chunk)
+                result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
+                results.append(TranscribeResult(**result))
 
         total_time = sum(r.inference_time_sec for r in results)
         return TranscribeResponse(results=results, total_time_sec=total_time)

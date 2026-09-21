@@ -51,7 +51,7 @@ def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
 def eliminate_ghost_speakers(
     segments: list,
     profiles: Optional[dict] = None,
-    ghost_threshold_sec: float = 10.0,
+    ghost_threshold_sec: float = 5.0,
 ) -> list:
     if not segments:
         return []

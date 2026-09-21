@@ -110,12 +110,16 @@ def match_known_speakers_full(
 ) -> Tuple[list[dict], dict]:
     from asr_mcp.speaker.matcher import match_clusters, merge_matched_clusters
 
+    unique_speakers = sorted(set(s.get("speaker", "") for s in merged_segments))
+
     clusters_data = {}
     for cluster_id, centroid in cluster_centroids.items():
+        label = f"Speaker {cluster_id + 1}"
+        profile = profiles.get(label, {})
         clusters_data[str(cluster_id)] = {
             "embedding": centroid.tolist(),
-            "pitch_hz": profiles.get(f"SPEAKER_{cluster_id:02d}", {}).get("pitch_hz", 0.0),
-            "energy_rms": profiles.get(f"SPEAKER_{cluster_id:02d}", {}).get("energy_rms", 0.0),
+            "pitch_hz": profile.get("pitch_hz", 0.0),
+            "energy_rms": profile.get("energy_rms", 0.0),
         }
 
     match_results = match_clusters(clusters_data, known_speakers, cfg)

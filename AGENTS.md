@@ -37,10 +37,10 @@ After completing any code changes:
 - `TRANSCRIBE_PREFIX` sets URL prefix for redirects behind reverse proxy
 
 ### GPU Backend
-- **ASR Encoder**: ONNX Runtime CUDA EP (float16)
-- **ASR Decoder**: ONNX Runtime CPU
-- **ECAPA-TDNN512 Embedding**: ONNX Runtime CUDA EP (192-dim)
-- **Silero VAD**: ONNX Runtime CPU
+- **ASR Encoder**: ONNX Runtime CUDA EP (float16) — chunked input for long audio (>30s)
+- **ASR Decoder**: ONNX Runtime CPU — receives `encoder_hidden_states` + KV caches (8 layers)
+- **ECAPA-TDNN512 Embedding**: ONNX Runtime CUDA EP (192-dim) — fbank chunking (60s max) + CPU OOM fallback
+- **Silero VAD**: ONNX Runtime CPU — with state/sr inputs, h/c hidden state updates
 - Peak VRAM: ~2.6GB
 
 ### Audio Format Support

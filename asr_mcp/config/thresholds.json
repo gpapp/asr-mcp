@@ -2,10 +2,12 @@
   "diarization": {
     "default_threshold": 0.35,
     "max_clusters": 15,
-    "distance_threshold": 0.55,
-    "merge_threshold": 0.45,
+    "distance_threshold": 0.50,
+    "merge_threshold": 0.25,
     "close_match_threshold": 0.17,
-    "min_segment_duration": 0.5
+    "min_segment_duration": 0.5,
+    "min_cluster_duration_sec": 3.0,
+    "min_cluster_coherence": 0.75
   },
   "matching": {
     "accept_threshold": 0.35,
