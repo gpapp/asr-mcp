@@ -148,11 +148,7 @@ async def delete_speaker(
     settings: Settings = Depends(get_settings),
 ):
     service = _get_service(settings)
-    snippets = service.list_snippets(speaker_name, user_id=user_id)
-    for sn in snippets:
-        service.delete_snippet(sn["id"], user_id=user_id)
-    deleted = service.delete_voiceprint(speaker_name, user_id=user_id)
-    return {"status": "deleted", "name": speaker_name, "snippets_removed": len(snippets)}
+    return service.delete_speaker_bulk(speaker_name, user_id=user_id)
 
 
 @router.post("/rescan", response_model=RescanResponse)

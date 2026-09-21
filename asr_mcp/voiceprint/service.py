@@ -161,6 +161,20 @@ class VoiceprintService:
         self._auto_refine(speaker_name, user_id=user_id)
         return {"status": "deleted", "speaker_removed": False}
 
+    def delete_speaker_bulk(self, speaker_name: str, user_id: str = DEFAULT_USER) -> dict:
+        """Delete a speaker, all snippets, and files without intermediate refine steps."""
+        snippets = self._snippets.list_by_speaker(speaker_name, user_id=user_id)
+        for sn in snippets:
+            file_path = Path(sn["file_path"])
+            if file_path.exists():
+                file_path.unlink()
+            self._snippets.delete(sn["id"], user_id=user_id)
+
+        self._db.delete(speaker_name, user_id=user_id)
+        self._cleanup_speaker_dir(speaker_name, user_id)
+
+        return {"status": "deleted", "name": speaker_name, "snippets_removed": len(snippets)}
+
     def rename_speaker(self, old_name: str, new_name: str, user_id: str = DEFAULT_USER) -> dict:
         existing_vp = self._db.get(new_name, user_id=user_id)
         if existing_vp:
