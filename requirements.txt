@@ -16,8 +16,7 @@ aiohttp
 
 # ML/Audio
 numpy
-torch
-torchaudio
+# torch + torchaudio are installed from CUDA index in Dockerfile
 soundfile
 librosa
 scikit-learn
