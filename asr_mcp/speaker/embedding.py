@@ -35,7 +35,9 @@ def extract_embedding(
     )[0]
 
     # Mean pool and L2 normalize
-    embedding = embedding.mean(axis=1)
+    if embedding.ndim == 3:
+        embedding = embedding.mean(axis=1)
+    embedding = embedding.reshape(1, -1) if embedding.ndim == 1 else embedding
     norm = np.linalg.norm(embedding, axis=1, keepdims=True)
     embedding = embedding / (norm + 1e-8)
 
@@ -82,7 +84,11 @@ def batch_embed_files(
                     [output_name], {input_name: fbank_np}
                 )[0]
 
-                emb_mean = embedding.mean(axis=1)
+                if embedding.ndim == 3:
+                    emb_mean = embedding.mean(axis=1)
+                else:
+                    emb_mean = embedding
+                emb_mean = emb_mean.reshape(1, -1) if emb_mean.ndim == 1 else emb_mean
                 norm = np.linalg.norm(emb_mean, axis=1, keepdims=True)
                 emb_mean = emb_mean / (norm + 1e-8)
 

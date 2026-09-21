@@ -117,7 +117,9 @@ class Diarizer:
                 emb = self._state.embedding_session.run(
                     [output_name], {input_name: fbank_feed}
                 )[0]
-                emb = emb.mean(axis=1)  # Mean pool
+                if emb.ndim == 3:
+                    emb = emb.mean(axis=1)  # Mean pool over frames
+                emb = emb.reshape(1, -1) if emb.ndim == 1 else emb
                 norm = np.linalg.norm(emb, axis=1, keepdims=True)
                 emb = emb / (norm + 1e-8)
                 emb = emb.squeeze().astype(np.float32)
