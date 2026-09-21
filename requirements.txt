@@ -39,6 +39,7 @@ slowapi
 
 # Auth
 bcrypt
+itsdangerous
 
 # CLI
 tqdm
