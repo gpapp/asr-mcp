@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
-from scipy.signal import spectrogram
+import librosa
 
 from asr_mcp.core.model_state import state
 
@@ -17,48 +17,54 @@ logger = logging.getLogger("asr_mcp.core.transcriber")
 
 _mel_filterbank_cache: Optional[np.ndarray] = None
 SAMPLE_RATE = 16000
-N_MELS = 80
+N_MELS = 128
 N_FFT = 512
+WIN_LENGTH = 400
 HOP_LENGTH = 160
+PREEMPHASIS = 0.97
+DITHER = 1e-5
 
 
 def _get_mel_filterbank() -> np.ndarray:
     global _mel_filterbank_cache
     if _mel_filterbank_cache is not None:
         return _mel_filterbank_cache
-    n_freqs = N_FFT // 2 + 1
-    f_max = SAMPLE_RATE / 2.0
-    f_bins = np.linspace(0, f_max, n_freqs)
-    mel_low = 2595.0 * np.log10(1.0 + 0.0 / 700.0)
-    mel_high = 2595.0 * np.log10(1.0 + f_max / 700.0)
-    mel_points = np.linspace(mel_low, mel_high, N_MELS + 2)
-    hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
-    filterbank = np.zeros((N_MELS, n_freqs), dtype=np.float32)
-    for i in range(N_MELS):
-        low = hz_points[i]
-        center = hz_points[i + 1]
-        high = hz_points[i + 2]
-        for j in range(n_freqs):
-            if low <= f_bins[j] <= center:
-                if center - low > 0:
-                    filterbank[i, j] = (f_bins[j] - low) / (center - low)
-            elif center < f_bins[j] <= high:
-                if high - center > 0:
-                    filterbank[i, j] = (high - f_bins[j]) / (high - center)
-    _mel_filterbank_cache = filterbank
-    return filterbank
+    _mel_filterbank_cache = librosa.filters.mel(
+        sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS,
+        fmin=0.0, fmax=SAMPLE_RATE / 2, norm="slaney",
+    ).astype(np.float32)
+    return _mel_filterbank_cache
+
+
+def _preemphasis(audio: np.ndarray, coeff: float = PREEMPHASIS) -> np.ndarray:
+    return np.concatenate([[audio[0]], audio[1:] - coeff * audio[:-1]])
 
 
 def _compute_mel_spectrogram_fast(audio: np.ndarray) -> np.ndarray:
+    if DITHER > 0:
+        rng = np.random.RandomState(abs(hash(audio.ctypes.data) % (2**31)))
+        audio = audio + rng.randn(len(audio)).astype(np.float32) * DITHER
+
+    audio = _preemphasis(audio)
+
+    win = np.hanning(WIN_LENGTH)
+
     f, t, Sxx = spectrogram(
-        audio, fs=SAMPLE_RATE, nperseg=N_FFT, noverlap=N_FFT - HOP_LENGTH,
-        nfft=N_FFT, window="hann", scaling="spectrum",
+        audio, fs=SAMPLE_RATE, nperseg=WIN_LENGTH,
+        noverlap=WIN_LENGTH - HOP_LENGTH, nfft=N_FFT,
+        window=win, scaling="spectrum",
     )
+
     Sxx = np.maximum(Sxx, 1e-10)
     mel_fb = _get_mel_filterbank()
     mel_spec = mel_fb @ Sxx
     log_mel = np.log(mel_spec + 1e-8).astype(np.float32)
-    return log_mel
+
+    mean = log_mel.mean(axis=1, keepdims=True)
+    std = log_mel.std(axis=1, keepdims=True) + 1e-5
+    log_mel = ((log_mel - mean) / std).astype(np.float32)
+
+    return log_mel.T
 
 
 @contextmanager
