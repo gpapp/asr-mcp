@@ -23,7 +23,7 @@ librosa
 scikit-learn
 
 # ONNX Runtime (GPU — CUDA 12)
-onnxruntime-gpu==1.24.1
+onnxruntime-gpu>=1.22.0
 
 # Tokenizer & model download
 tokenizers
