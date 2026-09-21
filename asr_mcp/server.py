@@ -173,10 +173,11 @@ async def login_page():
 
 @app.post("/api/auth/login")
 async def login_post(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...),
 ):
-    from asr_mcp.api.auth import verify_password
+    from asr_mcp.api.auth import verify_password, login_user
 
     users = app.state.htpasswd_users if hasattr(app.state, "htpasswd_users") else {}
     if not users:
@@ -186,6 +187,7 @@ async def login_post(
     if not stored or not verify_password(stored, password):
         return JSONResponse({"success": False, "error": "Invalid username or password"})
 
+    login_user(request, username)
     return JSONResponse({"success": True, "username": username, "redirect": _init_settings().prefix + "/gui"})
 
 

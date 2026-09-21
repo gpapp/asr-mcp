@@ -96,7 +96,10 @@ def get_session_user(request: Request) -> Optional[str]:
 
 def require_auth(request: Request) -> Optional[RedirectResponse]:
     """Check if request is authenticated. Returns RedirectResponse to /login if not."""
-    path = request.url.path
+    path = request.url.path or "/"
+    # Normalize double slashes
+    while "//" in path:
+        path = path.replace("//", "/")
 
     # Allow public paths
     if path in PUBLIC_PATHS:
