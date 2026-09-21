@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi.responses import FileResponse
 
 from asr_mcp.api.schemas import (
     SpeakerRenameRequest, SpeakerMergeRequest,
@@ -119,6 +120,25 @@ async def delete_snippet(
 ):
     service = _get_service(settings)
     return service.delete_snippet(snippet_id, user_id=user_id)
+
+
+@router.get("/snippets/{snippet_id}/audio")
+async def get_snippet_audio(
+    snippet_id: int,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    service = _get_service(settings)
+    sn = service._snippets.get(snippet_id, user_id=user_id)
+    if not sn:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Snippet not found")
+    file_path = Path(sn["file_path"])
+    if not file_path.exists():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    media_type = "audio/flac" if file_path.suffix == ".flac" else "audio/wav"
+    return FileResponse(str(file_path), media_type=media_type)
 
 
 @router.delete("/speakers/{speaker_name}")

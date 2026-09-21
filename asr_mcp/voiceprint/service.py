@@ -365,10 +365,14 @@ class VoiceprintService:
         if not waveforms:
             return
 
-        embeddings = batch_embed_files(
-            waveforms, [SAMPLE_RATE] * len(waveforms), durations,
-            self._embedding_session, block_sec=600.0,
-        )
+        embeddings = []
+        for waveform in waveforms:
+            try:
+                emb = extract_embedding(waveform, SAMPLE_RATE, self._embedding_session)
+                embeddings.append(emb)
+            except Exception as e:
+                logger.warning("Failed to embed snippet: %s", e)
+                embeddings.append(None)
 
         valid = [(e, d) for e, d in zip(embeddings, durations) if e is not None]
         if not valid:
