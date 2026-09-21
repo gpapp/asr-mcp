@@ -20,6 +20,7 @@ logger = logging.getLogger("asr_mcp.voiceprint.service")
 SAMPLE_RATE = 16000
 AUTO_COLLECT_MIN_DURATION = 1.5
 AUTO_COLLECT_MAX_TOTAL_SEC = 600.0
+AUTO_COLLECT_MAX_SEGMENT_SEC = 300.0
 MIN_SNIPPET_DURATION = 1.5
 
 
@@ -339,33 +340,38 @@ class VoiceprintService:
                 continue
 
             for seg in segs:
-                current_total = speaker_totals.get(speaker_name, 0.0)
-                if current_total >= AUTO_COLLECT_MAX_TOTAL_SEC:
-                    break
+                seg_start = seg["start"]
+                seg_end = seg["end"]
 
-                dur = seg["end"] - seg["start"]
+                while seg_start < seg_end and current_total < AUTO_COLLECT_MAX_TOTAL_SEC:
+                    chunk_end = min(seg_start + AUTO_COLLECT_MAX_SEGMENT_SEC, seg_end)
+                    dur = chunk_end - seg_start
 
-                existing = self._snippets.find_duplicate(audio_path, seg["start"], user_id=user_id)
-                if existing:
-                    if existing["duration_sec"] >= dur:
-                        continue
-                    old_path = Path(existing["file_path"])
-                    if old_path.exists():
-                        old_path.unlink()
-                    self._snippets.delete(existing["id"], user_id=user_id)
-                    current_total -= existing["duration_sec"]
+                    existing = self._snippets.find_duplicate(audio_path, seg_start, user_id=user_id)
+                    if existing:
+                        if existing["duration_sec"] >= dur:
+                            seg_start = chunk_end
+                            continue
+                        old_path = Path(existing["file_path"])
+                        if old_path.exists():
+                            old_path.unlink()
+                        self._snippets.delete(existing["id"], user_id=user_id)
+                        current_total -= existing["duration_sec"]
 
-                result = self.add_snippet_from_segment(
-                    speaker_name=speaker_name,
-                    wav_path=audio_path,
-                    start_sec=seg["start"],
-                    end_sec=seg["end"],
-                    user_id=user_id,
-                    source_audio=audio_path,
-                )
-                if "error" not in result:
-                    speaker_totals[speaker_name] = current_total + dur
-                    collected.append(result)
+                    result = self.add_snippet_from_segment(
+                        speaker_name=speaker_name,
+                        wav_path=audio_path,
+                        start_sec=seg_start,
+                        end_sec=chunk_end,
+                        user_id=user_id,
+                        source_audio=audio_path,
+                    )
+                    if "error" not in result:
+                        speaker_totals[speaker_name] = current_total + dur
+                        current_total += dur
+                        collected.append(result)
+
+                    seg_start = chunk_end
 
         for speaker_name in by_speaker:
             self._auto_refine(speaker_name, user_id=user_id)
