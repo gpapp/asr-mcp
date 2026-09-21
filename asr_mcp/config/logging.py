@@ -3,12 +3,6 @@ import sys
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
-try:
-    import structlog
-    HAS_STRUCTLOG = True
-except ImportError:
-    HAS_STRUCTLOG = False
-
 
 def setup_logging(log_dir: Path = Path("./logs"), debug: bool = False) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -24,31 +18,10 @@ def setup_logging(log_dir: Path = Path("./logs"), debug: bool = False) -> loggin
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
 
-    if HAS_STRUCTLOG:
-        structlog.configure(
-            processors=[
-                structlog.contextvars.merge_contextvars,
-                structlog.stdlib.filter_by_level,
-                structlog.stdlib.add_logger_name,
-                structlog.stdlib.add_log_level,
-                structlog.stdlib.PositionalArgumentsFormatter(),
-                structlog.processors.TimeStamper(fmt="iso"),
-                structlog.processors.StackInfoRenderer(),
-                structlog.processors.format_exc_info,
-                structlog.dev.ConsoleRenderer(),
-            ],
-            wrapper_class=structlog.stdlib.BoundLogger,
-            context_class=dict,
-            logger_factory=structlog.stdlib.LoggerFactory(),
-            cache_logger_on_first_use=True,
-        )
-        formatter = structlog.stdlib.ProcessorFormatter(
-            processor=structlog.dev.ConsoleRenderer(),
-        )
-    else:
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
