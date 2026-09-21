@@ -142,6 +142,101 @@
             setTimeout(() => t.className = 'toast', 4000);
         }
 
+        const SPEAKER_COLORS = [
+            '#007bff','#28a745','#dc3545','#fd7e14','#6f42c1',
+            '#20c997','#e83e8c','#17a2b8','#ffc658','#6610f2',
+            '#2d6a4f','#d63384','#0dcaf0','#198754','#cf222e',
+        ];
+
+        function getSpeakerColor(name, allSpeakers) {
+            const idx = allSpeakers.indexOf(name);
+            return SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
+        }
+
+        function formatTime(sec) {
+            const m = Math.floor(sec / 60);
+            const s = Math.floor(sec % 60);
+            const ms = Math.floor((sec % 1) * 100);
+            return m + ':' + String(s).padStart(2, '0') + '.' + String(ms).padStart(2, '0');
+        }
+
+        function renderTimeline(result, container) {
+            if (!result || !result.segments || !result.segments.length) return;
+
+            const segments = result.segments;
+            const audioDur = result.audio_duration_sec || (segments.length ? Math.max(...segments.map(s => s.end)) : 0);
+            if (audioDur <= 0) return;
+
+            const allSpeakers = [...new Set(segments.map(s => s.speaker))].sort();
+
+            const fileLabel = document.createElement('div');
+            fileLabel.className = 'file-label';
+            fileLabel.textContent = (result._fileName || 'Audio') + ' - ' + allSpeakers.length + ' speaker(s), ' + formatTime(audioDur);
+            container.appendChild(fileLabel);
+
+            const barContainer = document.createElement('div');
+            barContainer.className = 'bar-container';
+
+            for (const seg of segments) {
+                const left = (seg.start / audioDur * 100).toFixed(4);
+                const width = ((seg.end - seg.start) / audioDur * 100).toFixed(4);
+                const color = getSpeakerColor(seg.speaker, allSpeakers);
+                const div = document.createElement('div');
+                div.className = 'bar-seg';
+                div.style.left = left + '%';
+                div.style.width = width + '%';
+                div.style.background = color;
+                div.title = seg.speaker + '  ' + formatTime(seg.start) + ' - ' + formatTime(seg.end) + ' (' + (seg.end - seg.start).toFixed(1) + 's)';
+                if (parseFloat(width) > 3) div.textContent = seg.speaker.replace('Speaker ', 'S');
+                barContainer.appendChild(div);
+            }
+            container.appendChild(barContainer);
+
+            const timeAxis = document.createElement('div');
+            timeAxis.className = 'time-axis';
+            const numTicks = Math.min(10, Math.max(2, Math.floor(audioDur / 10)));
+            for (let i = 0; i <= numTicks; i++) {
+                const tick = document.createElement('span');
+                tick.textContent = formatTime(audioDur * i / numTicks);
+                timeAxis.appendChild(tick);
+            }
+            container.appendChild(timeAxis);
+
+            const legend = document.createElement('div');
+            legend.className = 'legend';
+            for (const spk of allSpeakers) {
+                const item = document.createElement('div');
+                item.className = 'legend-item';
+                const swatch = document.createElement('div');
+                swatch.className = 'legend-swatch';
+                swatch.style.background = getSpeakerColor(spk, allSpeakers);
+                item.appendChild(swatch);
+                const dur = segments.filter(s => s.speaker === spk).reduce((acc, s) => acc + (s.end - s.start), 0);
+                item.appendChild(document.createTextNode(spk + ' (' + dur.toFixed(1) + 's)'));
+                legend.appendChild(item);
+            }
+            container.appendChild(legend);
+
+            if (segments.length > 0) {
+                const listDiv = document.createElement('div');
+                listDiv.className = 'segment-list';
+                const table = document.createElement('table');
+                const thead = document.createElement('thead');
+                thead.innerHTML = '<tr><th>#</th><th>Speaker</th><th>Start</th><th>End</th><th>Duration</th></tr>';
+                table.appendChild(thead);
+                const tbody = document.createElement('tbody');
+                segments.forEach((seg, i) => {
+                    const tr = document.createElement('tr');
+                    const color = getSpeakerColor(seg.speaker, allSpeakers);
+                    tr.innerHTML = '<td>' + (i + 1) + '</td><td><span class="spk-badge" style="background:' + color + '">' + escHtml(seg.speaker) + '</span></td><td>' + formatTime(seg.start) + '</td><td>' + formatTime(seg.end) + '</td><td>' + (seg.end - seg.start).toFixed(1) + 's</td>';
+                    tbody.appendChild(tr);
+                });
+                table.appendChild(tbody);
+                listDiv.appendChild(table);
+                container.appendChild(listDiv);
+            }
+        }
+
         async function loadUser() {
             try {
                 const r = await fetch(P + '/api/user');
@@ -210,9 +305,11 @@
             const btn = document.getElementById('processBtn');
             const resultsArea = document.getElementById('resultsArea');
             const resultsContent = document.getElementById('resultsContent');
+            const timelineContainer = document.getElementById('timelineContainer');
 
             btn.disabled = true;
             resultsArea.style.display = 'none';
+            timelineContainer.innerHTML = '';
 
             const allResults = [];
             const total = fileInput.files.length;
@@ -229,7 +326,12 @@
                     const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
                     const r = await fetch(endpoint, { method: 'POST', body: form });
                     const data = await r.json();
+                    data._fileName = file.name;
                     allResults.push({ file: file.name, result: data });
+
+                    if (data.segments && data.segments.length) {
+                        renderTimeline(data, timelineContainer);
+                    }
                 } catch (e) {
                     allResults.push({ file: file.name, error: e.message });
                 }
