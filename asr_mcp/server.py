@@ -136,6 +136,14 @@ async def gui():
     return HTMLResponse(content="<h1>GUI not available</h1>")
 
 
+@app.get("/voices", response_class=HTMLResponse)
+async def voices():
+    voices_file = templates_dir / "voices.html"
+    if voices_file.exists():
+        return HTMLResponse(content=voices_file.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>Voice manager not available</h1>")
+
+
 @app.post("/shutdown")
 async def shutdown():
     import signal

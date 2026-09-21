@@ -67,6 +67,7 @@ async def diarize_endpoint(
 async def diarize_upload(
     file: UploadFile = File(...),
     num_speakers: int = None,
+    user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
 ):
     content = await file.read()
@@ -87,6 +88,20 @@ async def diarize_upload(
         audio_path=str(tmp_path),
         num_speakers=num_speakers,
     )
+
+    segments = result.get("segments", [])
+    try:
+        from asr_mcp.db.manager import DatabaseManager
+        from asr_mcp.voiceprint.service import VoiceprintService
+        db = DatabaseManager(settings.db_path)
+        vp_service = VoiceprintService(settings.data_dir, db)
+        vp_service.set_voices_dir(settings.voices_dir)
+        vp_service.set_embedding_session(state.embedding_session)
+        vp_service.auto_collect_from_diarization(
+            audio_path=str(tmp_path), segments=segments, user_id=user_id,
+        )
+    except Exception as e:
+        logger.warning("Auto-collect failed: %s", e)
 
     try:
         tmp_path.unlink()

@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
+RUN python3 -m pip install --no-cache-dir \
     pip setuptools wheel
 
 WORKDIR /app
@@ -16,7 +16,7 @@ RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 COPY asr_mcp ./asr_mcp
 
-RUN mkdir -p /app/data /app/logs /app/models
+RUN mkdir -p /app/data /app/logs /app/models /app/voices
 
 ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/app/data \
