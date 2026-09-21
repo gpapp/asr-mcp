@@ -34,20 +34,20 @@ def _download_with_external_data(
 ) -> Path:
     """Download an ONNX file plus its external .onnx_data files."""
     model_path = model_dir / filename
-    if model_path.exists():
-        return model_path
 
-    logger.info("Downloading %s from %s", filename, repo_id)
-    hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        local_dir=str(model_dir),
-        token=hf_token,
-    )
+    if not model_path.exists():
+        logger.info("Downloading %s from %s", filename, repo_id)
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=str(model_dir),
+            token=hf_token,
+        )
 
     data_file = filename + "_data"
     data_path = model_dir / data_file
     if not data_path.exists():
+        logger.info("Downloading external data %s from %s", data_file, repo_id)
         try:
             hf_hub_download(
                 repo_id=repo_id,
