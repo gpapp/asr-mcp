@@ -46,6 +46,22 @@
         .results-area { margin-top: 1rem; }
         .results-area pre { background: #1a1a2e; color: #f8f8f2; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; max-height: 500px; overflow-y: auto; white-space: pre-wrap; }
 
+        .speaker-timeline { margin: 1rem 0; }
+        .speaker-timeline .bar-container { position: relative; height: 40px; background: #e9ecef; border-radius: 6px; overflow: hidden; margin-bottom: 0.5rem; }
+        .speaker-timeline .bar-seg { position: absolute; top: 0; height: 100%; opacity: 0.85; border-right: 1px solid rgba(255,255,255,0.3); display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 600; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); overflow: hidden; white-space: nowrap; min-width: 1px; }
+        .speaker-timeline .bar-seg:hover { opacity: 1; }
+        .speaker-timeline .legend { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.4rem; }
+        .speaker-timeline .legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.78rem; }
+        .speaker-timeline .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+        .speaker-timeline .time-axis { display: flex; justify-content: space-between; font-size: 0.7rem; color: #888; margin-top: 0.2rem; }
+        .speaker-timeline .file-label { font-size: 0.85rem; font-weight: 600; margin-bottom: 0.3rem; color: #333; }
+        .segment-list { margin-top: 0.8rem; max-height: 300px; overflow-y: auto; border: 1px solid #e9ecef; border-radius: 6px; }
+        .segment-list table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+        .segment-list th { position: sticky; top: 0; background: #f8f9fa; padding: 0.4rem 0.6rem; text-align: left; border-bottom: 2px solid #dee2e6; font-weight: 600; }
+        .segment-list td { padding: 0.35rem 0.6rem; border-bottom: 1px solid #f0f0f0; }
+        .segment-list tr:hover td { background: #f8f9fa; }
+        .segment-list .spk-badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.72rem; font-weight: 600; color: #fff; }
+
         .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 0.5rem; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -102,6 +118,7 @@
 
                 <div class="results-area" id="resultsArea" style="display:none;">
                     <h3 style="margin-bottom:0.5rem;">Results</h3>
+                    <div id="timelineContainer"></div>
                     <pre id="resultsContent"></pre>
                 </div>
             </div>

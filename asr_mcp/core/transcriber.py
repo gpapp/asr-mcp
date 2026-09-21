@@ -296,6 +296,7 @@ def transcribe_audio_sync(
             logger.error("Feed keys: %s", list(feed.keys()))
             for k, v in feed.items():
                 logger.error("  %s: shape=%s dtype=%s", k, v.shape, v.dtype)
+            logger.error("Expected decoder input names: %s", dec_input_names)
             break
 
         logits = outputs[0]
@@ -305,7 +306,9 @@ def transcribe_audio_sync(
         for i, name in enumerate(dec_output_names):
             if name == "logits":
                 continue
-            new_self_kv[name] = outputs[i]
+            # Map HuggingFace ONNX output names (present.*) back to input names (past_key_values.*)
+            mapped_name = name.replace("present.", "past_key_values.") if name.startswith("present.") else name
+            new_self_kv[mapped_name] = outputs[i]
         if new_self_kv:
             self_kv = new_self_kv
 

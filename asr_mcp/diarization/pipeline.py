@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import logging
 import time
 from typing import Optional
@@ -14,8 +13,8 @@ from asr_mcp.diarization.clustering import (
 from asr_mcp.diarization.segment_ops import (
     collapse_same_speaker_segments, absorb_islands, eliminate_ghost_speakers,
 )
-from asr_mcp.speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
-from asr_mcp.speaker.embedding import extract_embedding, batch_embed_files
+from asr_mcp.speaker.audio import refine_speaker_boundaries
+from asr_mcp.speaker.embedding import extract_embedding
 from asr_mcp.speaker.vad import split_at_energy_dips, run_vad_chunked, run_vad_onnx
 from asr_mcp.speaker.profiling import profile_speakers, relabel_by_pitch
 
@@ -81,57 +80,30 @@ class Diarizer:
             min_split_piece=2.0,
         )
 
-        # Step 3: Sliding windows + feature extraction
-        all_windows = []
-        all_fbanks = []
+        # Step 3: Extract one embedding per segment (energy-dip bounded)
+        all_segments = []
+        all_embeddings = []
         for ts in speech_ts:
             start_sample = ts["start"]
             end_sample = ts["end"]
+            dur_sec = (end_sample - start_sample) / sample_rate
+            if dur_sec < 0.3:
+                continue
             segment_audio = waveform[..., start_sample:end_sample]
-            windows = generate_sliding_windows(segment_audio, sample_rate, window_sec=3.0, stride_sec=2.5)
-            for w in windows:
-                w["abs_start"] = start_sample + w["start_sample"]
-                w["abs_end"] = start_sample + w["end_sample"]
-                w["speech_ts"] = ts
-            all_windows.extend(windows)
-            for w in windows:
-                w_audio = waveform[..., w["abs_start"]:w["abs_end"]]
-                fbank = extract_fbank(w_audio, sample_rate)
-                fbank = fbank - fbank.mean(dim=0, keepdim=True)
-                all_fbanks.append(fbank)
+            all_segments.append({
+                "start": round(start_sample / sample_rate, 3),
+                "end": round(end_sample / sample_rate, 3),
+                "duration": round(dur_sec, 3),
+            })
+            emb = extract_embedding(
+                segment_audio, sample_rate, self._state.embedding_session,
+            )
+            all_embeddings.append(emb)
 
-        if not all_fbanks:
+        if not all_embeddings:
             return {"segments": [], "total_time_sec": round(time.time() - start_time, 2)}
 
-        if progress_callback:
-            await progress_callback({"stage": "embedding", "progress": 0.4})
-
-        # Step 4: Extract embeddings from pre-computed fbanks
-        raw_embeddings = []
-        for fbank in all_fbanks:
-            fbank_np = fbank.numpy().astype(np.float32)
-            fbank_hash = hashlib.md5(fbank_np.tobytes()).hexdigest()
-            cached = _embedding_cache.get(fbank_hash)
-            if cached is not None:
-                raw_embeddings.append(cached)
-            else:
-                # Feed fbank directly to ONNX embedding model
-                fbank_feed = fbank_np[np.newaxis]  # (1, frames, n_mels)
-                input_name = self._state.embedding_session.get_inputs()[0].name
-                output_name = self._state.embedding_session.get_outputs()[0].name
-                emb = self._state.embedding_session.run(
-                    [output_name], {input_name: fbank_feed}
-                )[0]
-                if emb.ndim == 3:
-                    emb = emb.mean(axis=1)  # Mean pool over frames
-                emb = emb.reshape(1, -1) if emb.ndim == 1 else emb
-                norm = np.linalg.norm(emb, axis=1, keepdims=True)
-                emb = emb / (norm + 1e-8)
-                emb = emb.squeeze().astype(np.float32)
-                _embedding_cache.put(fbank_hash, emb)
-                raw_embeddings.append(emb)
-
-        raw_embeddings = np.array(raw_embeddings, dtype=np.float32)
+        raw_embeddings = np.array(all_embeddings, dtype=np.float32)
 
         if progress_callback:
             await progress_callback({"stage": "clustering", "progress": 0.6})
@@ -157,28 +129,40 @@ class Diarizer:
         if progress_callback:
             await progress_callback({"stage": "segments", "progress": 0.7})
 
-        # Step 8: Map labels to segments
-        merged_segments = self._map_labels_to_segments(
-            all_windows, long_labels, cluster_centroids, sample_rate,
-        )
+        # Step 8: Map labels to segments (energy-dip boundaries)
+        merged_segments = []
+        for i, (seg, label) in enumerate(zip(all_segments, long_labels)):
+            merged_segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "speaker": f"Speaker {label + 1}",
+                "index": i,
+            })
 
         # Step 9: Collapse + absorb islands
         merged_segments = collapse_same_speaker_segments(merged_segments, max_gap=0.5)
         merged_segments = absorb_islands(merged_segments, min_island_dur=1.0)
 
-        # Step 10: Boundary refinement
-        merged_segments = refine_speaker_boundaries(
-            merged_segments, waveform, self._state.embedding_session,
-            cluster_centroids, sample_rate,
-            embedding_cache=_embedding_cache,
-        )
-
         if progress_callback:
             await progress_callback({"stage": "profiling", "progress": 0.8})
 
-        # Step 11: Speaker profiling
+        # Step 10: Speaker profiling + relabel by pitch
         profiles = profile_speakers(waveform, merged_segments, sample_rate)
         merged_segments, profiles, label_map = relabel_by_pitch(merged_segments, profiles)
+
+        # Rebuild centroids dict keyed by new speaker names for boundary refinement
+        relabeled_centroids = {}
+        for old_label, new_label in label_map.items():
+            old_idx = int(old_label.split()[-1]) - 1
+            if old_idx in cluster_centroids:
+                relabeled_centroids[new_label] = cluster_centroids[old_idx]
+
+        # Step 11: Boundary refinement (uses relabeled centroids)
+        merged_segments = refine_speaker_boundaries(
+            merged_segments, waveform, self._state.embedding_session,
+            relabeled_centroids, sample_rate,
+            embedding_cache=_embedding_cache,
+        )
 
         # Step 12: Ghost elimination
         merged_segments = eliminate_ghost_speakers(merged_segments, profiles)
@@ -186,7 +170,7 @@ class Diarizer:
         # Step 13: Known speaker matching
         if known_speakers:
             merged_segments, match_info = match_known_speakers_full(
-                merged_segments, all_windows, list(range(len(all_windows))),
+                merged_segments, all_segments, list(range(len(all_segments))),
                 raw_embeddings, cluster_centroids, profiles, known_speakers, cfg,
             )
 
@@ -237,14 +221,3 @@ class Diarizer:
                 merged.append(seg.copy())
         logger.info("Merged VAD: %d regions -> %d (gap<%.1fs)", len(speech_ts), len(merged), max_gap_sec)
         return merged
-
-    def _map_labels_to_segments(self, windows, labels, centroids, sample_rate):
-        segments = []
-        for i, (w, label) in enumerate(zip(windows, labels)):
-            segments.append({
-                "start": round(w["abs_start"] / sample_rate, 3),
-                "end": round(w["abs_end"] / sample_rate, 3),
-                "speaker": f"Speaker {label + 1}",
-                "index": i,
-            })
-        return segments
