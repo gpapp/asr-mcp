@@ -104,7 +104,10 @@ class ModelState:
         self.embedding_session = None
         self.vad_session = None
         self.tokens = None
+        self.tokenizer = None
         self.prompt_ids = None
+        self.eos_token_id = 3
+        self.decoder_start_token_id = 13764
         self.device = "cpu"
         self.settings = None
         self._last_used: float = 0.0

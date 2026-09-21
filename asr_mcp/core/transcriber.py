@@ -25,6 +25,10 @@ HOP_LENGTH = 160
 PREEMPHASIS = 0.97
 DITHER = 1e-5
 
+NUM_LAYERS = 8
+NUM_HEADS = 8
+HEAD_DIM = 128
+
 
 def _get_mel_filterbank() -> np.ndarray:
     global _mel_filterbank_cache
@@ -115,6 +119,71 @@ def clean_transcript(text: str) -> str:
     return cleaned.strip()
 
 
+def _parse_encoder_outputs(encoder_outputs, encoder_session):
+    enc_output_names = [o.name for o in encoder_session.get_outputs()]
+    cross_kv = {}
+
+    if len(encoder_outputs) == 2 and "cross" in str(enc_output_names).lower():
+        cross_k = encoder_outputs[0]
+        cross_v = encoder_outputs[1]
+        num_layers_enc = cross_k.shape[0]
+        logger.debug("Encoder cross KV stacked format: layers=%d, shape=%s", num_layers_enc, cross_k.shape)
+
+        for i in range(num_layers_enc):
+            k = cross_k[i].reshape(1, NUM_HEADS, -1, HEAD_DIM).astype(np.float32)
+            v = cross_v[i].reshape(1, NUM_HEADS, -1, HEAD_DIM).astype(np.float32)
+            cross_kv[f"past_key_values.{i}.encoder.key"] = k
+            cross_kv[f"past_key_values.{i}.encoder.value"] = v
+    else:
+        for name, val in zip(enc_output_names, encoder_outputs):
+            if "encoder" in name.lower():
+                cross_kv[name] = val.astype(np.float32)
+
+    if not cross_kv:
+        for i in range(NUM_LAYERS):
+            cross_kv[f"past_key_values.{i}.encoder.key"] = np.zeros(
+                (1, NUM_HEADS, 1, HEAD_DIM), dtype=np.float32
+            )
+            cross_kv[f"past_key_values.{i}.encoder.value"] = np.zeros(
+                (1, NUM_HEADS, 1, HEAD_DIM), dtype=np.float32
+            )
+
+    return cross_kv
+
+
+def _init_self_kv_cache():
+    self_kv = {}
+    for i in range(NUM_LAYERS):
+        self_kv[f"past_key_values.{i}.decoder.key"] = np.zeros(
+            (1, NUM_HEADS, 0, HEAD_DIM), dtype=np.float32
+        )
+        self_kv[f"past_key_values.{i}.decoder.value"] = np.zeros(
+            (1, NUM_HEADS, 0, HEAD_DIM), dtype=np.float32
+        )
+    return self_kv
+
+
+def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv, num_logits_to_keep=1):
+    batch_size = input_ids.shape[0]
+    seq_len = input_ids.shape[1]
+
+    inputs = {}
+    inputs["input_ids"] = input_ids.astype(np.int64)
+    inputs["attention_mask"] = np.ones((batch_size, seq_len), dtype=np.int64)
+    inputs["position_ids"] = np.arange(position, position + seq_len, dtype=np.int64).reshape(1, -1)
+    inputs["num_logits_to_keep"] = np.array(num_logits_to_keep, dtype=np.int64)
+
+    inputs.update(cross_kv)
+    inputs.update(self_kv)
+
+    feed = {}
+    for name in dec_input_names:
+        if name in inputs:
+            feed[name] = inputs[name]
+
+    return feed
+
+
 def transcribe_audio_sync(
     audio: Optional[np.ndarray] = None,
     language: str = "en",
@@ -144,51 +213,59 @@ def transcribe_audio_sync(
         logger.error("Encoder inference failed: %s", e)
         return {"text": "", "error": str(e)}
 
-    input_ids = state.prompt_ids if prefix_ids is None else np.array([prefix_ids], dtype=np.int64)
+    cross_kv = _parse_encoder_outputs(encoder_outputs, state.encoder_session)
 
     if past_kv_cache_ort is not None:
-        past = past_kv_cache_ort
+        self_kv = past_kv_cache_ort.get("self_kv", _init_self_kv_cache())
     else:
-        past = {}
-        for i in range(len(state.encoder_session.get_outputs()) // 2):
-            past[f"past_key_values.{i}.key"] = np.zeros((1, 8, 0, 128), dtype=np.float32)
-            past[f"past_key_values.{i}.value"] = np.zeros((1, 8, 0, 128), dtype=np.float32)
+        self_kv = _init_self_kv_cache()
 
+    dec_input_names = [inp.name for inp in state.decoder_session.get_inputs()]
+    dec_output_names = [out.name for out in state.decoder_session.get_outputs()]
+
+    if prefix_ids is not None:
+        input_ids = np.array([prefix_ids], dtype=np.int64)
+    else:
+        input_ids = np.array([state.prompt_ids], dtype=np.int64)
+
+    position = 0
     generated_tokens = []
     max_new = state.settings.max_new_tokens if state.settings else 448
 
     for step in range(max_new):
-        decoder_inputs = {
-            "input_ids": input_ids,
-            "encoder_hidden_states": encoder_outputs[0],
-        }
-        for k, v in past.items():
-            decoder_inputs[k] = v
+        feed = _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv)
 
         try:
-            outputs = state.decoder_session.run(None, decoder_inputs)
+            outputs = state.decoder_session.run(None, feed)
         except Exception as e:
             logger.error("Decoder step %d failed: %s", step, e)
+            logger.error("Feed keys: %s", list(feed.keys()))
+            for k, v in feed.items():
+                logger.error("  %s: shape=%s dtype=%s", k, v.shape, v.dtype)
             break
 
         logits = outputs[0]
         next_token = int(np.argmax(logits[0, -1, :]))
-        past = {}
-        output_names = [o.name for o in state.decoder_session.get_outputs()]
-        for i, name in enumerate(output_names[1:]):
-            past[name] = outputs[i + 1]
 
-        if next_token == state.tokens.get("eos_token_id", 2):
+        new_self_kv = {}
+        for i, name in enumerate(dec_output_names):
+            if name == "logits":
+                continue
+            new_self_kv[name] = outputs[i]
+        if new_self_kv:
+            self_kv = new_self_kv
+
+        if next_token == state.eos_token_id:
             break
 
-        if next_token >= 3 and next_token < len(state.tokens.get("added_tokens_decoder", {})):
-            generated_tokens.append(next_token)
-        else:
-            generated_tokens.append(next_token)
-
+        generated_tokens.append(next_token)
         input_ids = np.array([[next_token]], dtype=np.int64)
+        position += 1
 
-    text = state.tokens.decode(generated_tokens) if state.tokens else ""
+    if state.tokenizer:
+        text = state.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    else:
+        text = "".join(chr(t) if 32 <= t < 127 else "" for t in generated_tokens)
     text = clean_transcript(text)
 
     inference_time = time.time() - start_time
