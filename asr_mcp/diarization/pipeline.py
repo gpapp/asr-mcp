@@ -8,7 +8,7 @@ import torch
 
 from asr_mcp.core.model_state import state, LRUCache
 from asr_mcp.diarization.clustering import (
-    greedy_merge_clusters, match_known_speakers_full,
+    greedy_merge_clusters, merge_similar_speakers, match_known_speakers_full,
 )
 from asr_mcp.diarization.segment_ops import (
     collapse_same_speaker_segments, absorb_islands, eliminate_ghost_speakers,
@@ -146,16 +146,25 @@ class Diarizer:
         if progress_callback:
             await progress_callback({"stage": "profiling", "progress": 0.8})
 
-        # Step 10: Speaker profiling + relabel by pitch
+        # Step 10: Speaker profiling
         profiles = profile_speakers(waveform, merged_segments, sample_rate)
+
+        # Step 10b: Merge similar speakers (compare voiceprints, merge close ones)
+        merged_segments, cluster_centroids, profiles = merge_similar_speakers(
+            merged_segments, raw_embeddings, long_labels,
+            cluster_centroids, profiles, cfg,
+        )
+
+        # Step 10c: Relabel by pitch (highest pitch = Speaker 1)
         merged_segments, profiles, label_map = relabel_by_pitch(merged_segments, profiles)
 
         # Rebuild centroids dict keyed by new speaker names for boundary refinement
         relabeled_centroids = {}
         for old_label, new_label in label_map.items():
-            old_idx = int(old_label.split()[-1]) - 1
-            if old_idx in cluster_centroids:
-                relabeled_centroids[new_label] = cluster_centroids[old_idx]
+            if old_label.startswith("Speaker "):
+                old_num = int(old_label.split()[-1]) - 1
+                if old_num in cluster_centroids:
+                    relabeled_centroids[new_label] = cluster_centroids[old_num]
 
         # Step 11: Boundary refinement (uses relabeled centroids)
         merged_segments = refine_speaker_boundaries(
