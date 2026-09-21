@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import onnxruntime as ort
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 from asr_mcp.core.model_state import ModelState, state
 from asr_mcp.config.settings import Settings
@@ -29,6 +29,53 @@ def _get_providers(settings: Settings = None) -> list[str]:
     return ["CPUExecutionProvider"]
 
 
+def _download_with_external_data(
+    repo_id: str, filename: str, model_dir: Path, hf_token: Optional[str]
+) -> Path:
+    """Download an ONNX file plus its external .onnx_data files."""
+    model_path = model_dir / filename
+    if model_path.exists():
+        return model_path
+
+    logger.info("Downloading %s from %s", filename, repo_id)
+    hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        local_dir=str(model_dir),
+        token=hf_token,
+    )
+
+    data_file = filename + "_data"
+    data_path = model_dir / data_file
+    if not data_path.exists():
+        try:
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=data_file,
+                local_dir=str(model_dir),
+                token=hf_token,
+            )
+        except Exception:
+            pass
+
+    for i in range(1, 10):
+        shard = f"{data_file}_{i}"
+        shard_path = model_dir / shard
+        if shard_path.exists():
+            continue
+        try:
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=shard,
+                local_dir=str(model_dir),
+                token=hf_token,
+            )
+        except Exception:
+            break
+
+    return model_path
+
+
 def ensure_model(settings: Settings) -> Path:
     model_dir = Path(settings.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -36,26 +83,8 @@ def ensure_model(settings: Settings) -> Path:
     encoder_file = f"onnx/encoder_model{settings.encoder_model_type}.onnx"
     decoder_file = f"onnx/decoder_model_merged{settings.decoder_model_type}.onnx"
 
-    encoder_path = model_dir / encoder_file
-    decoder_path = model_dir / decoder_file
-
-    if not encoder_path.exists():
-        logger.info("Downloading encoder model from %s", settings.model_repo)
-        encoder_path = Path(hf_hub_download(
-            repo_id=settings.model_repo,
-            filename=encoder_file,
-            local_dir=str(model_dir),
-            token=settings.hf_token,
-        ))
-
-    if not decoder_path.exists():
-        logger.info("Downloading decoder model from %s", settings.model_repo)
-        decoder_path = Path(hf_hub_download(
-            repo_id=settings.model_repo,
-            filename=decoder_file,
-            local_dir=str(model_dir),
-            token=settings.hf_token,
-        ))
+    _download_with_external_data(settings.model_repo, encoder_file, model_dir, settings.hf_token)
+    _download_with_external_data(settings.model_repo, decoder_file, model_dir, settings.hf_token)
 
     return model_dir
 
@@ -65,36 +94,21 @@ def ensure_vad_model(settings: Settings) -> Path:
     model_dir.mkdir(parents=True, exist_ok=True)
 
     filename = "onnx/model.onnx"
-    model_path = model_dir / filename
-
-    if not model_path.exists():
-        logger.info("Downloading VAD model from %s", settings.vad_model_repo)
-        model_path = Path(hf_hub_download(
-            repo_id=settings.vad_model_repo,
-            filename=filename,
-            local_dir=str(model_dir),
-            token=settings.hf_token,
-        ))
-
-    return model_path
+    return _download_with_external_data(
+        settings.vad_model_repo, filename, model_dir, settings.hf_token
+    )
 
 
 def ensure_embedding_model(settings: Settings) -> Path:
     model_dir = Path(settings.embedding_model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = model_dir / settings.embedding_model_filename
-
-    if not model_path.exists():
-        logger.info("Downloading embedding model from %s", settings.embedding_model_repo)
-        model_path = Path(hf_hub_download(
-            repo_id=settings.embedding_model_repo,
-            filename=settings.embedding_model_filename,
-            local_dir=str(model_dir),
-            token=settings.hf_token,
-        ))
-
-    return model_path
+    return _download_with_external_data(
+        settings.embedding_model_repo,
+        settings.embedding_model_filename,
+        model_dir,
+        settings.hf_token,
+    )
 
 
 def load_models(settings: Settings) -> None:
