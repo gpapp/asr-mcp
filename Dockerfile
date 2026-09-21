@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -12,7 +13,8 @@ RUN python3 -m pip install --no-cache-dir \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
     --extra-index-url https://download.pytorch.org/whl/cu121 \
     -r requirements.txt
 
