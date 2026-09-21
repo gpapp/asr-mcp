@@ -102,7 +102,12 @@ async def diarize_upload(
 
     settings = get_settings()
 
-    wav_path = convert_to_wav(str(tmp_path), tmp_dir)
+    try:
+        wav_path = convert_to_wav(str(tmp_path), tmp_dir)
+    except Exception as e:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return JSONResponse(status_code=400, content={"detail": f"Audio conversion failed: {e}"})
     try:
         diarizer = Diarizer(state, settings)
         known_speakers = _load_known_speakers(settings, user_id)

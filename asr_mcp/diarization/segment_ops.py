@@ -4,7 +4,7 @@ from typing import Optional
 logger = logging.getLogger("asr_mcp.diarization.segment_ops")
 
 
-def collapse_same_speaker_segments(segments: list, max_gap: float = 0.0) -> list:
+def collapse_same_speaker_segments(segments: list, max_gap: float = 0.5) -> list:
     if not segments:
         return []
     result = [segments[0].copy()]
@@ -40,7 +40,7 @@ def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
                              curr.get("start", 0), curr.get("end", 0), curr_dur, prev_speaker)
 
         if (curr.get("speaker") == result[-1].get("speaker")
-                and curr.get("start", 0) - result[-1].get("end", 0) <= 0.0):
+                and curr.get("start", 0) - result[-1].get("end", 0) <= 0.5):
             result[-1]["end"] = curr.get("end", result[-1].get("end"))
         else:
             result.append(curr.copy())

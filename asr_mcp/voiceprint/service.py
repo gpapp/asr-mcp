@@ -344,6 +344,17 @@ class VoiceprintService:
                     break
 
                 dur = seg["end"] - seg["start"]
+
+                existing = self._snippets.find_duplicate(audio_path, seg["start"], user_id=user_id)
+                if existing:
+                    if existing["duration_sec"] >= dur:
+                        continue
+                    old_path = Path(existing["file_path"])
+                    if old_path.exists():
+                        old_path.unlink()
+                    self._snippets.delete(existing["id"], user_id=user_id)
+                    current_total -= existing["duration_sec"]
+
                 result = self.add_snippet_from_segment(
                     speaker_name=speaker_name,
                     wav_path=audio_path,

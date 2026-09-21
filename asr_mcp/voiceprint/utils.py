@@ -76,15 +76,22 @@ def ensure_wav(file_path: Path, output_dir: Optional[Path] = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{file_path.stem}.wav"
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["ffmpeg", "-y", "-i", str(file_path), "-ar", str(SAMPLE_RATE),
              "-ac", "1", "-acodec", "pcm_s16le", str(out_path)],
-            capture_output=True, check=True,
+            capture_output=True, timeout=120,
         )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            logger.error("ffmpeg failed for %s (rc=%d): %s", file_path.name, result.returncode, stderr[-500:])
+            raise RuntimeError(f"ffmpeg conversion failed for {file_path.name}: {stderr[-200:]}")
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError(f"ffmpeg produced empty output for {file_path.name}")
         return out_path
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        logger.error("ffmpeg conversion failed: %s", e)
-        raise
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found — install ffmpeg for audio format conversion")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffmpeg timed out converting {file_path.name} (>120s)")
 
 
 def convert_to_wav(input_path: str, output_dir: Optional[Path] = None) -> Path:

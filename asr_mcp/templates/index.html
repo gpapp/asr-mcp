@@ -82,7 +82,7 @@
             <div class="card-body">
                 <div class="upload-area" id="uploadArea" onclick="document.getElementById('audioFile').click()">
                     <p>Drop an audio file here or click to browse</p>
-                    <input type="file" id="audioFile" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.webm,.opus" onchange="fileSelected(this)">
+                    <input type="file" id="audioFile" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.webm,.opus" multiple onchange="fileSelected(this)">
                     <div class="formats">WAV, MP3, FLAC, OGG, M4A, WebM, Opus</div>
                 </div>
                 <div id="fileName" style="margin-top:0.8rem;font-size:0.85rem;color:#555;display:none;"></div>
@@ -155,11 +155,15 @@
         }
 
         function fileSelected(input) {
-            const name = input.files[0]?.name;
+            const files = input.files;
             const el = document.getElementById('fileName');
             const btn = document.getElementById('processBtn');
-            if (name) {
-                el.textContent = name;
+            if (files.length > 0) {
+                if (files.length === 1) {
+                    el.textContent = files[0].name;
+                } else {
+                    el.textContent = files.length + ' files selected';
+                }
                 el.style.display = 'block';
                 btn.disabled = false;
             } else {
@@ -182,7 +186,7 @@
 
         async function processAudio() {
             const fileInput = document.getElementById('audioFile');
-            if (!fileInput.files[0]) { toast('Please select a file', true); return; }
+            if (!fileInput.files.length) { toast('Please select a file', true); return; }
 
             const mode = document.getElementById('outputMode').value;
             const numSpeakers = document.getElementById('numSpeakers').value;
@@ -191,28 +195,34 @@
             const resultsContent = document.getElementById('resultsContent');
 
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner"></span>Processing...';
             resultsArea.style.display = 'none';
 
-            const form = new FormData();
-            form.append('file', fileInput.files[0]);
-            if (numSpeakers) form.append('num_speakers', numSpeakers);
+            const allResults = [];
+            const total = fileInput.files.length;
 
-            try {
-                const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
-                const r = await fetch(endpoint, { method: 'POST', body: form });
-                const data = await r.json();
-                resultsContent.textContent = JSON.stringify(data, null, 2);
-                resultsArea.style.display = 'block';
-                toast('Processing complete');
-            } catch (e) {
-                resultsContent.textContent = 'Error: ' + e.message;
-                resultsArea.style.display = 'block';
-                toast('Processing failed', true);
-            } finally {
-                btn.disabled = false;
-                btn.innerHTML = 'Process Audio';
+            for (let i = 0; i < total; i++) {
+                const file = fileInput.files[i];
+                btn.innerHTML = '<span class="spinner"></span>Processing ' + (i + 1) + '/' + total + '...';
+
+                const form = new FormData();
+                form.append('file', file);
+                if (numSpeakers) form.append('num_speakers', numSpeakers);
+
+                try {
+                    const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
+                    const r = await fetch(endpoint, { method: 'POST', body: form });
+                    const data = await r.json();
+                    allResults.push({ file: file.name, result: data });
+                } catch (e) {
+                    allResults.push({ file: file.name, error: e.message });
+                }
             }
+
+            resultsContent.textContent = JSON.stringify(allResults.length === 1 ? allResults[0] : allResults, null, 2);
+            resultsArea.style.display = 'block';
+            toast('Processing complete');
+            btn.disabled = false;
+            btn.innerHTML = 'Process Audio';
         }
 
         loadUser();

@@ -9,14 +9,14 @@ import torch
 
 from asr_mcp.core.model_state import state, LRUCache
 from asr_mcp.diarization.clustering import (
-    cap_clusters, greedy_merge_clusters, match_known_speakers_full,
+    greedy_merge_clusters, match_known_speakers_full,
 )
 from asr_mcp.diarization.segment_ops import (
     collapse_same_speaker_segments, absorb_islands, eliminate_ghost_speakers,
 )
 from asr_mcp.speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
 from asr_mcp.speaker.embedding import extract_embedding, batch_embed_files
-from asr_mcp.speaker.vad import split_at_energy_dips, run_vad_chunked
+from asr_mcp.speaker.vad import split_at_energy_dips, run_vad_chunked, run_vad_onnx
 from asr_mcp.speaker.profiling import profile_speakers, relabel_by_pitch
 
 logger = logging.getLogger("asr_mcp.diarization.pipeline")
@@ -68,12 +68,17 @@ class Diarizer:
         if not speech_ts:
             return {"segments": [], "total_time_sec": round(time.time() - start_time, 2)}
 
+        # Step 1b: Merge nearby speech regions separated by <1s silence
+        speech_ts = self._merge_nearby_speech(speech_ts, sample_rate, max_gap_sec=1.0)
+
         if progress_callback:
             await progress_callback({"stage": "features", "progress": 0.2})
 
-        # Step 2: Energy-dip splitting
+        # Step 2: Energy-dip splitting (only split at genuine pauses >1s)
         speech_ts = split_at_energy_dips(
             speech_ts, waveform.numpy().squeeze(), sample_rate,
+            min_segment_dur=3.0, dip_ratio=0.35, min_dip_dur=0.5,
+            min_split_piece=2.0,
         )
 
         # Step 3: Sliding windows + feature extraction
@@ -83,7 +88,7 @@ class Diarizer:
             start_sample = ts["start"]
             end_sample = ts["end"]
             segment_audio = waveform[..., start_sample:end_sample]
-            windows = generate_sliding_windows(segment_audio, sample_rate, window_sec=2.0, stride_sec=1.2)
+            windows = generate_sliding_windows(segment_audio, sample_rate, window_sec=3.0, stride_sec=2.5)
             for w in windows:
                 w["abs_start"] = start_sample + w["start_sample"]
                 w["abs_end"] = start_sample + w["end_sample"]
@@ -134,21 +139,19 @@ class Diarizer:
         # Step 5: Clustering
         from sklearn.cluster import AgglomerativeClustering
         if num_speakers:
-            n_clusters = num_speakers
+            clustering = AgglomerativeClustering(
+                n_clusters=num_speakers, metric="cosine", linkage="average"
+            )
         else:
-            n_clusters = min(cfg.get("diarization", {}).get("max_clusters", 15), len(raw_embeddings))
-
-        clustering = AgglomerativeClustering(
-            n_clusters=n_clusters, metric="cosine", linkage="average"
-        )
+            distance_threshold = cfg.get("diarization", {}).get("distance_threshold", 0.55)
+            clustering = AgglomerativeClustering(
+                n_clusters=None, distance_threshold=distance_threshold,
+                metric="cosine", linkage="average",
+            )
         long_labels = clustering.fit_predict(raw_embeddings)
 
-        # Step 6: Cap clusters
-        max_clusters = cfg.get("diarization", {}).get("max_clusters", 15)
-        long_labels = cap_clusters(raw_embeddings, long_labels, max_clusters)
-
-        # Step 7: Greedy merge
-        merge_thresh = cfg.get("diarization", {}).get("merge_threshold", 0.25)
+        # Step 6: Greedy merge
+        merge_thresh = cfg.get("diarization", {}).get("merge_threshold", 0.45)
         long_labels, cluster_centroids = greedy_merge_clusters(raw_embeddings, long_labels, merge_thresh)
 
         if progress_callback:
@@ -160,7 +163,7 @@ class Diarizer:
         )
 
         # Step 9: Collapse + absorb islands
-        merged_segments = collapse_same_speaker_segments(merged_segments)
+        merged_segments = collapse_same_speaker_segments(merged_segments, max_gap=0.5)
         merged_segments = absorb_islands(merged_segments, min_island_dur=1.0)
 
         # Step 10: Boundary refinement
@@ -207,17 +210,33 @@ class Diarizer:
         except Exception as e:
             logger.error("Failed to load audio %s: %s", audio_path, e)
             return None, None
-
     def _run_vad(self, waveform, sample_rate, threshold, min_speech_ms):
         if self._state.vad_session is not None:
-            return run_vad_chunked(
-                waveform, sample_rate=sample_rate,
-                threshold=threshold, min_speech_duration_ms=min_speech_ms,
+            return run_vad_onnx(
+                waveform, self._state.vad_session,
+                sample_rate=sample_rate,
+                threshold=threshold,
+                min_speech_duration_ms=min_speech_ms,
             )
         return run_vad_chunked(
             waveform, sample_rate=sample_rate,
             threshold=threshold, min_speech_duration_ms=min_speech_ms,
         )
+
+    @staticmethod
+    def _merge_nearby_speech(speech_ts: list, sample_rate: int, max_gap_sec: float = 1.0) -> list:
+        if len(speech_ts) <= 1:
+            return speech_ts
+        max_gap_samples = int(max_gap_sec * sample_rate)
+        merged = [speech_ts[0].copy()]
+        for seg in speech_ts[1:]:
+            gap = seg["start"] - merged[-1]["end"]
+            if gap <= max_gap_samples:
+                merged[-1]["end"] = seg["end"]
+            else:
+                merged.append(seg.copy())
+        logger.info("Merged VAD: %d regions -> %d (gap<%.1fs)", len(speech_ts), len(merged), max_gap_sec)
+        return merged
 
     def _map_labels_to_segments(self, windows, labels, centroids, sample_rate):
         segments = []
@@ -225,7 +244,7 @@ class Diarizer:
             segments.append({
                 "start": round(w["abs_start"] / sample_rate, 3),
                 "end": round(w["abs_end"] / sample_rate, 3),
-                "speaker": f"SPEAKER_{label:02d}",
+                "speaker": f"Speaker {label + 1}",
                 "index": i,
             })
         return segments

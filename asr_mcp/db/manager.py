@@ -247,6 +247,15 @@ class SnippetDB:
             )
             return result or 0.0
 
+    def find_duplicate(self, source_audio: str, start_sec: float, user_id: str = DEFAULT_USER) -> Optional[dict]:
+        with self._db.get_session() as session:
+            sn = session.query(SnippetModel).filter_by(
+                user_id=user_id, source_audio=source_audio, start_sec=start_sec
+            ).first()
+            if not sn:
+                return None
+            return self._row_to_dict(sn)
+
     def count(self, speaker_name: str, user_id: str = DEFAULT_USER) -> int:
         with self._db.get_session() as session:
             return (
