@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     max_new_tokens: int = 448
 
     # Server
+    prefix: str = Field(default="", description="URL prefix when behind reverse proxy (e.g. /asr-mcp)")
     host: str = "0.0.0.0"
     port: int = 8080
     workers: int = 1

@@ -51,7 +51,7 @@
 
             const form = new FormData(document.getElementById('loginForm'));
             try {
-                const r = await fetch('/api/auth/login', {
+                const r = await fetch('__PREFIX__/api/auth/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: new URLSearchParams({
@@ -61,7 +61,7 @@
                 });
                 const data = await r.json();
                 if (data.success) {
-                    window.location.href = data.redirect || '/gui';
+                    window.location.href = data.redirect || '__PREFIX__/gui';
                 } else {
                     errEl.textContent = data.error || 'Invalid credentials';
                     errEl.className = 'error show';

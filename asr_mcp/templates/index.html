@@ -58,8 +58,8 @@
     <div class="header">
         <h1>ASR-MCP</h1>
         <nav>
-            <a href="/gui" class="active">Process Transcription</a>
-            <a href="/voices">Manage Voiceprints</a>
+            <a href="__PREFIX__/gui" class="active">Process Transcription</a>
+            <a href="__PREFIX__/voices">Manage Voiceprints</a>
             <span class="user-info" id="userDisplay">...</span>
         </nav>
     </div>
@@ -111,6 +111,7 @@
     <div class="toast" id="toast"></div>
 
     <script>
+    const P = '__PREFIX__';
         function escHtml(s) {
             const d = document.createElement('div');
             d.textContent = s;
@@ -126,13 +127,13 @@
 
         async function loadUser() {
             try {
-                const r = await fetch('/api/user');
+                const r = await fetch(P + '/api/user');
                 const d = await r.json();
                 const el = document.getElementById('userDisplay');
                 if (d.authenticated) {
-                    el.innerHTML = escHtml(d.username) + ' <a href="/api/auth/logout">logout</a>';
+                    el.innerHTML = escHtml(d.username) + ' <a href="' + P + '/api/auth/logout">logout</a>';
                 } else {
-                    el.innerHTML = '<a href="/login">login</a>';
+                    el.innerHTML = '<a href="' + P + '/login">login</a>';
                 }
             } catch (e) {
                 document.getElementById('userDisplay').textContent = '';
@@ -141,7 +142,7 @@
 
         async function checkStatus() {
             try {
-                const r = await fetch('/health');
+                const r = await fetch(P + '/health');
                 const d = await r.json();
                 const ready = d.model_status === 'ready';
                 document.getElementById('stModels').innerHTML = ready ? '<span class="status-ok">Ready</span>' : '<span class="status-fail">Not loaded</span>';
@@ -198,7 +199,7 @@
             if (numSpeakers) form.append('num_speakers', numSpeakers);
 
             try {
-                const endpoint = mode === 'transcribe' ? '/api/asr/transcribe' : '/api/asr/diarize/upload';
+                const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe' : P + '/api/asr/diarize/upload';
                 const r = await fetch(endpoint, { method: 'POST', body: form });
                 const data = await r.json();
                 resultsContent.textContent = JSON.stringify(data, null, 2);

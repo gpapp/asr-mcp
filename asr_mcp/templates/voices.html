@@ -70,8 +70,8 @@
     <div class="header">
         <h1>ASR-MCP</h1>
         <nav>
-            <a href="/gui">Process Transcription</a>
-            <a href="/voices" class="active">Manage Voiceprints</a>
+            <a href="__PREFIX__/gui">Process Transcription</a>
+            <a href="__PREFIX__/voices" class="active">Manage Voiceprints</a>
             <span class="user-info" id="userDisplay">...</span>
         </nav>
     </div>
@@ -104,7 +104,8 @@
     <div class="toast" id="toast"></div>
 
     <script>
-    const API = '/api/voiceprint';
+    const P = '__PREFIX__';
+    const API = P + '/api/voiceprint';
     let speakersData = [];
 
     function toast(msg, isError) {
@@ -297,13 +298,13 @@
 
     async function loadUser() {
         try {
-            const r = await fetch('/api/user');
+            const r = await fetch(P + '/api/user');
             const d = await r.json();
             const el = document.getElementById('userDisplay');
             if (d.authenticated) {
-                el.innerHTML = escHtml(d.username) + ' <a href="/api/auth/logout">logout</a>';
+                el.innerHTML = escHtml(d.username) + ' <a href="' + P + '/api/auth/logout">logout</a>';
             } else {
-                el.innerHTML = '<a href="/login">login</a>';
+                el.innerHTML = '<a href="' + P + '/login">login</a>';
             }
         } catch (e) {
             document.getElementById('userDisplay').textContent = '';

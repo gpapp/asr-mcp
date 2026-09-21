@@ -17,6 +17,7 @@ services:
       - TRANSCRIBE_MODEL_CACHE_DIR=/app/models
       - TRANSCRIBE_DB_PATH=/app/data/asr_mcp.db
       - TRANSCRIBE_HTPASSWD_PATH=/app/htpasswd
+      - TRANSCRIBE_PREFIX=/asr-mcp
     volumes:
       - ${DATA_DIR:-.}/data:/app/data
       - ${DATA_DIR:-.}/logs:/app/logs

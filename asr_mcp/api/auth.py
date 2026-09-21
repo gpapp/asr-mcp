@@ -14,6 +14,18 @@ logger = logging.getLogger("asr_mcp.api.auth")
 PUBLIC_PATHS = {"/login", "/health", "/api/auth/login", "/api/user"}
 
 
+def _get_prefix(request: Request) -> str:
+    """Get the URL prefix from settings."""
+    from asr_mcp.config.settings import get_settings
+    return get_settings().prefix
+
+
+def redirect_url(request: Request, path: str) -> str:
+    """Prefix a path with the configured URL prefix."""
+    prefix = _get_prefix(request)
+    return prefix + path
+
+
 def parse_htpasswd(path: str) -> dict[str, str]:
     """Parse an Apache htpasswd file into {username: hash} dict."""
     users: dict[str, str] = {}
@@ -99,7 +111,7 @@ def require_auth(request: Request) -> Optional[RedirectResponse]:
     if user:
         return None
 
-    return RedirectResponse(url="/login", status_code=302)
+    return RedirectResponse(url=redirect_url(request, "/login"), status_code=302)
 
 
 def login_user(request: Request, username: str) -> None:

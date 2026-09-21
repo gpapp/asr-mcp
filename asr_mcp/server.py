@@ -139,13 +139,17 @@ if static_dir.exists():
 def _render(template_name: str) -> HTMLResponse:
     path = templates_dir / template_name
     if path.exists():
-        return HTMLResponse(content=path.read_text(encoding="utf-8"))
+        content = path.read_text(encoding="utf-8")
+        prefix = _init_settings().prefix
+        content = content.replace("__PREFIX__", prefix)
+        return HTMLResponse(content=content)
     return HTMLResponse(content=f"<h1>{template_name} not found</h1>")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return RedirectResponse(url="/gui", status_code=302)
+    prefix = _init_settings().prefix
+    return RedirectResponse(url=prefix + "/gui", status_code=302)
 
 
 @app.get("/health")
@@ -182,7 +186,7 @@ async def login_post(
     if not stored or not verify_password(stored, password):
         return JSONResponse({"success": False, "error": "Invalid username or password"})
 
-    return JSONResponse({"success": True, "username": username, "redirect": "/gui"})
+    return JSONResponse({"success": True, "username": username, "redirect": _init_settings().prefix + "/gui"})
 
 
 @app.post("/api/auth/login/session")
@@ -196,28 +200,28 @@ async def login_set_session(
 
     users = app.state.htpasswd_users if hasattr(app.state, "htpasswd_users") else {}
     if not users:
-        return RedirectResponse(url="/login", status_code=302)
+        return RedirectResponse(url=_init_settings().prefix + "/login", status_code=302)
 
     stored = users.get(username)
     if not stored or not verify_password(stored, password):
         return _render("login.html")
 
     login_user(request, username)
-    return RedirectResponse(url="/gui", status_code=302)
+    return RedirectResponse(url=_init_settings().prefix + "/gui", status_code=302)
 
 
 @app.get("/api/auth/logout")
 async def logout_get(request: Request):
     from asr_mcp.api.auth import logout_user
     logout_user(request)
-    return RedirectResponse(url="/login", status_code=302)
+    return RedirectResponse(url=_init_settings().prefix + "/login", status_code=302)
 
 
 @app.post("/api/auth/logout")
 async def logout_post(request: Request):
     from asr_mcp.api.auth import logout_user
     logout_user(request)
-    return JSONResponse({"success": True, "redirect": "/login"})
+    return JSONResponse({"success": True, "redirect": _init_settings().prefix + "/login"})
 
 
 @app.get("/gui", response_class=HTMLResponse)
