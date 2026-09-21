@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -106,6 +107,8 @@ class ModelState:
         self.prompt_ids = None
         self.device = "cpu"
         self.settings = None
+        self._last_used: float = 0.0
+        self._lock = threading.Lock()
 
     @property
     def is_ready(self) -> bool:
@@ -115,6 +118,55 @@ class ModelState:
             self.embedding_session is not None,
             self.vad_session is not None,
         ])
+
+    def touch(self):
+        """Record last usage time."""
+        self._last_used = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        """Seconds since last usage. Returns 0 if never used."""
+        if self._last_used == 0:
+            return 0
+        return time.monotonic() - self._last_used
+
+    def unload_models(self):
+        """Unload all GPU models to free VRAM."""
+        import gc
+        with self._lock:
+            if not self.is_ready:
+                return
+            logger.info("Unloading GPU models (idle %.0fs)", self.idle_seconds())
+            self.encoder_session = None
+            self.decoder_session = None
+            self.embedding_session = None
+            self.vad_session = None
+            self._last_used = 0.0
+        gc.collect()
+        logger.info("GPU models unloaded")
+
+    def reload_models(self):
+        """Reload models if they were unloaded."""
+        if self.is_ready:
+            self.touch()
+            return
+        if not self.settings:
+            logger.warning("Cannot reload models: no settings stored")
+            return
+        logger.info("Auto-reloading models after idle period...")
+        from asr_mcp.core.model_loader import load_models
+        try:
+            load_models(self.settings)
+            self.touch()
+            logger.info("Models reloaded successfully")
+        except Exception as e:
+            logger.error("Failed to reload models: %s", e)
+
+    def ensure_ready(self):
+        """Ensure models are loaded, reload if needed, and record usage."""
+        if not self.is_ready:
+            self.reload_models()
+        if self.is_ready:
+            self.touch()
 
     def clear_gpu_memory(self):
         import gc

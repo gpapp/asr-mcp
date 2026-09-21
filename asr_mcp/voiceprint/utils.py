@@ -14,6 +14,9 @@ SAMPLE_RATE = 16000
 
 
 def load_audio(wav_path: str, target_sr: int = SAMPLE_RATE) -> tuple[torch.Tensor, int]:
+    p = Path(wav_path)
+    if p.suffix.lower() != ".wav":
+        wav_path = str(ensure_wav(p))
     data, sr = sf.read(wav_path, dtype="float32")
     if data.ndim > 1:
         data = data.mean(axis=1)
@@ -64,6 +67,15 @@ def ensure_wav(file_path: Path, output_dir: Optional[Path] = None) -> Path:
         raise
 
 
+def convert_to_wav(input_path: str, output_dir: Optional[Path] = None) -> Path:
+    """Convert any audio/video format to WAV. Returns path to WAV file.
+    Caller is responsible for cleanup."""
+    p = Path(input_path)
+    if p.suffix.lower() == ".wav":
+        return p
+    return ensure_wav(p, output_dir)
+
+
 def load_audio_segment(wav_path: str, start_sec: float, end_sec: float):
     waveform, sr = load_audio(wav_path)
     start_sample = int(start_sec * SAMPLE_RATE)
@@ -97,7 +109,7 @@ def extract_speaker_audio(
 
         combined = torch.cat(all_chunks, dim=-1)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        sf.write(output_path, combined.numpy().squeeze(), SAMPLE_RATE)
+        sf.write(output_path, combined.numpy().squeeze(), SAMPLE_RATE, format="FLAC")
         logger.info("Extracted %.1fs of audio for %s -> %s",
                      combined.shape[-1] / SAMPLE_RATE, speaker_name, output_path)
         return True

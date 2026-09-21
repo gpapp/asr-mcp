@@ -199,7 +199,7 @@
             if (numSpeakers) form.append('num_speakers', numSpeakers);
 
             try {
-                const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe' : P + '/api/asr/diarize/upload';
+                const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
                 const r = await fetch(endpoint, { method: 'POST', body: form });
                 const data = await r.json();
                 resultsContent.textContent = JSON.stringify(data, null, 2);

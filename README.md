@@ -1,103 +1,173 @@
 # asr-mcp
 
-`asr-mcp` is a Python-based Model Context Protocol (MCP) server designed for advanced Audio Speech Recognition (ASR) capabilities. It provides interfaces for performing diarization (identifying different speakers) and voiceprint recognition (speaker identification) within an MCP-compliant framework.
+GPU-accelerated ASR MCP server with speaker diarization, voiceprint recognition, and streaming transcription. Built with FastAPI + ONNX Runtime CUDA.
 
 ## Features
 
-- **ASR with Diarization**: Automatically detect and separate multiple speakers in an audio stream.
-- **Voiceprint Recognition**: Identify and track specific speakers using voice embeddings.
-- **MCP Compliant**: Designed to work seamlessly with MCP-capable AI agents.
-- **Secure Access**: Nginx proxy with `htpasswd` authentication for protected MCP endpoints.
-- **Session Persistency**: Maintains state across interactions via session management.
-- **Containerized**: Fully Dockerized deployment for consistent environments.
-- **Web Interface**: Includes a dashboard/GUI for monitoring and manual interaction.
+- **ASR with Diarization**: Detect and separate multiple speakers in audio using Cohere Transcribe ONNX.
+- **Voiceprint Recognition**: Register, identify, and manage speaker profiles with ECAPA-TDNN embeddings.
+- **Streaming Transcription**: Real-time WebSocket dual-channel transcription.
+- **Auto Voiceprint Collection**: Snippets auto-collected from diarization for registered speakers.
+- **Form-Based Auth**: Session-based login with htpasswd password files.
+- **Reverse Proxy Support**: Configurable URL prefix (`TRANSCRIBE_PREFIX`) for nginx/Caddy.
+- **Multi-Format Input**: Accepts mp3, mp4, mkv, flac, ogg, m4a — auto-converts via ffmpeg.
+- **Compressed Snippets**: Voiceprint snippets stored as FLAC for efficient storage.
+- **Web Dashboard**: Upload audio, view results, manage voiceprints at `/gui` and `/voices`.
 
-## Architecture
+## Quick Start
 
-The project follows a modular architecture:
+### Docker (recommended)
 
-- **FastAPI Server**: The core application providing RESTful and MCP interfaces.
-- **Nginx**: Acts as a reverse proxy, handling authentication and routing.
-- **Docker Compose**: Orchestrates the app and any necessary sidecars.
-- **ASR Engine**: Implemented using advanced Python libraries for audio processing and speaker embedding.
-
-### Project Structure
-
-```text
-asr-mcp/
-├── asr_mcp/             # Core application logic
-│   ├── api/             # API route handlers
-│   ├── config/          # Configuration management
-│   ├── diarization/     # Diarization logic
-│   ├── speaker/         # Speaker identification/embeddings
-│   ├── static/          # Static assets for GUI
-│   ├── templates/       # HTML templates
-│   ├── data/           # Application data (runtime)
-│   └── logs/           # Application logs
-├── data/               # Persistent application data
-├── logs/               # Persistent application logs
-├── AGENTS.md           # Developer instructions and commands
-├── docker-compose.yml  # Docker orchestration
-├── requirements.txt    # Python dependencies
-└── .env.example        # Template for environment variables
+```bash
+cp .env.example .env
+# Edit .env: set TRANSCRIBE_SESSION_SECRET
+docker compose up -d --build
 ```
 
-## Getting Started
+### Local dev (CUDA GPU required)
 
-### Prerequisites
-
-- [Docker](https://www.docker.com/get-started) and [Docker Compose](https://docs.docker.com/compose/install/)
-- Python 3.10+ (for local development)
-
-### Setup
-
-1.  **Clone the repository** (not applicable here, but for others).
-2.  **Configure Environment**:
-    ```bash
-    cp .env.example .env
-    # Edit .env and set appropriate values (e.g., SESSION_SECRET)
-    ```
-3.  **Install Dependencies** (Local Development):
-    ```bash
-    python -m venv .venv
-    source .venv/bin/activate  # On Windows: .\.venv\Scripts\activate
-    pip install -r requirements.txt
-    ```
-4.  **Start Infrastructure**:
-    ```bash
-    docker-compose up -d
-    ```
-5.  **Run Server Locally**:
-    ```bash
-    python asr_mcp/server.py
-    ```
-
-### Running with Docker
-
-To build and start the containerized application:
-```bash
-docker-compose up -d --build
+```powershell
+cp .env.example .env
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python -m asr_mcp.server
 ```
 
 ## Configuration
 
-Key configuration is handled via environment variables in the `.env` file:
+All settings use the `TRANSCRIBE_` env prefix. Key variables:
 
-| Variable | Description |
-|----------|-------------|
-| `HTPASSWD_PATH` | Path to the htpasswd file for Nginx authentication |
-| `SESSION_SECRET` | Secret key for session management |
-| `DATA_DIR` | Directory for persistent application data |
-| `LOG_DIR` | Directory for application logs |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRANSCRIBE_SESSION_SECRET` | (required) | Secret key for session cookies |
+| `TRANSCRIBE_HTPASSWD_PATH` | `/app/data/.htpasswd` | Path to htpasswd file |
+| `TRANSCRIBE_PREFIX` | `""` | URL prefix for reverse proxy (e.g. `/asr-mcp`) |
+| `TRANSCRIBE_CUDA_DEVICE` | `cuda:0` | CUDA device ordinal |
+| `TRANSCRIBE_DATA_DIR` | `./data` | Data directory (SQLite DB) |
+| `TRANSCRIBE_VOICES_DIR` | `./voices` | Voiceprint snippets directory |
+| `TRANSCRIBE_DB_PATH` | `./data/asr_mcp.db` | SQLite database path |
+| `TRANSCRIBE_PORT` | `8080` | Server port |
 
-## API & MCP Interface
+## API Endpoints
 
-The server exposes several interfaces:
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/health` | GET | No | Health check + model status |
+| `/gui` | GET | Session | Dashboard — upload & process audio |
+| `/voices` | GET | Session | Voiceprint management dashboard |
+| `/login` | GET | No | Login page |
+| `/api/asr/diarize` | POST | API key | Diarize audio by file path |
+| `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
+| `/api/asr/transcribe` | POST | API key | Transcribe by file path |
+| `/api/asr/transcribe/upload` | POST | Session | Transcribe uploaded audio |
+| `/api/asr/ws/stream` | WS | No | Real-time streaming transcription |
+| `/api/speaker/register` | POST | API key | Register voiceprint |
+| `/api/speaker/identify` | POST | API key | Identify speaker |
+| `/api/speaker/list` | GET | API key | List all voiceprints |
+| `/api/speaker/{name}` | DELETE | API key | Delete voiceprint |
+| `/api/voiceprint/speakers` | GET | Session | List speakers (web UI) |
+| `/api/voiceprint/snippets/{speaker}` | GET | Session | List snippets |
+| `/api/voiceprint/upload` | POST | Session | Register voiceprint from upload |
+| `/api/voiceprint/merge` | POST | Session | Merge speakers |
+| `/api/voiceprint/rename` | POST | Session | Rename speaker |
+| `/api/voiceprint/rescan` | POST | Session | Rescan voices directory |
+| `/api/auth/login` | POST | No | Login (returns JSON) |
+| `/api/auth/logout` | POST | No | Logout |
+| `/api/user` | GET | No | Current user info |
+| `/api/mcp/tools` | GET | No | List MCP tools |
+| `/api/mcp/resources` | GET | No | List MCP resources |
+| `/api/mcp/call` | POST | No | Call MCP tool |
 
-- **MCP Interface**: Accessible via `/mcp` (requires authentication).
-- **REST API**: For programmatic access to ASR and speaker features.
-- **GUI**: Web-based dashboard for monitoring and manual interaction.
+## Architecture
 
----
+```
+Browser → nginx (/asr-mcp/) → FastAPI (port 8087) → ONNX Runtime CUDA
+                                  ├── Cohere Transcribe (encoder CUDA, decoder CPU)
+                                  ├── ECAPA-TDNN512 (embedding, CUDA)
+                                  ├── Silero VAD (CPU)
+                                  └── SQLite (voiceprints, sessions, transcripts, snippets)
+```
 
-*Built with Python, FastAPI, and MCP.*
+### Authentication Flow
+
+1. Browser requests a protected page
+2. Auth middleware checks session cookie
+3. If not authenticated → redirect to `/login`
+4. User submits credentials → `/api/auth/login` verifies against htpasswd file
+5. Session cookie set → redirect to `/gui`
+
+### Diarization Pipeline
+
+1. **VAD** — Silero VAD + energy-dip splitting
+2. **Sliding windows** — 2.0s window, 1.2s stride
+3. **FBank extraction** — 80-dim log-mel filterbanks + CMN
+4. **Embedding** — ECAPA-TDNN ONNX (192-dim), MD5-keyed LRU cache
+5. **Clustering** — AgglomerativeClustering (cosine, max 15 clusters)
+6. **Greedy merge** — Clusters with centroid distance < 0.25 merged
+7. **Boundary refinement** — Batched ONNX re-embedding at transition points
+8. **Speaker profiling** — Pitch, energy, spectral, MFCC stats
+9. **Relabel by pitch** — SPEAKER_00 = lowest pitch
+10. **Ghost elimination** — Reassign speakers with < 10s total speech
+11. **Voiceprint matching** — Multi-feature distance (emb 0.6 + pitch 0.15 + spectral 0.1 + MFCC 0.1)
+
+## Project Structure
+
+```
+asr-mcp/
+├── asr_mcp/
+│   ├── server.py              # FastAPI app + lifespan + auth routes
+│   ├── api/
+│   │   ├── router.py          # Combines sub-routers under /api
+│   │   ├── asr_router.py      # POST /asr/diarize, /transcribe, WS /ws/stream
+│   │   ├── speaker_router.py  # POST /speaker/register, /identify, GET /list
+│   │   ├── voiceprint_router.py # CRUD + upload + merge + rename + rescan
+│   │   ├── mcp_router.py      # MCP tools + resources
+│   │   ├── schemas.py         # Pydantic request/response models
+│   │   ├── security.py        # API key auth + path validation
+│   │   ├── auth.py            # htpasswd + session auth
+│   │   ├── exceptions.py      # Custom exceptions + handlers
+│   │   └── middleware.py      # Request logging, CORS
+│   ├── core/
+│   │   ├── model_state.py     # ModelState, KVCachePool, LRUCache
+│   │   ├── model_loader.py    # HuggingFace download + ORT session init
+│   │   └── transcriber.py     # Cohere ASR: mel-spec → encoder → decoder → text
+│   ├── diarization/
+│   │   ├── pipeline.py        # Diarizer: 11-step pipeline
+│   │   ├── clustering.py      # AgglomerativeClustering, greedy merge
+│   │   └── segment_ops.py     # Collapse, absorb islands, eliminate ghosts
+│   ├── speaker/
+│   │   ├── audio.py           # fbank, sliding windows, boundary refinement
+│   │   ├── embedding.py       # ONNX embedding, batch embed, pitch, energy
+│   │   ├── vad.py             # VAD (energy-dip splitting, chunked, ONNX)
+│   │   ├── matcher.py         # Multi-feature distance
+│   │   ├── profiling.py       # Pitch/energy/MFCC profiling
+│   │   └── service.py         # SpeakerService (SQLite-backed)
+│   ├── voiceprint/
+│   │   ├── service.py         # VoiceprintService (snippet CRUD, auto-collect, refine)
+│   │   └── utils.py           # Audio load/convert (ffmpeg), FLAC snippets
+│   ├── db/
+│   │   ├── models.py          # SQLAlchemy: voiceprints, snippets, sessions, transcripts
+│   │   └── manager.py         # DatabaseManager, VoiceprintDB, SnippetDB, etc.
+│   ├── sessions/
+│   │   └── manager.py         # SessionManager (SQLite-backed)
+│   ├── streaming/
+│   │   └── handler.py         # WebSocket dual-channel handler
+│   ├── config/
+│   │   ├── settings.py        # Pydantic BaseSettings (TRANSCRIBE_ prefix)
+│   │   ├── logging.py         # Structured logging (structlog)
+│   │   └── thresholds.json    # All tunable params
+│   ├── static/
+│   └── templates/
+│       ├── login.html          # Login form
+│       ├── index.html          # Audio processing dashboard
+│       └── voices.html         # Voiceprint management dashboard
+├── Dockerfile                 # nvidia/cuda:12.2.0 base
+├── docker-compose.yml         # GPU passthrough + named volumes
+├── nginx_snippet.conf         # nginx location block for /asr-mcp/
+├── requirements.txt
+├── .env
+├── .env.example
+├── .gitignore
+├── AGENTS.md
+└── README.md
+```

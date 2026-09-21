@@ -66,9 +66,30 @@ async def lifespan(app: FastAPI):
     await app.state.session_manager.initialize()
     await app.state.voiceprint_service.initialize()
 
+    # Background TTL monitor — unload GPU models after N minutes idle
+    ttl_task = None
+    if settings.model_ttl_minutes > 0:
+        async def _ttl_monitor():
+            interval = 60
+            while True:
+                await asyncio.sleep(interval)
+                if state.is_ready and state.idle_seconds() > settings.model_ttl_minutes * 60:
+                    state.unload_models()
+
+        ttl_task = asyncio.create_task(_ttl_monitor())
+        logger.info("Model TTL monitor started (%d min)", settings.model_ttl_minutes)
+
     logger.info("asr-mcp server ready on %s:%d", settings.host, settings.port)
 
     yield
+
+    # Cancel TTL task
+    if ttl_task:
+        ttl_task.cancel()
+        try:
+            await ttl_task
+        except asyncio.CancelledError:
+            pass
 
     # Shutdown
     logger.info("Shutting down...")

@@ -69,10 +69,10 @@ class VoiceprintService:
             return {"error": f"Snippet too short ({duration:.1f}s < {MIN_SNIPPET_DURATION}s)"}
 
         audio_hash = hashlib.md5(audio_data.tobytes()).hexdigest()[:12]
-        filename = f"{int(time.time())}_{audio_hash}.wav"
+        filename = f"{int(time.time())}_{audio_hash}.flac"
         file_path = speaker_dir / filename
 
-        sf.write(str(file_path), audio_data.astype(np.float32), sample_rate)
+        sf.write(str(file_path), audio_data.astype(np.float32), sample_rate, format="FLAC")
 
         snippet_id = self._snippets.add(
             speaker_name=speaker_name,
@@ -243,7 +243,7 @@ class VoiceprintService:
             for sn in self._snippets.list_by_speaker(speaker_name, user_id=user_id):
                 existing_paths.add(sn["file_path"])
 
-        audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+            audio_exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
         added = 0
         scanned = 0
         speakers_found = []

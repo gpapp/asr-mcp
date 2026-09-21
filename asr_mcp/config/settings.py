@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     vad_threshold: float = 0.5
     vad_min_speech_duration_ms: int = 250
 
+    # Model idle timeout (minutes). 0 = never unload
+    model_ttl_minutes: int = Field(default=0, description="Unload GPU models after N minutes of inactivity. 0=never")
+
     # HuggingFace
     hf_token: Optional[str] = None
 
