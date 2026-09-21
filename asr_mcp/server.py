@@ -1,10 +1,12 @@
 import asyncio
+import base64
 import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -142,6 +144,19 @@ async def voices():
     if voices_file.exists():
         return HTMLResponse(content=voices_file.read_text(encoding="utf-8"))
     return HTMLResponse(content="<h1>Voice manager not available</h1>")
+
+
+@app.get("/api/user")
+async def get_user(authorization: Optional[str] = Header(None)):
+    if authorization and authorization.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(authorization[6:]).decode("utf-8")
+            username = decoded.split(":")[0]
+            return {"username": username, "authenticated": True}
+        except Exception:
+            pass
+    from asr_mcp.api.security import DEFAULT_USER
+    return {"username": DEFAULT_USER, "authenticated": False}
 
 
 @app.post("/shutdown")

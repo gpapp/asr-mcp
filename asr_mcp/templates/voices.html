@@ -9,8 +9,9 @@
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #333; }
         .header { background: #1a1a2e; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
         .header h1 { font-size: 1.4rem; }
-        .header nav a { color: #8be9fd; text-decoration: none; margin-left: 1.5rem; font-size: 0.9rem; }
-        .header nav a:hover { text-decoration: underline; }
+        .header nav a { color: #8be9fd; text-decoration: none; margin-left: 1.5rem; font-size: 0.9rem; padding: 0.3rem 0.6rem; border-radius: 4px; transition: background 0.15s; }
+        .header nav a:hover, .header nav a.active { background: rgba(139,233,253,0.15); text-decoration: none; }
+        .header .user-info { color: #50fa7b; font-size: 0.85rem; }
         .container { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
         .toolbar { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
         .btn { padding: 0.5rem 1rem; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500; transition: background 0.15s; }
@@ -65,11 +66,11 @@
 </head>
 <body>
     <div class="header">
-        <h1>ASR-MCP Voice Manager</h1>
+        <h1>ASR-MCP</h1>
         <nav>
-            <a href="/">Dashboard</a>
-            <a href="/gui">GUI</a>
-            <a href="/health">Health</a>
+            <a href="/gui">Process Transcription</a>
+            <a href="/voices" class="active">Manage Voiceprints</a>
+            <span class="user-info" id="userDisplay">...</span>
         </nav>
     </div>
 
@@ -292,6 +293,17 @@
         return path.split(/[/\\]/).pop();
     }
 
+    async function loadUser() {
+        try {
+            const r = await fetch('/api/user');
+            const d = await r.json();
+            document.getElementById('userDisplay').textContent = d.authenticated ? d.username : 'anonymous';
+        } catch (e) {
+            document.getElementById('userDisplay').textContent = '';
+        }
+    }
+
+    loadUser();
     refresh();
     </script>
 </body>

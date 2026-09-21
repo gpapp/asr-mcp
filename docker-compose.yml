@@ -18,10 +18,10 @@ services:
       - TRANSCRIBE_DB_PATH=/app/data/asr_mcp.db
       - TRANSCRIBE_HTPASSWD_PATH=/app/htpasswd
     volumes:
-      - ${PWD}/data:/app/data
-      - ${PWD}/logs:/app/logs
-      - ${PWD}/models:/app/models
-      - ${PWD}/voices:/app/voices
+      - ${DATA_DIR}/data:/app/data
+      - ${DATA_DIR}/logs:/app/logs
+      - ${DATA_DIR}/models:/app/models
+      - ${DATA_DIR}/voices:/app/voices
     deploy:
       resources:
         reservations:
