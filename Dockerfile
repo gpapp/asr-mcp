@@ -15,7 +15,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
-    --extra-index-url https://download.pytorch.org/whl/cu121 \
+    torch torchaudio \
+    --index-url https://download.pytorch.org/whl/cu121 && \
+    python3 -m pip install \
     -r requirements.txt
 
 COPY asr_mcp ./asr_mcp
