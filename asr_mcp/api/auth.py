@@ -119,8 +119,6 @@ def require_auth(request: Request) -> Optional[RedirectResponse]:
 
 def login_user(request: Request, username: str) -> None:
     """Store username in session."""
-    if "session" not in request.scope:
-        request.scope["session"] = {}
     request.scope["session"]["user"] = username
 
 

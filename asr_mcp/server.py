@@ -9,6 +9,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 logger = logging.getLogger("asr_mcp.server")
@@ -85,7 +86,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Session middleware (must be first)
+# Auth middleware — added FIRST so it's innermost (runs AFTER SessionMiddleware)
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        from asr_mcp.api.auth import require_auth
+        redirect = require_auth(request)
+        if redirect:
+            return redirect
+        return await call_next(request)
+
+app.add_middleware(AuthMiddleware)
+
+# Session middleware
 from asr_mcp.config.settings import get_settings as _init_settings
 _init_secret = _init_settings().session_secret
 app.add_middleware(
@@ -117,16 +129,6 @@ register_exception_handlers(app)
 # API Router
 from asr_mcp.api.router import api_router
 app.include_router(api_router)
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    from asr_mcp.api.auth import require_auth
-    redirect = require_auth(request)
-    if redirect:
-        return redirect
-    response = await call_next(request)
-    return response
 
 
 # Static files & templates
