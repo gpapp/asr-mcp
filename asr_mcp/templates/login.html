@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASR-MCP Login</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .login-box { background: #16213e; border-radius: 12px; padding: 2.5rem; width: 380px; box-shadow: 0 4px 30px rgba(0,0,0,0.3); }
+        .login-box h1 { font-size: 1.5rem; margin-bottom: 0.3rem; color: #8be9fd; }
+        .login-box .subtitle { font-size: 0.85rem; color: #6272a4; margin-bottom: 2rem; }
+        .form-group { margin-bottom: 1.2rem; }
+        .form-group label { display: block; font-size: 0.85rem; color: #bd93f9; margin-bottom: 0.4rem; font-weight: 500; }
+        .form-group input { width: 100%; padding: 0.7rem 0.9rem; border: 1px solid #44475a; border-radius: 6px; background: #0d1117; color: #f8f8f2; font-size: 0.9rem; outline: none; transition: border 0.2s; }
+        .form-group input:focus { border-color: #8be9fd; }
+        .btn { width: 100%; padding: 0.7rem; border: none; border-radius: 6px; background: #50fa7b; color: #1a1a2e; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+        .btn:hover { background: #3ad65e; }
+        .error { background: #ff5555; color: white; padding: 0.6rem 1rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 1rem; display: none; }
+        .error.show { display: block; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h1>ASR-MCP</h1>
+        <div class="subtitle">Sign in to continue</div>
+
+        <div class="error" id="errorMsg"></div>
+
+        <form id="loginForm" onsubmit="return handleLogin(event)">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn" id="loginBtn">Sign In</button>
+        </form>
+    </div>
+
+    <script>
+        async function handleLogin(e) {
+            e.preventDefault();
+            const btn = document.getElementById('loginBtn');
+            const errEl = document.getElementById('errorMsg');
+            errEl.className = 'error';
+            btn.disabled = true;
+            btn.textContent = 'Signing in...';
+
+            const form = new FormData(document.getElementById('loginForm'));
+            try {
+                const r = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        username: form.get('username'),
+                        password: form.get('password'),
+                    }),
+                });
+                const data = await r.json();
+                if (data.success) {
+                    window.location.href = data.redirect || '/gui';
+                } else {
+                    errEl.textContent = data.error || 'Invalid credentials';
+                    errEl.className = 'error show';
+                }
+            } catch (err) {
+                errEl.textContent = 'Connection error';
+                errEl.className = 'error show';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Sign In';
+            }
+            return false;
+        }
+    </script>
+</body>
+</html>

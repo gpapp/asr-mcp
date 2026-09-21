@@ -11,7 +11,9 @@
         .header h1 { font-size: 1.4rem; }
         .header nav a { color: #8be9fd; text-decoration: none; margin-left: 1.5rem; font-size: 0.9rem; padding: 0.3rem 0.6rem; border-radius: 4px; transition: background 0.15s; }
         .header nav a:hover, .header nav a.active { background: rgba(139,233,253,0.15); text-decoration: none; }
-        .header .user-info { color: #50fa7b; font-size: 0.85rem; }
+        .header .user-info { color: #50fa7b; font-size: 0.85rem; display: flex; align-items: center; gap: 0.8rem; }
+        .header .user-info a { color: #ff6b6b; text-decoration: none; font-size: 0.8rem; }
+        .header .user-info a:hover { text-decoration: underline; }
         .container { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
         .toolbar { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
         .btn { padding: 0.5rem 1rem; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500; transition: background 0.15s; }
@@ -297,7 +299,12 @@
         try {
             const r = await fetch('/api/user');
             const d = await r.json();
-            document.getElementById('userDisplay').textContent = d.authenticated ? d.username : 'anonymous';
+            const el = document.getElementById('userDisplay');
+            if (d.authenticated) {
+                el.innerHTML = escHtml(d.username) + ' <a href="/api/auth/logout">logout</a>';
+            } else {
+                el.innerHTML = '<a href="/login">login</a>';
+            }
         } catch (e) {
             document.getElementById('userDisplay').textContent = '';
         }
