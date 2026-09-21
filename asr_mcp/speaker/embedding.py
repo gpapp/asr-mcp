@@ -3,10 +3,30 @@ import logging
 from typing import Optional
 
 import numpy as np
+import onnxruntime as ort
 import torch
 import torchaudio
 
 logger = logging.getLogger("asr_mcp.speaker.embedding")
+
+_cpu_embedding_cache: dict[str, ort.InferenceSession] = {}
+
+
+def _run_with_cpu_fallback(session, feed, output_names):
+    try:
+        return session.run(output_names, feed)
+    except ort.ORTRuntimeError as e:
+        if "Failed to allocate memory" in str(e):
+            logger.warning("GPU OOM on embedding, falling back to CPU")
+            model_path = session.get_modelmeta().model_path
+            if model_path not in _cpu_embedding_cache:
+                cpu_so = ort.SessionOptions()
+                cpu_so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                _cpu_embedding_cache[model_path] = ort.InferenceSession(
+                    model_path, sess_options=cpu_so, providers=["CPUExecutionProvider"],
+                )
+            return _cpu_embedding_cache[model_path].run(output_names, feed)
+        raise
 
 
 def extract_embedding(
@@ -30,8 +50,8 @@ def extract_embedding(
     input_name = embedding_session.get_inputs()[0].name
     output_name = embedding_session.get_outputs()[0].name
 
-    embedding = embedding_session.run(
-        [output_name], {input_name: fbank_np}
+    embedding = _run_with_cpu_fallback(
+        embedding_session, {input_name: fbank_np}, [output_name]
     )[0]
 
     # Mean pool and L2 normalize
@@ -80,8 +100,8 @@ def batch_embed_files(
 
                 input_name = embedding_session.get_inputs()[0].name
                 output_name = embedding_session.get_outputs()[0].name
-                embedding = embedding_session.run(
-                    [output_name], {input_name: fbank_np}
+                embedding = _run_with_cpu_fallback(
+                    embedding_session, {input_name: fbank_np}, [output_name]
                 )[0]
 
                 if embedding.ndim == 3:
