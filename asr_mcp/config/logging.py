@@ -35,7 +35,7 @@ def setup_logging(log_dir: Path = Path("./logs"), debug: bool = False) -> loggin
                 structlog.processors.TimeStamper(fmt="iso"),
                 structlog.processors.StackInfoRenderer(),
                 structlog.processors.format_exc_info,
-                structlog.dev.ConsoleRenderer() if sys.stderr.isatty() else structlog.processors.JSONRenderer(),
+                structlog.dev.ConsoleRenderer(),
             ],
             wrapper_class=structlog.stdlib.BoundLogger,
             context_class=dict,
@@ -43,7 +43,7 @@ def setup_logging(log_dir: Path = Path("./logs"), debug: bool = False) -> loggin
             cache_logger_on_first_use=True,
         )
         formatter = structlog.stdlib.ProcessorFormatter(
-            processor=structlog.dev.ConsoleRenderer() if sys.stderr.isatty() else structlog.processors.JSONRenderer(),
+            processor=structlog.dev.ConsoleRenderer(),
         )
     else:
         formatter = logging.Formatter(
