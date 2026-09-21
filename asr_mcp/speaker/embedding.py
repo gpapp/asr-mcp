@@ -33,6 +33,7 @@ def extract_embedding(
     waveform: torch.Tensor,
     sample_rate: int,
     embedding_session,
+    max_chunk_sec: float = 60.0,
 ) -> np.ndarray:
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
@@ -43,20 +44,37 @@ def extract_embedding(
     # CMN (Cepstral Mean Normalization)
     fbank = fbank - fbank.mean(dim=0, keepdim=True)
 
-    fbank_np = fbank.numpy().astype(np.float32)
-    if fbank_np.ndim == 2:
-        fbank_np = fbank_np[np.newaxis]
+    max_frames = int(max_chunk_sec * 100)  # ~100 frames/sec with default hop
+    if fbank.shape[0] > max_frames:
+        embeddings = []
+        for start in range(0, fbank.shape[0], max_frames):
+            chunk = fbank[start:start + max_frames]
+            chunk_np = chunk.numpy().astype(np.float32)[np.newaxis]
+            input_name = embedding_session.get_inputs()[0].name
+            output_name = embedding_session.get_outputs()[0].name
+            emb = _run_with_cpu_fallback(
+                embedding_session, {input_name: chunk_np}, [output_name]
+            )[0]
+            if emb.ndim == 3:
+                emb = emb.mean(axis=1)
+            embeddings.append(emb)
+        embedding = np.mean(embeddings, axis=0)
+    else:
+        fbank_np = fbank.numpy().astype(np.float32)
+        if fbank_np.ndim == 2:
+            fbank_np = fbank_np[np.newaxis]
 
-    input_name = embedding_session.get_inputs()[0].name
-    output_name = embedding_session.get_outputs()[0].name
+        input_name = embedding_session.get_inputs()[0].name
+        output_name = embedding_session.get_outputs()[0].name
 
-    embedding = _run_with_cpu_fallback(
-        embedding_session, {input_name: fbank_np}, [output_name]
-    )[0]
+        embedding = _run_with_cpu_fallback(
+            embedding_session, {input_name: fbank_np}, [output_name]
+        )[0]
 
-    # Mean pool and L2 normalize
-    if embedding.ndim == 3:
-        embedding = embedding.mean(axis=1)
+        # Mean pool and L2 normalize
+        if embedding.ndim == 3:
+            embedding = embedding.mean(axis=1)
+
     embedding = embedding.reshape(1, -1) if embedding.ndim == 1 else embedding
     norm = np.linalg.norm(embedding, axis=1, keepdims=True)
     embedding = embedding / (norm + 1e-8)
@@ -69,7 +87,7 @@ def batch_embed_files(
     sample_rates: list[int],
     durations: list[float],
     embedding_session,
-    block_sec: float = 600.0,
+    block_sec: float = 60.0,
 ) -> list[Optional[np.ndarray]]:
     from asr_mcp.speaker.audio import extract_fbank
 
