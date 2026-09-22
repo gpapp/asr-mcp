@@ -13,7 +13,7 @@ import librosa
 import onnxruntime as ort
 from scipy.signal import spectrogram
 
-from asr_mcp.core.model_state import state, is_gpu_oom, log_gpu_memory
+from asr_mcp.core.model_state import state, is_gpu_oom, log_gpu_memory, GPU_SHRINK_RUN_OPTIONS
 
 logger = logging.getLogger("asr_mcp.core.transcriber")
 
@@ -41,7 +41,8 @@ def _run_encoder(feed: dict):
     never silently dropped due to GPU memory exhaustion.
     """
     try:
-        return state.encoder_session.run(None, feed)
+        return state.encoder_session.run(None, feed,
+                                         run_options=GPU_SHRINK_RUN_OPTIONS)
     except Exception as e:
         if not is_gpu_oom(e):
             raise
@@ -51,7 +52,8 @@ def _run_encoder(feed: dict):
             from asr_mcp.core.model_loader import reload_encoder_session
             reload_encoder_session(state.settings)
             log_gpu_memory("encoder OOM after reload")
-            return state.encoder_session.run(None, feed)
+            return state.encoder_session.run(None, feed,
+                                             run_options=GPU_SHRINK_RUN_OPTIONS)
         except Exception as e2:
             if not is_gpu_oom(e2):
                 raise

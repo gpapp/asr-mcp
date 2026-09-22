@@ -7,7 +7,7 @@ import onnxruntime as ort
 import torch
 import torchaudio
 
-from asr_mcp.core.model_state import is_gpu_oom, log_gpu_memory
+from asr_mcp.core.model_state import is_gpu_oom, log_gpu_memory, GPU_SHRINK_RUN_OPTIONS
 
 logger = logging.getLogger("asr_mcp.speaker.embedding")
 
@@ -16,7 +16,7 @@ _cpu_embedding_cache: dict[str, ort.InferenceSession] = {}
 
 def _run_with_cpu_fallback(session, feed, output_names):
     try:
-        return session.run(output_names, feed)
+        return session.run(output_names, feed, run_options=GPU_SHRINK_RUN_OPTIONS)
     except Exception as e:
         if is_gpu_oom(e):
             logger.warning("GPU OOM on embedding, falling back to CPU: %s", e)

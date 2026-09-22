@@ -233,19 +233,25 @@ def load_models(settings: Settings) -> None:
 
 
 def reload_encoder_session(settings: Settings, force_cpu: bool = False) -> None:
+    import gc
     so = get_session_options(settings)
     model_dir = Path(settings.model_dir)
     encoder_file = f"onnx/encoder_model{settings.encoder_model_type}.onnx"
     providers = ["CPUExecutionProvider"] if force_cpu else _get_providers(settings, "encoder")
+    state.encoder_session = None
+    gc.collect()
     state.encoder_session = ort.InferenceSession(
         str(model_dir / encoder_file), sess_options=so, providers=providers
     )
 
 
 def reload_embedding_session(settings: Settings, force_cpu: bool = False) -> None:
+    import gc
     so = get_session_options(settings)
     emb_path = ensure_embedding_model(settings)
     providers = ["CPUExecutionProvider"] if force_cpu else _get_providers(settings, "embedding")
+    state.embedding_session = None
+    gc.collect()
     state.embedding_session = ort.InferenceSession(
         str(emb_path), sess_options=so, providers=providers
     )

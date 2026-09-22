@@ -7,10 +7,18 @@ from contextlib import contextmanager
 from typing import Any, Optional
 
 import numpy as np
+import onnxruntime as ort
 
 logger = logging.getLogger("asr_mcp.core.model_state")
 
 EMBEDDING_CACHE_MAX_SIZE = 5000
+
+# Shrink the GPU arena after every run — without this the arena only
+# releases on full session reload (reload_encoder_session / reload_embedding_session).
+GPU_SHRINK_RUN_OPTIONS = ort.RunOptions()
+GPU_SHRINK_RUN_OPTIONS.add_run_config_entry(
+    "memory.enable_memory_arena_shrinkage", "gpu:0"
+)
 
 
 class KVCachePool:
@@ -240,7 +248,8 @@ executor: Optional[ThreadPoolExecutor] = None
 def run_embedding(input_feed: dict) -> list[np.ndarray]:
     import onnxruntime as ort
     output_names = [o.name for o in state.embedding_session.get_outputs()]
-    return state.embedding_session.run(output_names, input_feed)
+    return state.embedding_session.run(output_names, input_feed,
+                                       run_options=GPU_SHRINK_RUN_OPTIONS)
 
 
 def is_gpu_oom(err: BaseException) -> bool:
