@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     from asr_mcp.speaker.service import SpeakerService
     from asr_mcp.sessions.manager import SessionManager
     from asr_mcp.voiceprint.service import VoiceprintService
-    from asr_mcp.core.job_state import job_state
+    from asr_mcp.core import job_state
 
     settings = get_settings()
     setup_logging(settings.log_dir, log_level=settings.log_level)
