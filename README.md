@@ -47,6 +47,8 @@ All settings use the `TRANSCRIBE_` env prefix. Key variables:
 | `TRANSCRIBE_VOICES_DIR` | `./voices` | Voiceprint snippets directory |
 | `TRANSCRIBE_DB_PATH` | `./data/asr_mcp.db` | SQLite database path |
 | `TRANSCRIBE_PORT` | `8080` | Server port |
+| `TRANSCRIBE_MODEL_TTL_MINUTES` | `5` | Idle minutes before GPU models unload (0 = never; skipped while a job is active) |
+| `TRANSCRIBE_GPU_MEMORY_LIMIT_GB` | `4.0` | GPU size hint for CUDA arena caps (encoder ×0.625, embedding min(÷4, 768 MiB)) |
 
 ## API Endpoints
 
@@ -88,6 +90,12 @@ Browser → nginx (/asr-mcp/) → FastAPI (port 8087) → ONNX Runtime CUDA
                                   └── SQLite (voiceprints, sessions, transcripts, snippets)
 ```
 
+Models are **lazy-loaded on first use** (nothing loads at server start) and idle models
+unload after `TRANSCRIBE_MODEL_TTL_MINUTES` (default 5; skipped while a job runs).
+CUDA arenas are capped (encoder ≈2.5 GB, embedding ≤768 MiB on a 4 GB card), shrink
+after every run (`memory.enable_memory_arena_shrinkage=gpu:0`), and OOM recovery
+reloads a fresh arena before falling back to CPU.
+
 ### Authentication Flow
 
 1. Browser requests a protected page
@@ -96,19 +104,21 @@ Browser → nginx (/asr-mcp/) → FastAPI (port 8087) → ONNX Runtime CUDA
 4. User submits credentials → `/api/auth/login` verifies against htpasswd file
 5. Session cookie set → redirect to `/gui`
 
-### Diarization Pipeline
+### Diarization Pipeline (13 steps)
 
-1. **VAD** — Silero VAD + energy-dip splitting
-2. **Sliding windows** — 2.0s window, 1.2s stride
-3. **FBank extraction** — 80-dim log-mel filterbanks + CMN
-4. **Embedding** — ECAPA-TDNN ONNX (192-dim), MD5-keyed LRU cache
-5. **Clustering** — AgglomerativeClustering (cosine, max 15 clusters)
-6. **Greedy merge** — Clusters with centroid distance < 0.25 merged
-7. **Boundary refinement** — Batched ONNX re-embedding at transition points
-8. **Speaker profiling** — Pitch, energy, spectral, MFCC stats
-9. **Relabel by pitch** — SPEAKER_00 = lowest pitch
-10. **Ghost elimination** — Reassign speakers with < 10s total speech
-11. **Voiceprint matching** — Multi-feature distance (emb 0.6 + pitch 0.15 + spectral 0.1 + MFCC 0.1)
+1. **VAD** — Silero ONNX → speech regions, merge gaps <1s
+2. **Energy-dip splitting** — split long segments at quiet dips
+3. **Sliding windows** — 3.0s window, 2.5s stride (embeddings only)
+4. **Embedding** — ECAPA-TDNN512 ONNX (192-dim), MD5-keyed LRU cache
+5. **Clustering** — AgglomerativeClustering (cosine, average linkage)
+6. **Greedy merge** — centroid distance < 0.25 merged
+7. **Collapse** — same-speaker merge (max gap 0.5s) + absorb islands
+8. **Boundary refinement** — re-embedding at transitions
+9. **Speaker profiling** — Pitch, energy, spectral, MFCC stats
+10. **Merge similar speakers** — embed-only threshold 0.2
+11. **Relabel by pitch** — "Speaker 1" = highest pitch (always `Speaker N`, 1-indexed)
+12. **Ghost elimination** — speakers with < 5s total speech absorbed
+13. **Voiceprint matching** — Multi-feature distance (emb 0.6 + pitch 0.15 + spectral 0.1 + MFCC 0.1)
 
 ## Project Structure
 
@@ -128,11 +138,12 @@ asr-mcp/
 │   │   ├── exceptions.py      # Custom exceptions + handlers
 │   │   └── middleware.py      # Request logging, CORS
 │   ├── core/
-│   │   ├── model_state.py     # ModelState, KVCachePool, LRUCache
-│   │   ├── model_loader.py    # HuggingFace download + ORT session init
+│   │   ├── model_state.py     # ModelState, is_gpu_oom, GPU_SHRINK_RUN_OPTIONS, lazy-load/TTL
+│   │   ├── model_loader.py    # HuggingFace download + ORT session init (arena caps)
+│   │   ├── job_state.py       # Active job tracking (start/publish/finish/attach)
 │   │   └── transcriber.py     # Cohere ASR: mel-spec → encoder → decoder → text
 │   ├── diarization/
-│   │   ├── pipeline.py        # Diarizer: 11-step pipeline
+│   │   ├── pipeline.py        # Diarizer: 13-step pipeline
 │   │   ├── clustering.py      # AgglomerativeClustering, greedy merge
 │   │   └── segment_ops.py     # Collapse, absorb islands, eliminate ghosts
 │   ├── speaker/
@@ -154,12 +165,14 @@ asr-mcp/
 │   │   └── handler.py         # WebSocket dual-channel handler
 │   ├── config/
 │   │   ├── settings.py        # Pydantic BaseSettings (TRANSCRIBE_ prefix)
-│   │   ├── logging.py         # Structured logging (structlog)
+│   │   ├── logging.py         # Structured logging (stdlib)
 │   │   └── thresholds.json    # All tunable params
 │   ├── static/
 │   └── templates/
+│       ├── _nav.html          # Shared top menu snippet
 │       ├── login.html          # Login form
-│       ├── index.html          # Audio processing dashboard
+│       ├── index.html          # Audio upload dashboard
+│       ├── transcripts.html    # Transcription history
 │       └── voices.html         # Voiceprint management dashboard
 ├── Dockerfile                 # nvidia/cuda:12.2.0 base
 ├── docker-compose.yml         # GPU passthrough + named volumes

@@ -37,11 +37,20 @@ After completing any code changes:
 - `TRANSCRIBE_PREFIX` sets URL prefix for redirects behind reverse proxy
 
 ### GPU Backend
-- **ASR Encoder**: ONNX Runtime CUDA EP (float16) — chunked input for long audio (>30s)
+- **ASR Encoder**: ONNX Runtime CUDA EP — chunked input for long audio (>30s). Arena cap `gpu_memory_limit_gb×0.625` (2560 MiB @ 4GB) + `cudnn_conv_algo_search: HEURISTIC`. OOM escalation (`_run_encoder`): reload fresh arena → retry GPU → cached CPU session (success = no error field).
 - **ASR Decoder**: ONNX Runtime CPU — receives `encoder_hidden_states` + KV caches (8 layers)
-- **ECAPA-TDNN512 Embedding**: ONNX Runtime CUDA EP (192-dim) — fbank chunking (60s max) + CPU OOM fallback
+- **ECAPA-TDNN512 Embedding**: ONNX Runtime CUDA EP (192-dim) — fbank chunking (60s max); arena cap `min(gpu_memory_limit_gb/4, 768 MiB)`; OOM → cached CPU session (`_run_with_cpu_fallback`)
 - **Silero VAD**: ONNX Runtime CPU — with state/sr inputs, h/c hidden state updates
-- Peak VRAM: ~2.6GB
+- **Arena shrinkage**: every GPU run passes `GPU_SHRINK_RUN_OPTIONS` (`memory.enable_memory_arena_shrinkage=gpu:0`, defined in `model_state.py`) so arenas release after each run instead of holding peak until session reload. Reload helpers clear the old session + `gc.collect()` BEFORE constructing the new one (no double-arena peak).
+- Peak VRAM: ~2.6GB with caps (target card: GTX 1650, 4096 MiB)
+
+### Model Lifecycle (lazy load + TTL + phase unloads)
+- **No auto-load at server start** — `server.py` lifespan does NOT load models; first GPU request calls `state.ensure_ready()`. Endpoint rule: any endpoint that embeds/transcribes/diarizes must call `ensure_ready()` (or be behind a handler that does).
+- **TTL**: `model_ttl_minutes` (default **5**) — monitor in `server.py` unloads idle models only when `state.any_loaded and idle > ttl` AND `job_state.get_running() is None`. Never unload mid-job.
+- **Phase unloads** (models not needed in a phase get freed for the next):
+  - `/diarize` + `/diarize/upload`: `unload_encoder()` at job start (diarize never uses the encoder)
+  - `/transcribe/upload`: `unload_embedding()` right after the `diarization_complete` SSE emit (auto-collect + boundary refinement already done; embedding never used again)
+- **Live session resolution**: NEVER pin a copy of `state.*_session` into other objects. `VoiceprintService._emb_session()` resolves `state.embedding_session` at call time (`set_embedding_session` has zero callers — pins caused `'NoneType' has no attribute get_inputs` after lazy unload).
 
 ### Transcription Chunking (Long Audio)
 
@@ -108,8 +117,9 @@ asr-mcp/
 │   │   ├── exceptions.py      # Custom exceptions + handlers
 │   │   └── middleware.py      # Request logging
 │   ├── core/
-│   │   ├── model_state.py     # ModelState, KVCachePool, LRUCache
-│   │   ├── model_loader.py    # HuggingFace download + ORT session init (CUDA EP)
+│   │   ├── model_state.py     # ModelState, is_gpu_oom, log_gpu_memory, GPU_SHRINK_RUN_OPTIONS, run_embedding
+│   │   ├── model_loader.py    # HuggingFace download + ORT session init (CUDA EP, arena caps)
+│   │   ├── job_state.py       # Active job tracking: start/publish/finish/attach (import the MODULE)
 │   │   └── transcriber.py     # Cohere ASR: mel-spec → encoder → decoder → text
 │   ├── diarization/
 │   │   ├── pipeline.py        # Diarizer: 13-step pipeline
@@ -215,12 +225,14 @@ asr-mcp/
 | `TRANSCRIBE_MODEL_CACHE_DIR` | `./models` | ONNX model cache |
 | `TRANSCRIBE_DIARIZATION_THRESHOLD` | `0.35` | Clustering cosine threshold |
 | `TRANSCRIBE_VAD_THRESHOLD` | `0.5` | VAD speech probability cutoff |
+| `TRANSCRIBE_MODEL_TTL_MINUTES` | `5` | Idle minutes before GPU models unload (0 = disabled); skipped while a job is active |
+| `TRANSCRIBE_GPU_MEMORY_LIMIT_GB` | `4.0` | GPU size hint for CUDA arena caps (encoder = ×0.625, embedding = ÷4 capped at 768 MiB) |
 | `TRANSCRIBE_HF_TOKEN` | - | HuggingFace token for gated models |
 | `API_KEYS` | - | Comma-separated API keys |
 
 ## Known Issues
 
-- **CUDA OOM on large files**: Reduce max_audio_duration_sec or use --num-speakers to limit clusters
+- **CUDA OOM on large files**: arena caps + per-run shrinkage + reload-fresh-arena + CPU fallback now recover automatically (window may be slow on CPU, but no silent holes); reduce max_audio_duration_sec if still OOM
 - **No CUDA available**: Server starts but models fail to load; API returns errors for ASR operations
 - **SQLite locking**: Concurrent writes may fail under heavy load; WAL mode recommended for production
 - **ffmpeg required**: Audio format conversion requires ffmpeg installed in Docker image
@@ -252,12 +264,13 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 
 ### 5. ONNX Runtime Error Handling
 - `onnxruntime` has NO `ORTRuntimeError` attribute. Catch `Exception` and gate on `is_gpu_oom(e)` — ORT ≥1.22 raises `onnxruntime_pybind11_state.RuntimeException` which inherits `Exception`, NOT `RuntimeError`, so `except RuntimeError` silently never fires.
-- Check error message content: `"Failed to allocate memory"` indicates GPU OOM.
-- **Why**: Every OOM was silently re-raised because the except clause itself threw `AttributeError`.
+- `is_gpu_oom` (model_state.py) matches, case-lowered: `failed to allocate memory`, `out of memory`, `out_of_memory`, `available memory of`, `smaller than requested bytes` — the last two exist because arena-cap messages (`Available memory of 0 is smaller than requested bytes of 97517568`) don't contain "Failed to allocate memory".
+- Pattern: `except Exception as e: if not is_gpu_oom(e): raise` then recover.
+- **Why**: Every OOM was silently re-raised because (a) the except clause itself threw `AttributeError`, then (b) `except RuntimeError` never matched ORT's exception type, then (c) the arena-cap message didn't match the string.
 
 ### 6. Embedding GPU OOM → CPU Fallback with Chunking
 - ECAPA-TDNN512 embedding on CUDA can OOM after encoder has consumed VRAM.
-- `_run_with_cpu_fallback()` catches `RuntimeError` and retries on CPU with cached sessions.
+- `_run_with_cpu_fallback()` catches `Exception` gated by `is_gpu_oom(e)` (NOT `RuntimeError` — see lesson 5) and retries on CPU with cached sessions.
 - For long audio: `extract_embedding()` chunks fbank into 60s pieces, embeds each, averages, L2-normalizes.
 - `batch_embed_files()` uses `block_sec=60.0` (not 600.0) to prevent huge ONNX calls.
 
@@ -323,32 +336,48 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - Apply ONE shared cut per gap (`left.end == right.start`), clamped into `[gap_start, gap_end]` so turns stay contiguous and can never overlap or chain-react. Cut = exact start of the first right-owned section, or `gap_end` when all-left.
 - Log `Boundary refinement N: ... cut at X.XXs` — grep this to confirm the refinement is active after a rebuild.
 
-### 12. SSE Producers Must Yield AND Run Heavy Work Off-Loop
+### 19. SSE Producers Must Yield AND Run Heavy Work Off-Loop
 - `await queue.put()` on an unbounded `asyncio.Queue` NEVER suspends — the consumer doesn't run and all events flush in one burst when the job ends.
 - `_sse_put()` = `queue.put()` + `await asyncio.sleep(0.01)`. `sleep(0)` alone is insufficient: the BaseHTTPMiddleware body pump + uvicorn transport need a real tick to flush bytes.
 - Yielding is not enough for CPU-heavy work (ONNX decode, clustering): it starves the loop regardless. Run turns via `loop.run_in_executor(None, ...)`; thread-side progress uses `loop.call_soon_threadsafe(queue.put_nowait, evt)`.
 
-### 13. Starlette Middleware Order — Last Added Runs Outermost
+### 20. Starlette Middleware Order — Last Added Runs Outermost
 - `app.add_middleware()` prepends to the stack: the LAST middleware added wraps all earlier ones and runs FIRST.
 - Working order in `server.py`: AuthMiddleware added first (inner), SessionMiddleware added second (outer) → Session populates `request.scope["session"]` before Auth reads it.
 - **Why**: An attempted swap (to "fix" SSE 401s) broke auth and was reverted. SSE endpoints are not in `PUBLIC_PATHS` and depend on this order to see the session cookie. Do not reorder without tracing who populates `scope["session"]` first.
 
-### 14. CSS for JS-generated Elements Must Not Be Scoped Under Classes JS Never Adds
+### 21. CSS for JS-generated Elements Must Not Be Scoped Under Classes JS Never Adds
 - Timeline styles were scoped `.speaker-timeline .bar-seg`, but `renderTimeline()` never added that class → `position:absolute` etc. silently no-op'd: segments stacked (one visible speaker), legend swatches got zero size.
 - Rule: add the scoping class in JS OR write selectors against the real elements. Verify by inspecting computed styles, not just rendered HTML.
 
-### 15. Display REFINED Segments, Not Raw Diarization
+### 22. Display REFINED Segments, Not Raw Diarization
 - `_prepare_turns()` closes inter-turn gaps (VAD voiceprint attribution + midpoint cuts) so turns cover the full timeline. Emit ITS output in `diarization_complete` and set `diarization["segments"]` to it — raw segments leave visible gaps between bands.
 - Strip the nested `segments` list before emitting (`{start, end, speaker}` only) to keep SSE payloads small.
 - `auto_collect_from_diarization()` must still receive the RAW segments (happens before replacement).
 
-### 16. Progress UI Needs Sub-Turn Time Interpolation
+### 23. Progress UI Needs Sub-Turn Time Interpolation
 - Window-progress events for one long turn all carried the same `segment_start`/`segment_end` → the caret never moved despite events arriving.
 - Interpolate per window in `_make_window_cb`: `win_start = turn.start + span * (i-1)/n`.
 - Elements shown under a bar whose container has `overflow:hidden` must live in a sibling wrapper or they are clipped (caret moved into `position:relative; padding-bottom` wrapper).
 - UI chrome shared across pages (top nav) lives in `templates/_nav.html`, injected by `_render(name, active=...)` via `__NAV__` + `__ACT_*__` markers — edit the snippet, not each page.
 
-### 17. Paragraph Breaks at Pauses Must Snap to Sentence Ends
+### 24. Paragraph Breaks at Pauses Must Snap to Sentence Ends
 - `_apply_paragraph_breaks()` (asr_router.py): RMS interior pauses ≥ `PARAGRAPH_PAUSE_SEC` (1.5s), map each to the nearest decoder split-token segment boundary, then snap to `[.!?…]` within **40 chars**.
 - If no punctuation is close: break at the boundary anyway and append `.` (after stripping trailing `,;—`) so the break is still a sentence boundary.
 - **Why 40 chars**: a 120-char window snapped BACKWARD across the pause to an earlier sentence end, burying the pause mid-paragraph. Keep the snap window tight.
+
+### 25. `stage: "done"` in SSE Finishes the Job — Progress Events Must Not Use It
+- `_sse_put` publishes every event to `job_state.publish`, which calls `finish()` when `stage in ("done","error")` → `_active = None`. If a mid-job progress event says `done` (pipeline used to emit final diarization progress as `stage: "done"`), the TTL monitor sees no running job and unloads models WHILE the turn loop still runs → `'NoneType' has no attribute 'get_inputs'`.
+- Pipeline final progress stage must be `"diarization_finished"` (NOT `"done"`). `job_state.publish` also guards `evt.get("phase") != "diarization"` so real terminal events (which carry NO phase key) still finish the job.
+- `state.touch()` at the start of the transcribe turn loop so idle-TTL never counts job time as idle.
+- Import rule: `from asr_mcp.core import job_state` — the MODULE (functions `start_job/get_running/publish/finish/ensure_finished`); there is NO `job_state` symbol to import.
+
+### 26. Never Pin Session Objects — Resolve `state.*_session` Live
+- Storing `state.embedding_session` into another object (`set_embedding_session`) leaves a stale/None reference once lazy-load/TTL/phase-unload replaces or clears it → `'NoneType' ... get_inputs` deep in a helper.
+- Rule: look up the session at call time (`VoiceprintService._emb_session()` = `self._embedding_session or state.embedding_session`). Grep for direct `state.*_session` field reads inside services before adding pins.
+
+### 27. GPU Arena Discipline: Cap → Shrink Per Run → Reload Clears First
+- Caps set at session creation (`_cuda_provider_options`): encoder `gpu_memory_limit_gb×0.625`, embedding `min(÷4, 768 MiB)`, `cudnn_conv_algo_search: HEURISTIC` (EXHAUSTIVE allocates huge workspaces).
+- Every GPU run passes `GPU_SHRINK_RUN_OPTIONS` (`memory.enable_memory_arena_shrinkage=gpu:0`) — without it the arena only releases on full session reload.
+- `reload_encoder_session`/`reload_embedding_session`: set the field to `None` + `gc.collect()` BEFORE constructing the replacement — otherwise old arena (alive) + new session (allocating) peak together.
+- Encoder OOM escalation: reload fresh arena → retry GPU once → CPU fallback. Embedding OOM: straight to cached CPU session.
