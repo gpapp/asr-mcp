@@ -42,7 +42,7 @@ def _run_encoder(feed: dict):
     """
     try:
         return state.encoder_session.run(None, feed)
-    except RuntimeError as e:
+    except Exception as e:
         if not is_gpu_oom(e):
             raise
         logger.warning("GPU OOM on encoder, reloading fresh arena: %s", e)
@@ -52,7 +52,7 @@ def _run_encoder(feed: dict):
             reload_encoder_session(state.settings)
             log_gpu_memory("encoder OOM after reload")
             return state.encoder_session.run(None, feed)
-        except RuntimeError as e2:
+        except Exception as e2:
             if not is_gpu_oom(e2):
                 raise
             logger.warning("GPU OOM persisted after arena reset, falling back to CPU encoder: %s", e2)

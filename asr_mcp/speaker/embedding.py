@@ -17,7 +17,7 @@ _cpu_embedding_cache: dict[str, ort.InferenceSession] = {}
 def _run_with_cpu_fallback(session, feed, output_names):
     try:
         return session.run(output_names, feed)
-    except RuntimeError as e:
+    except Exception as e:
         if is_gpu_oom(e):
             logger.warning("GPU OOM on embedding, falling back to CPU: %s", e)
             log_gpu_memory("embedding OOM fallback")

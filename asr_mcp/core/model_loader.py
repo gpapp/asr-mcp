@@ -26,7 +26,7 @@ def _cuda_provider_options(settings: Settings = None, kind: str = "encoder") -> 
     if kind == "encoder":
         limit = int(total_bytes * 0.625)  # ~2.5GB of default 4GB budget
     else:
-        limit = min(total_bytes // 8, 512 * 1024 * 1024)  # embedding ≤512MB
+        limit = min(total_bytes // 4, 768 * 1024 * 1024)  # embedding ≤768MB
     return {
         "gpu_mem_limit": limit,
         "arena_extend_strategy": "kNextPowerOfTwo",

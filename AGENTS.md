@@ -251,7 +251,7 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - **Why**: Silero VAD produces many short regions during brief pauses (breaths, filler sounds) within a single speaker's turn.
 
 ### 5. ONNX Runtime Error Handling
-- `onnxruntime` has NO `ORTRuntimeError` attribute. Catch `RuntimeError` instead.
+- `onnxruntime` has NO `ORTRuntimeError` attribute. Catch `Exception` and gate on `is_gpu_oom(e)` — ORT ≥1.22 raises `onnxruntime_pybind11_state.RuntimeException` which inherits `Exception`, NOT `RuntimeError`, so `except RuntimeError` silently never fires.
 - Check error message content: `"Failed to allocate memory"` indicates GPU OOM.
 - **Why**: Every OOM was silently re-raised because the except clause itself threw `AttributeError`.
 
