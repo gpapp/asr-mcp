@@ -140,17 +140,18 @@ def _parse_encoder_outputs(encoder_outputs, encoder_session):
     else:
         for name, val in zip(enc_output_names, encoder_outputs):
             val = val.astype(np.float32)
-            if "encoder" in name.lower() and "key" not in name.lower() and "value" not in name.lower():
+            low = name.lower()
+            if ("encoder" in low and "key" not in low and "value" not in low) or \
+               low in ("hidden_states", "last_hidden_state", "encoder_output", "encoder_out", "memory", "context"):
                 hidden_states = val
-            if "key" in name.lower() and "encoder" in name.lower():
+            elif "key" in low and "encoder" in low:
                 cross_kv[name] = val
-            elif "value" in name.lower() and "encoder" in name.lower():
+            elif "value" in low and "encoder" in low:
                 cross_kv[name] = val
-            else:
-                hidden_states = val
 
-    if hidden_states is None and not cross_kv:
+    if hidden_states is None:
         hidden_states = encoder_outputs[0].astype(np.float32)
+        logger.warning("No explicit hidden_states output found; using encoder_outputs[0] as hidden_states")
 
     if not cross_kv:
         for i in range(NUM_LAYERS):
@@ -176,7 +177,7 @@ def _init_self_kv_cache():
     return self_kv
 
 
-def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv, encoder_hidden_states=None, num_logits_to_keep=1):
+def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv, encoder_hidden_states=None, enc_hs_input_name=None, num_logits_to_keep=1):
     batch_size = input_ids.shape[0]
     seq_len = input_ids.shape[1]
 
@@ -186,8 +187,8 @@ def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_k
     inputs["position_ids"] = np.arange(position, position + seq_len, dtype=np.int64).reshape(1, -1)
     inputs["num_logits_to_keep"] = np.array(num_logits_to_keep, dtype=np.int64)
 
-    if encoder_hidden_states is not None:
-        inputs["encoder_hidden_states"] = encoder_hidden_states.astype(np.float32)
+    if encoder_hidden_states is not None and enc_hs_input_name is not None:
+        inputs[enc_hs_input_name] = encoder_hidden_states.astype(np.float32)
 
     inputs.update(cross_kv)
     inputs.update(self_kv)
@@ -271,8 +272,16 @@ def transcribe_audio_sync(
     dec_input_names = [inp.name for inp in state.decoder_session.get_inputs()]
     dec_output_names = [out.name for out in state.decoder_session.get_outputs()]
 
-    if "encoder_hidden_states" not in dec_input_names:
+    enc_hs_input_name = None
+    for candidate in ("encoder_hidden_states", "encoder_hidden_state", "encoder_output", "encoder_out", "memory", "context"):
+        if candidate in dec_input_names:
+            enc_hs_input_name = candidate
+            break
+    if enc_hs_input_name is None:
+        logger.warning("Decoder has no encoder_hidden_states input; cross-attention will not work. Inputs: %s", dec_input_names)
         encoder_hidden_states = None
+    else:
+        logger.info("Using encoder hidden states input: %s", enc_hs_input_name)
 
     if prefix_ids is not None:
         input_ids = np.array([prefix_ids], dtype=np.int64)
@@ -288,6 +297,7 @@ def transcribe_audio_sync(
         feed = _build_decoder_inputs(
             dec_input_names, input_ids, position, cross_kv, self_kv,
             encoder_hidden_states=encoder_hidden_states,
+            enc_hs_input_name=enc_hs_input_name,
         )
 
         try:
