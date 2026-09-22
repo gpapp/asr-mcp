@@ -215,6 +215,10 @@ async def transcribe_endpoint(
         if len(chunk) < 1600:
             continue
 
+        speaker_name = seg.get("speaker", "UNKNOWN")
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+
         max_samples = int(30.0 * 16000)
         if len(chunk) > max_samples:
             sub_segments = split_at_energy_dips(
@@ -236,8 +240,14 @@ async def transcribe_endpoint(
                         ])
                         if len(buf_audio) >= 1600:
                             result = transcribe_audio_sync(audio=buf_audio)
-                            result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
-                            results.append(TranscribeResult(**result))
+                            results.append(TranscribeResult(
+                                text=result.get("text", ""),
+                                segments=result.get("segments"),
+                                start=seg_start, end=seg_end, speaker=speaker_name,
+                                audio_duration_sec=result.get("audio_duration_sec", 0),
+                                inference_time_sec=result.get("inference_time_sec", 0),
+                                tokens_generated=result.get("tokens_generated", 0),
+                            ))
                         buffer = []
                         buffer_dur = 0.0
                 if buffer_dur + sub_len > max_samples and buffer:
@@ -246,8 +256,14 @@ async def transcribe_endpoint(
                     ])
                     if len(buf_audio) >= 1600:
                         result = transcribe_audio_sync(audio=buf_audio)
-                        result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
-                        results.append(TranscribeResult(**result))
+                        results.append(TranscribeResult(
+                            text=result.get("text", ""),
+                            segments=result.get("segments"),
+                            start=seg_start, end=seg_end, speaker=speaker_name,
+                            audio_duration_sec=result.get("audio_duration_sec", 0),
+                            inference_time_sec=result.get("inference_time_sec", 0),
+                            tokens_generated=result.get("tokens_generated", 0),
+                        ))
                     buffer = []
                     buffer_dur = 0.0
                 buffer.append(sub)
@@ -258,12 +274,24 @@ async def transcribe_endpoint(
                 ])
                 if len(buf_audio) >= 1600:
                     result = transcribe_audio_sync(audio=buf_audio)
-                    result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
-                    results.append(TranscribeResult(**result))
+                    results.append(TranscribeResult(
+                        text=result.get("text", ""),
+                        segments=result.get("segments"),
+                        start=seg_start, end=seg_end, speaker=speaker_name,
+                        audio_duration_sec=result.get("audio_duration_sec", 0),
+                        inference_time_sec=result.get("inference_time_sec", 0),
+                        tokens_generated=result.get("tokens_generated", 0),
+                    ))
         else:
             result = transcribe_audio_sync(audio=chunk)
-            result["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {result.get('text', '')}"
-            results.append(TranscribeResult(**result))
+            results.append(TranscribeResult(
+                text=result.get("text", ""),
+                segments=result.get("segments"),
+                start=seg_start, end=seg_end, speaker=speaker_name,
+                audio_duration_sec=result.get("audio_duration_sec", 0),
+                inference_time_sec=result.get("inference_time_sec", 0),
+                tokens_generated=result.get("tokens_generated", 0),
+            ))
 
     total_time = sum(r.inference_time_sec for r in results)
     return TranscribeResponse(results=results, total_time_sec=total_time)
@@ -376,6 +404,10 @@ async def transcribe_upload(
                 if len(chunk) < 1600:
                     continue
 
+                speaker_name = seg.get("speaker", "UNKNOWN")
+                seg_start = seg["start"]
+                seg_end = seg["end"]
+
                 max_samples = int(30.0 * 16000)
                 if len(chunk) > max_samples:
                     sub_segments = split_at_energy_dips(
@@ -397,8 +429,14 @@ async def transcribe_upload(
                                 ])
                                 if len(buf_audio) >= 1600:
                                     tr = transcribe_audio_sync(audio=buf_audio)
-                                    tr["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {tr.get('text', '')}"
-                                    results.append(TranscribeResult(**tr))
+                                    results.append(TranscribeResult(
+                                        text=tr.get("text", ""),
+                                        segments=tr.get("segments"),
+                                        start=seg_start, end=seg_end, speaker=speaker_name,
+                                        audio_duration_sec=tr.get("audio_duration_sec", 0),
+                                        inference_time_sec=tr.get("inference_time_sec", 0),
+                                        tokens_generated=tr.get("tokens_generated", 0),
+                                    ))
                                 buffer = []
                                 buffer_dur = 0.0
                         if buffer_dur + sub_len > max_samples and buffer:
@@ -407,8 +445,14 @@ async def transcribe_upload(
                             ])
                             if len(buf_audio) >= 1600:
                                 tr = transcribe_audio_sync(audio=buf_audio)
-                                tr["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {tr.get('text', '')}"
-                                results.append(TranscribeResult(**tr))
+                                results.append(TranscribeResult(
+                                    text=tr.get("text", ""),
+                                    segments=tr.get("segments"),
+                                    start=seg_start, end=seg_end, speaker=speaker_name,
+                                    audio_duration_sec=tr.get("audio_duration_sec", 0),
+                                    inference_time_sec=tr.get("inference_time_sec", 0),
+                                    tokens_generated=tr.get("tokens_generated", 0),
+                                ))
                             buffer = []
                             buffer_dur = 0.0
                         buffer.append(sub)
@@ -419,12 +463,24 @@ async def transcribe_upload(
                         ])
                         if len(buf_audio) >= 1600:
                             tr = transcribe_audio_sync(audio=buf_audio)
-                            tr["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {tr.get('text', '')}"
-                            results.append(TranscribeResult(**tr))
+                            results.append(TranscribeResult(
+                                text=tr.get("text", ""),
+                                segments=tr.get("segments"),
+                                start=seg_start, end=seg_end, speaker=speaker_name,
+                                audio_duration_sec=tr.get("audio_duration_sec", 0),
+                                inference_time_sec=tr.get("inference_time_sec", 0),
+                                tokens_generated=tr.get("tokens_generated", 0),
+                            ))
                 else:
                     tr = transcribe_audio_sync(audio=chunk)
-                    tr["text"] = f"[{seg.get('speaker', 'UNKNOWN')}] {tr.get('text', '')}"
-                    results.append(TranscribeResult(**tr))
+                    results.append(TranscribeResult(
+                        text=tr.get("text", ""),
+                        segments=tr.get("segments"),
+                        start=seg_start, end=seg_end, speaker=speaker_name,
+                        audio_duration_sec=tr.get("audio_duration_sec", 0),
+                        inference_time_sec=tr.get("inference_time_sec", 0),
+                        tokens_generated=tr.get("tokens_generated", 0),
+                    ))
 
             diarization["results"] = [r.__dict__ if hasattr(r, '__dict__') else r for r in results]
             diarization["total_time_sec"] = sum(

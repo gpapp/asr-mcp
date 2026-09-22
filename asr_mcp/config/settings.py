@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # Model idle timeout (minutes). 0 = never unload
     model_ttl_minutes: int = Field(default=0, description="Unload GPU models after N minutes of inactivity. 0=never")
 
+    # Logging
+    log_level: str = Field(default="INFO", description="Log level: DEBUG, INFO, WARNING, ERROR")
+
     # HuggingFace
     hf_token: Optional[str] = None
 

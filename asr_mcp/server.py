@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     from asr_mcp.voiceprint.service import VoiceprintService
 
     settings = get_settings()
-    setup_logging(settings.log_dir, debug=False)
+    setup_logging(settings.log_dir, log_level=settings.log_level)
 
     logger.info("Starting asr-mcp server...")
     logger.info("CUDA device: %s", settings.cuda_device)

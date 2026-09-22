@@ -145,7 +145,7 @@ def _build_prompt_ids(tokenizer, language: str = "en") -> list[int]:
         "<|noitn|>",
         "<|nodiarize|>",
         "<|emo:undefined|>",
-        "<|notimestamp|>",
+        "<|timestamp|>",
     ]
     ids = []
     for tok in prompt_tokens:

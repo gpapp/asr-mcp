@@ -46,6 +46,9 @@ class TimedSegment(BaseModel):
 
 class TranscribeResult(BaseModel):
     text: str = ""
+    start: Optional[float] = None
+    end: Optional[float] = None
+    speaker: Optional[str] = None
     audio_duration_sec: float = 0.0
     inference_time_sec: float = 0.0
     tokens_generated: int = 0

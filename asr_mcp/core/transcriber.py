@@ -302,11 +302,17 @@ def transcribe_audio_sync(
         logits = outputs[0]
         next_token = int(np.argmax(logits[0, -1, :]))
 
+        if logger.isEnabledFor(logging.DEBUG):
+            if state.tokenizer:
+                tok_str = state.tokenizer.decode([next_token], skip_special_tokens=False)
+            else:
+                tok_str = chr(next_token) if 32 <= next_token < 127 else f"<{next_token}>"
+            logger.debug("Step %d: token=%d (%s), logits_shape=%s", step, next_token, tok_str, logits.shape)
+
         new_self_kv = {}
         for i, name in enumerate(dec_output_names):
             if name == "logits":
                 continue
-            # Map HuggingFace ONNX output names (present.*) back to input names (past_key_values.*)
             mapped_name = name.replace("present.", "past_key_values.") if name.startswith("present.") else name
             new_self_kv[mapped_name] = outputs[i]
         if new_self_kv:
@@ -319,17 +325,61 @@ def transcribe_audio_sync(
         input_ids = np.array([[next_token]], dtype=np.int64)
         position += 1
 
+    segments_out = []
     if state.tokenizer:
-        text = state.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        full_decode = state.tokenizer.decode(generated_tokens, skip_special_tokens=False)
+        text_tokens = []
+        current_time = 0.0
+        current_text_start = 0.0
+        for tok_id in generated_tokens:
+            tok_str = state.tokenizer.decode([tok_id], skip_special_tokens=False)
+            ts_match = re.match(r'<\|(\d+\.?\d*)\|>', tok_str)
+            if ts_match:
+                ts_val = float(ts_match.group(1))
+                if text_tokens:
+                    seg_text = state.tokenizer.decode(text_tokens, skip_special_tokens=True)
+                    seg_text = clean_transcript(seg_text)
+                    if seg_text.strip():
+                        segments_out.append({
+                            "start": round(current_text_start, 2),
+                            "end": round(ts_val, 2),
+                            "text": seg_text.strip(),
+                        })
+                    text_tokens = []
+                current_text_start = ts_val
+            elif tok_id != state.eos_token_id:
+                text_tokens.append(tok_id)
+        if text_tokens:
+            seg_text = state.tokenizer.decode(text_tokens, skip_special_tokens=True)
+            seg_text = clean_transcript(seg_text)
+            if seg_text.strip():
+                segments_out.append({
+                    "start": round(current_text_start, 2),
+                    "end": round(current_time, 2),
+                    "text": seg_text.strip(),
+                })
+        if segments_out:
+            text = " ".join(s["text"] for s in segments_out)
+        else:
+            text = state.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            text = clean_transcript(text)
     else:
         text = "".join(chr(t) if 32 <= t < 127 else "" for t in generated_tokens)
-    text = clean_transcript(text)
+        text = clean_transcript(text)
 
     inference_time = time.time() - start_time
     audio_duration = len(mel_spectrogram[0]) * HOP_LENGTH / SAMPLE_RATE if mel_spectrogram is not None else 0
 
+    if segments_out and audio_duration > 0:
+        for s in segments_out:
+            if s["end"] == 0.0 and s != segments_out[-1]:
+                pass
+            elif s["end"] == 0.0:
+                s["end"] = round(audio_duration, 2)
+
     return {
         "text": text,
+        "segments": segments_out if segments_out else None,
         "audio_duration_sec": round(audio_duration, 2),
         "inference_time_sec": round(inference_time, 2),
         "tokens_generated": len(generated_tokens),
