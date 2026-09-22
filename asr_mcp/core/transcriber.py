@@ -217,6 +217,88 @@ def _build_decoder_inputs(dec_input_names, input_ids, position, past_seq_len, to
     return feed
 
 
+def _plan_window_bounds(mel: np.ndarray, window_frames: int, min_tail: int = 300, snap: int = 100) -> list[int]:
+    """Plan decode window boundaries for long mel, snapping cuts to quiet frames."""
+    total = mel.shape[0]
+    bounds = [0]
+    pos = 0
+    while total - pos > window_frames:
+        target = pos + window_frames
+        if total - target < min_tail:
+            break
+        lo = max(pos + window_frames // 2, target - snap)
+        energies = mel[lo:target].sum(axis=1)
+        cut = lo + int(np.argmin(energies))
+        if cut <= pos:
+            cut = target
+        bounds.append(cut)
+        pos = cut
+    bounds.append(total)
+    return bounds
+
+
+def _transcribe_windowed(
+    mel: np.ndarray,
+    language: str = "en",
+    timeout_sec: int = 120,
+    max_frames: Optional[int] = None,
+) -> dict:
+    """Transcribe long mel in <=MAX_ENCODER_SEC windows and merge results.
+
+    A single decode over a very long encoding truncates early (max_new_tokens /
+    EOS after the first window of speech). Each window gets its own prompt and
+    decode; segment times are offset back to the full-audio timeline.
+    """
+    if max_frames is None:
+        max_frames = int(MAX_ENCODER_SEC * (SAMPLE_RATE / HOP_LENGTH))
+    bounds = _plan_window_bounds(mel, max_frames)
+    logger.info("Windowing long audio: %d frames -> %d windows", mel.shape[0], len(bounds) - 1)
+
+    segments_out = []
+    text_parts = []
+    tokens_total = 0
+    inference_total = 0.0
+    errors = []
+
+    for i in range(len(bounds) - 1):
+        s, e = bounds[i], bounds[i + 1]
+        off = s * HOP_LENGTH / SAMPLE_RATE
+        r = transcribe_audio_sync(
+            mel_spectrogram=mel[s:e],
+            language=language,
+            timeout_sec=timeout_sec,
+            _no_window=True,
+        )
+        if r.get("error"):
+            errors.append(f"window {i} ({off:.1f}s): {r['error']}")
+            logger.error("Window %d transcription failed: %s", i, r["error"])
+            continue
+        if r.get("text"):
+            text_parts.append(r["text"].strip())
+        for seg in r.get("segments") or []:
+            segments_out.append({
+                "start": round(seg["start"] + off, 3),
+                "end": round(seg["end"] + off, 3),
+                "text": seg["text"],
+            })
+        tokens_total += r.get("tokens_generated", 0)
+        inference_total += r.get("inference_time_sec", 0.0)
+
+    audio_duration = mel.shape[0] * HOP_LENGTH / SAMPLE_RATE
+    text = " ".join(p for p in text_parts if p).strip()
+
+    if not text and errors:
+        return {"text": "", "error": "; ".join(errors)}
+
+    return {
+        "text": text,
+        "segments": segments_out if segments_out else None,
+        "audio_duration_sec": round(audio_duration, 2),
+        "inference_time_sec": round(inference_total, 2),
+        "tokens_generated": tokens_total,
+    }
+
+
 def transcribe_audio_sync(
     audio: Optional[np.ndarray] = None,
     language: str = "en",
@@ -224,6 +306,7 @@ def transcribe_audio_sync(
     mel_spectrogram: Optional[np.ndarray] = None,
     past_kv_cache_ort: Optional[dict] = None,
     prefix_ids: Optional[list[int]] = None,
+    _no_window: bool = False,
 ) -> dict:
     start_time = time.time()
 
@@ -238,6 +321,16 @@ def transcribe_audio_sync(
         return {"text": "", "error": "No audio provided"}
 
     max_frames = int(MAX_ENCODER_SEC * (SAMPLE_RATE / HOP_LENGTH))
+
+    if (
+        not _no_window
+        and past_kv_cache_ort is None
+        and prefix_ids is None
+        and mel_spectrogram.shape[0] > max_frames
+    ):
+        return _transcribe_windowed(
+            mel_spectrogram, language=language, timeout_sec=timeout_sec, max_frames=max_frames
+        )
 
     enc_input_names = [inp.name for inp in state.encoder_session.get_inputs()]
     encoder_input_name = enc_input_names[0]
@@ -266,8 +359,13 @@ def transcribe_audio_sync(
                 for name, val in zip(enc_output_names, chunk_out):
                     arr = val.astype(np.float32)
                     if arr.ndim >= 3 and pos > 0:
-                        trim = min(overlap_frames, arr.shape[-2])
-                        arr = arr[..., trim:, :]
+                        in_len = end - pos
+                        out_seq = arr.shape[-2]
+                        if out_seq > 0 and in_len > 0:
+                            ratio = out_seq / in_len
+                            trim = min(int(round(overlap_frames * ratio)), out_seq)
+                            if trim > 0:
+                                arr = arr[..., trim:, :]
                     all_parts[name].append(arr)
                 pos = end - overlap_frames if end < mel_spectrogram.shape[0] else mel_spectrogram.shape[0]
 
