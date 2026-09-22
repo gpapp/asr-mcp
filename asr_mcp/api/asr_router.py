@@ -106,33 +106,59 @@ def _transcribe_turn(audio_np, turn, sample_rate=16000):
 
     tr = transcribe_audio_sync(audio=turn_audio)
 
-    logger.info("Turn result: text=%d chars, tokens=%d, inference=%.2fs",
+    logger.info("Turn result: text=%d chars, tokens=%d, inference=%.2fs, error=%s",
                 len(tr.get("text", "")), tr.get("tokens_generated", 0),
-                tr.get("inference_time_sec", 0))
+                tr.get("inference_time_sec", 0), tr.get("error"))
+
+    text = (tr.get("text") or "").strip()
+    segments = tr.get("segments")
+    error = tr.get("error")
+    if not text and not segments and not error:
+        return []
 
     return [TranscribeResult(
-        text=tr.get("text", "").strip(),
-        segments=tr.get("segments"),
+        text=text,
+        segments=segments,
         start=turn["start"],
         end=turn["end"],
         speaker=turn["speaker"],
         audio_duration_sec=tr.get("audio_duration_sec", 0),
         inference_time_sec=tr.get("inference_time_sec", 0),
         tokens_generated=tr.get("tokens_generated", 0),
+        error=error,
     )]
 
 
-def _prepare_turns(segments):
-    """Merge diarized segments into turns, split long ones."""
+def _prepare_turns(segments, audio_duration_sec=None):
+    """Merge diarized segments into turns, split long ones, close gaps.
+
+    Any positive gap between consecutive turns is split at its midpoint and
+    the neighbouring turn boundaries are extended to meet there, so every
+    second of the timeline is covered by exactly one transcription turn and
+    speech between diarized segments is not dropped. Edges are extended to
+    the file start/end as well.
+    """
     turns = _merge_into_turns(segments)
     split = []
     for t in turns:
         split.extend(_split_long_turn(t))
+    for i in range(len(split) - 1):
+        gap_start = split[i]["end"]
+        gap_end = split[i + 1]["start"]
+        if gap_end - gap_start > 1e-3:
+            mid = (gap_start + gap_end) / 2.0
+            split[i]["end"] = mid
+            split[i + 1]["start"] = mid
+    if split and audio_duration_sec is not None:
+        if split[0]["start"] > 1e-3:
+            split[0]["start"] = 0.0
+        if audio_duration_sec - split[-1]["end"] > 1e-3:
+            split[-1]["end"] = float(audio_duration_sec)
     return split
 
 
 def _transcribe_diarized(audio_np, segments, sample_rate=16000):
-    turns = _prepare_turns(segments)
+    turns = _prepare_turns(segments, audio_duration_sec=len(audio_np) / sample_rate)
     all_results = []
     for turn in turns:
         all_results.extend(_transcribe_turn(audio_np, turn, sample_rate))
@@ -466,7 +492,7 @@ async def transcribe_upload(
                 await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
                 return
 
-            turns = _prepare_turns(segments)
+            turns = _prepare_turns(segments, audio_duration_sec=audio_dur or None)
             total_turns = len(turns)
             results = []
             for turn_idx, turn in enumerate(turns):

@@ -287,16 +287,16 @@ def _transcribe_windowed(
     audio_duration = mel.shape[0] * HOP_LENGTH / SAMPLE_RATE
     text = " ".join(p for p in text_parts if p).strip()
 
-    if not text and errors:
-        return {"text": "", "error": "; ".join(errors)}
-
-    return {
+    result = {
         "text": text,
         "segments": segments_out if segments_out else None,
         "audio_duration_sec": round(audio_duration, 2),
         "inference_time_sec": round(inference_total, 2),
         "tokens_generated": tokens_total,
     }
+    if errors:
+        result["error"] = "; ".join(errors)
+    return result
 
 
 def transcribe_audio_sync(
