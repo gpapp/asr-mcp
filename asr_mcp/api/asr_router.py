@@ -692,10 +692,10 @@ async def diarize_upload(
 ):
     busy = job_state.get_running()
     if busy is not None:
-        return JSONResponse(status_code=409, content={
-            "detail": "A transcription is already in progress",
-            "job": busy.meta(),
-        })
+        content = {"detail": "A transcription is already in progress"}
+        if busy.user_id == user_id:
+            content["job"] = busy.meta()
+        return JSONResponse(status_code=409, content=content)
 
     content = await file.read()
     if len(content) > 200 * 1024 * 1024:
@@ -837,10 +837,10 @@ async def transcribe_upload(
 ):
     busy = job_state.get_running()
     if busy is not None:
-        return JSONResponse(status_code=409, content={
-            "detail": "A transcription is already in progress",
-            "job": busy.meta(),
-        })
+        content = {"detail": "A transcription is already in progress"}
+        if busy.user_id == user_id:
+            content["job"] = busy.meta()
+        return JSONResponse(status_code=409, content=content)
 
     content = await file.read()
     if len(content) > 200 * 1024 * 1024:
