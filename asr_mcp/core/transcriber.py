@@ -239,11 +239,17 @@ def transcribe_audio_sync(
 
     max_frames = int(MAX_ENCODER_SEC * (SAMPLE_RATE / HOP_LENGTH))
 
+    enc_input_names = [inp.name for inp in state.encoder_session.get_inputs()]
+    encoder_input_name = enc_input_names[0]
+    encoder_feed_value = mel_spectrogram[np.newaxis]
+
+    if encoder_input_name in ("input_features", "mel", "mel_spectrogram"):
+        encoder_feed_value = encoder_feed_value.astype(np.float32)
+
     try:
-        encoder_input_name = state.encoder_session.get_inputs()[0].name
         if mel_spectrogram.shape[0] <= max_frames:
             encoder_outputs = state.encoder_session.run(
-                None, {encoder_input_name: mel_spectrogram[np.newaxis]}
+                None, {encoder_input_name: encoder_feed_value}
             )
         else:
             enc_output_names = [o.name for o in state.encoder_session.get_outputs()]
@@ -255,7 +261,7 @@ def transcribe_audio_sync(
                 end = min(pos + max_frames, mel_spectrogram.shape[0])
                 chunk = mel_spectrogram[pos:end]
                 chunk_out = state.encoder_session.run(
-                    None, {encoder_input_name: chunk[np.newaxis]}
+                    None, {encoder_input_name: chunk[np.newaxis] if encoder_input_name != "input_features" else chunk[np.newaxis].astype(np.float32)}
                 )
                 for name, val in zip(enc_output_names, chunk_out):
                     arr = val.astype(np.float32)
