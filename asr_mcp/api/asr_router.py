@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import tempfile
 from pathlib import Path
 
@@ -22,6 +23,8 @@ router = APIRouter(prefix="/asr", tags=["ASR"])
 
 MIN_CHUNK_SAMPLES = 1600
 MAX_TURN_SEC = 30.0
+PARAGRAPH_PAUSE_SEC = 1.5
+_SENT_END_RE = re.compile(r'[.!?…]["”’)\]]?(?=\s|$)')
 
 
 def _merge_into_turns(segments, max_gap_sec=1.5):
@@ -89,6 +92,121 @@ def _split_long_turn(turn):
     return out
 
 
+def _find_interior_pauses(audio, sample_rate, min_pause_sec=PARAGRAPH_PAUSE_SEC,
+                          frame_ms=30.0):
+    """Silence runs >= min_pause_sec strictly inside the audio (edges skipped)."""
+    import numpy as np
+    if audio is None or len(audio) < int(0.5 * sample_rate):
+        return []
+    frame = max(1, int(sample_rate * frame_ms / 1000))
+    n = len(audio) // frame
+    if n < 4:
+        return []
+    rms = np.sqrt(np.mean(
+        audio[:n * frame].astype(np.float64).reshape(n, frame) ** 2, axis=1) + 1e-12)
+    thr = max(float(np.percentile(rms, 25)) * 0.3, float(rms.max()) * 0.02, 1e-5)
+    quiet = rms < thr
+    dur = len(audio) / sample_rate
+    frame_sec = frame_ms / 1000.0
+    pauses = []
+    i = 0
+    while i < n:
+        if not quiet[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and quiet[j]:
+            j += 1
+        s, e = i * frame_sec, j * frame_sec
+        if e - s >= min_pause_sec and s > 0.25 and e < dur - 0.25:
+            pauses.append((s, e))
+        i = j
+    return pauses
+
+
+def _snap_sentence_end(text, pos, window=40):
+    """Index just past the sentence-ending punctuation nearest to *pos*.
+
+    Returns None when no [.!?…] occurs within *window* chars on either side.
+    A tight window keeps the break near the actual pause; callers fall back to
+    the raw boundary (plus a completed sentence) when nothing is close.
+    """
+    lo = max(0, pos - window)
+    hi = min(len(text), pos + window)
+    region = text[lo:hi]
+    best = None
+    for m in _SENT_END_RE.finditer(region):
+        end = lo + m.end()
+        d = abs(end - pos)
+        if best is None or d < best[0]:
+            best = (d, end)
+    return best[1] if best else None
+
+
+def _apply_paragraph_breaks(text, segments, turn_audio, sample_rate):
+    """Insert \\n\\n at long interior pauses, snapped to sentence boundaries.
+
+    Segment timestamps come from the decoder's split tokens; pause times come
+    from RMS silence runs in the turn audio. Each pause maps to the nearest
+    segment boundary, then snaps to the closest [.!?…] within 40 chars so the
+    break never lands mid-sentence. If no punctuation exists nearby the break
+    is taken at the boundary and a '.' is appended to complete the sentence.
+    """
+    if not text or not segments or len(segments) < 2 or turn_audio is None:
+        return text
+
+    rebuilt = " ".join((s.get("text") or "") for s in segments)
+    if abs(len(rebuilt) - len(text)) > max(16, len(text) // 20):
+        return text
+
+    pauses = _find_interior_pauses(turn_audio, sample_rate)
+    if not pauses:
+        return rebuilt
+
+    bounds = []
+    pos = 0
+    for seg in segments:
+        pos += len(seg.get("text") or "")
+        bounds.append((pos, float(seg.get("end", 0.0))))
+        pos += 1
+
+    marks = {}
+    for ps, pe in pauses:
+        mid = (ps + pe) / 2.0
+        best_i, best_d = None, None
+        for i in range(len(bounds) - 1):
+            d = abs(bounds[i][1] - mid)
+            if best_d is None or d < best_d:
+                best_i, best_d = i, d
+        if best_i is None:
+            continue
+        boundary = bounds[best_i][0]
+        snapped = _snap_sentence_end(rebuilt, boundary)
+        if snapped is not None:
+            marks.setdefault(snapped, False)
+        else:
+            marks.setdefault(boundary, True)
+
+    parts = []
+    prev = 0
+    for idx in sorted(marks):
+        if idx <= prev or idx - prev < 25 or len(rebuilt) - idx < 25:
+            continue
+        chunk = rebuilt[prev:idx].strip()
+        if not chunk:
+            continue
+        if marks[idx]:
+            chunk = chunk.rstrip(",;:—–- ")
+            if chunk and chunk[-1] not in ".!?…":
+                chunk += "."
+        parts.append(chunk)
+        prev = idx
+    tail = rebuilt[prev:].strip()
+    if tail:
+        parts.append(tail)
+    return "\n\n".join(p for p in parts if p)
+
+
 def _transcribe_turn(audio_np, turn, sample_rate=16000, progress_cb=None):
     """Transcribe a single speaker turn as one coherent audio chunk."""
     from asr_mcp.core.transcriber import transcribe_audio_sync
@@ -115,6 +233,8 @@ def _transcribe_turn(audio_np, turn, sample_rate=16000, progress_cb=None):
     error = tr.get("error")
     if not text and not segments and not error:
         return []
+
+    text = _apply_paragraph_breaks(text, segments, turn_audio, sample_rate)
 
     return [TranscribeResult(
         text=text,
@@ -822,6 +942,9 @@ async def transcribe_upload(
                 def _make_window_cb(turn_idx=turn_idx, turn=turn):
                     def cb(i, n):
                         frac = (turn_idx + i / max(n, 1)) / max(total_turns, 1)
+                        span = turn["end"] - turn["start"]
+                        win_start = turn["start"] + span * ((i - 1) / max(n, 1))
+                        win_end = turn["start"] + span * (i / max(n, 1))
                         loop.call_soon_threadsafe(queue.put_nowait, {
                             "stage": f"Transcribing turn {turn_idx+1}/{total_turns} — window {i}/{n} ({turn['speaker']})",
                             "progress": frac,
@@ -829,8 +952,10 @@ async def transcribe_upload(
                             "segment_index": turn_idx,
                             "total_segments": total_turns,
                             "segment_speaker": turn["speaker"],
-                            "segment_start": turn["start"],
-                            "segment_end": turn["end"],
+                            "segment_start": round(win_start, 2),
+                            "segment_end": round(win_end, 2),
+                            "turn_start": turn["start"],
+                            "turn_end": turn["end"],
                             "window": i,
                             "total_windows": n,
                         })

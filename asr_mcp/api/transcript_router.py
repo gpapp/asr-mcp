@@ -70,7 +70,8 @@ async def download_transcript(
             start = r.get("start")
             end = r.get("end")
             if speaker and start is not None and end is not None:
-                lines.append(f"[{speaker}] {start:.1f}s - {end:.1f}s: {text}")
+                body = text.replace("\n", "\n    ")
+                lines.append(f"[{speaker}] {start:.1f}s - {end:.1f}s: {body}")
             else:
                 lines.append(text)
     elif segments:
