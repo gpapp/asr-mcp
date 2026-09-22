@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import re
 import shutil
 import time
 from pathlib import Path
@@ -23,6 +24,13 @@ AUTO_COLLECT_MAX_TOTAL_SEC = 600.0
 AUTO_COLLECT_MAX_SEGMENT_SEC = 300.0
 AUTO_COLLECT_MIN_SPEAKER_SEGMENTS = 2
 MIN_SNIPPET_DURATION = 1.5
+
+
+def _origin_prefix(audio_path: str) -> str:
+    """Filesystem-safe prefix from the source audio filename stem."""
+    stem = Path(audio_path).stem
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    return (stem or "audio")[:64]
 
 
 class VoiceprintService:
@@ -178,8 +186,11 @@ class VoiceprintService:
         return {"status": "deleted", "name": speaker_name, "snippets_removed": len(snippets)}
 
     def rename_speaker(self, old_name: str, new_name: str, user_id: str = DEFAULT_USER) -> dict:
+        if new_name == old_name:
+            return {"error": "New name is the same as the current name"}
         existing_vp = self._db.get(new_name, user_id=user_id)
-        if existing_vp:
+        snippet_count = self._snippets.count(new_name, user_id=user_id)
+        if existing_vp or snippet_count > 0:
             return {"error": f"Speaker '{new_name}' already exists"}
 
         count = self._snippets.rename_speaker(old_name, new_name, user_id=user_id)
@@ -209,11 +220,22 @@ class VoiceprintService:
             else:
                 old_dir.rename(new_dir)
 
+        transcripts_updated = 0
+        try:
+            from asr_mcp.db.manager import TranscriptDB
+            transcripts_updated = TranscriptDB(self._db._db).rename_speaker(
+                old_name, new_name, user_id=user_id
+            )
+        except Exception as e:
+            logger.warning("Failed to update transcripts for rename %r -> %r: %s",
+                           old_name, new_name, e)
+
         return {
             "status": "renamed",
             "from": old_name,
             "to": new_name,
             "snippets_moved": count,
+            "transcripts_updated": transcripts_updated,
         }
 
     def merge_speakers(self, primary_name: str, secondary_name: str, user_id: str = DEFAULT_USER) -> dict:
@@ -335,10 +357,23 @@ class VoiceprintService:
                 continue
             by_speaker.setdefault(sp, []).append(seg)
 
+        origin = _origin_prefix(audio_path)
+        final_names: dict[str, str] = {}
+        for speaker_name in by_speaker:
+            if self._db.get(speaker_name, user_id=user_id) or \
+                    self._snippets.count(speaker_name, user_id=user_id) > 0:
+                final_names[speaker_name] = speaker_name
+            else:
+                final_names[speaker_name] = f"{origin}_{speaker_name}"
+
         for speaker_name, segs in by_speaker.items():
+            final_name = final_names[speaker_name]
+            if final_name != speaker_name:
+                for seg in segs:
+                    seg["speaker"] = final_name
             if len(segs) < AUTO_COLLECT_MIN_SPEAKER_SEGMENTS:
                 continue
-            current_total = speaker_totals.get(speaker_name, 0.0)
+            current_total = speaker_totals.get(final_name, 0.0)
             if current_total >= AUTO_COLLECT_MAX_TOTAL_SEC:
                 continue
 
@@ -346,7 +381,7 @@ class VoiceprintService:
                 seg_start = seg["start"]
                 seg_end = seg["end"]
 
-                while seg_start < seg_end and current_total < AUTO_COLLECT_MAX_TOTAL_SEC:
+                while seg_start < seg_end and current_total < AUTO_COLLECT_MAX_SEGMENT_SEC and current_total < AUTO_COLLECT_MAX_TOTAL_SEC:
                     chunk_end = min(seg_start + AUTO_COLLECT_MAX_SEGMENT_SEC, seg_end)
                     dur = chunk_end - seg_start
 
@@ -362,7 +397,7 @@ class VoiceprintService:
                         current_total -= existing["duration_sec"]
 
                     result = self.add_snippet_from_segment(
-                        speaker_name=speaker_name,
+                        speaker_name=final_name,
                         wav_path=audio_path,
                         start_sec=seg_start,
                         end_sec=chunk_end,
@@ -370,14 +405,14 @@ class VoiceprintService:
                         source_audio=audio_path,
                     )
                     if "error" not in result:
-                        speaker_totals[speaker_name] = current_total + dur
+                        speaker_totals[final_name] = current_total + dur
                         current_total += dur
                         collected.append(result)
 
                     seg_start = chunk_end
 
-        for speaker_name in by_speaker:
-            self._auto_refine(speaker_name, user_id=user_id)
+        for final_name in final_names.values():
+            self._auto_refine(final_name, user_id=user_id)
 
         return collected
 

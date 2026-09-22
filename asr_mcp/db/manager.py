@@ -421,6 +421,34 @@ class TranscriptDB:
             session.commit()
             return True
 
+    def rename_speaker(self, old_name: str, new_name: str,
+                       user_id: str = DEFAULT_USER) -> int:
+        """Rename speaker fields in stored transcripts (results[] + segments[])."""
+        updated = 0
+        with self._db.get_session() as session:
+            rows = session.query(TranscriptModel).filter_by(user_id=user_id).all()
+            for tm in rows:
+                if not tm.result:
+                    continue
+                try:
+                    result = json.loads(tm.result)
+                except (ValueError, TypeError):
+                    continue
+                changed = False
+                for key in ("results", "segments"):
+                    items = result.get(key)
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        if isinstance(item, dict) and item.get("speaker") == old_name:
+                            item["speaker"] = new_name
+                            changed = True
+                if changed:
+                    tm.result = json.dumps(result, ensure_ascii=False)
+                    updated += 1
+            session.commit()
+        return updated
+
     def _row_to_dict(self, tm: TranscriptModel) -> dict:
         return {
             "id": tm.id,

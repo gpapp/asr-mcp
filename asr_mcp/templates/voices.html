@@ -225,11 +225,12 @@
     }
 
     async function renameSpeaker(oldName, newName) {
-        await apiFetch('/speakers/' + encodeURIComponent(oldName) + '/rename', {
+        const res = await apiFetch('/speakers/' + encodeURIComponent(oldName) + '/rename', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ new_name: newName }),
         });
+        if (res && res.error) { toast(res.error, true); return; }
         toast('Renamed to ' + newName);
         refresh();
     }
