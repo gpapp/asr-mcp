@@ -540,8 +540,12 @@
                     if (r.status === 409) {
                         let info = {};
                         try { info = await r.json(); } catch (e) { /* ignore */ }
-                        toast('Already processing — attaching to running job');
-                        await attachActiveJob(info.job || { mode, filename: file.name });
+                        if (info.job) {
+                            toast('Already processing — attaching to running job');
+                            await attachActiveJob(info.job);
+                        } else {
+                            toast(info.detail || 'Another transcription is already in progress', true);
+                        }
                         return;
                     }
 
