@@ -196,6 +196,8 @@ def is_gpu_oom(err: BaseException) -> bool:
         "failed to allocate memory" in s
         or "out of memory" in s
         or "out_of_memory" in s
+        or "available memory of" in s
+        or "smaller than requested bytes" in s
     )
 
 
