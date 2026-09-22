@@ -20,7 +20,7 @@ logger = logging.getLogger("asr_mcp.voiceprint.service")
 
 SAMPLE_RATE = 16000
 AUTO_COLLECT_MIN_DURATION = 3.0
-AUTO_COLLECT_MAX_TOTAL_SEC = 600.0
+AUTO_COLLECT_MAX_TOTAL_SEC = 900.0
 AUTO_COLLECT_MAX_SEGMENT_SEC = 300.0
 AUTO_COLLECT_MIN_SPEAKER_SEGMENTS = 2
 MIN_SNIPPET_DURATION = 1.5
@@ -358,7 +358,10 @@ class VoiceprintService:
         audio_path: str,
         segments: list[dict],
         user_id: str = DEFAULT_USER,
+        source_id: str | None = None,
     ) -> list[dict]:
+        if source_id is None:
+            source_id = audio_path
         collected = []
         speaker_totals = {}
         for name, info in self._snippets.all_speakers(user_id=user_id).items():
@@ -402,7 +405,7 @@ class VoiceprintService:
                     chunk_end = min(seg_start + AUTO_COLLECT_MAX_SEGMENT_SEC, seg_end)
                     dur = chunk_end - seg_start
 
-                    existing = self._snippets.find_duplicate(audio_path, seg_start, user_id=user_id)
+                    existing = self._snippets.find_duplicate(source_id, seg_start, user_id=user_id)
                     if existing:
                         if existing["duration_sec"] >= dur:
                             seg_start = chunk_end
@@ -419,7 +422,7 @@ class VoiceprintService:
                         start_sec=seg_start,
                         end_sec=chunk_end,
                         user_id=user_id,
-                        source_audio=audio_path,
+                        source_audio=source_id,
                     )
                     if "error" not in result:
                         speaker_totals[final_name] = current_total + dur

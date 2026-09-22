@@ -759,6 +759,7 @@ async def diarize_upload(
                 vp_service.set_voices_dir(settings.voices_dir)
                 vp_service.auto_collect_from_diarization(
                     audio_path=str(wav_path), segments=segments, user_id=user_id,
+                    source_id=file.filename,
                 )
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
@@ -916,6 +917,7 @@ async def transcribe_upload(
                 vp_service.set_voices_dir(settings.voices_dir)
                 vp_service.auto_collect_from_diarization(
                     audio_path=str(wav_path), segments=segments, user_id=user_id,
+                    source_id=file.filename,
                 )
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)

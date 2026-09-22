@@ -11,7 +11,8 @@ from asr_mcp.diarization.clustering import (
     cap_clusters, greedy_merge_clusters, merge_similar_speakers, match_known_speakers_full,
 )
 from asr_mcp.diarization.segment_ops import (
-    collapse_same_speaker_segments, absorb_islands, eliminate_ghost_speakers,
+    collapse_same_speaker_segments, absorb_islands, absorb_minority_speakers,
+    eliminate_ghost_speakers,
 )
 from asr_mcp.speaker.audio import refine_speaker_boundaries
 from asr_mcp.speaker.embedding import extract_embedding
@@ -147,9 +148,10 @@ class Diarizer:
                 "index": i,
             })
 
-        # Step 9: Collapse + absorb islands
+        # Step 9: Collapse + absorb islands + absorb minority speakers
         merged_segments = collapse_same_speaker_segments(merged_segments, max_gap=0.5)
         merged_segments = absorb_islands(merged_segments, min_island_dur=1.0)
+        merged_segments = absorb_minority_speakers(merged_segments, min_speaker_dur=3.0)
 
         if progress_callback:
             await progress_callback({"stage": "Profiling speakers", "progress": 0.8})

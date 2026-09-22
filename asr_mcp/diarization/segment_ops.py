@@ -48,6 +48,46 @@ def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
     return result
 
 
+def absorb_minority_speakers(segments: list, min_speaker_dur: float = 3.0) -> list:
+    """Reassign all segments of speakers whose total duration < min_speaker_dur
+    to the temporally nearest dominant speaker."""
+    if len(segments) < 2:
+        return segments
+
+    speaker_durations = {}
+    for seg in segments:
+        spk = seg.get("speaker", "UNKNOWN")
+        dur = seg.get("end", 0) - seg.get("start", 0)
+        speaker_durations[spk] = speaker_durations.get(spk, 0) + dur
+
+    dominant = {spk for spk, dur in speaker_durations.items() if dur >= min_speaker_dur}
+    if not dominant or len(dominant) == len(speaker_durations):
+        return segments
+
+    minority = set(speaker_durations) - dominant
+
+    result = []
+    for i, seg in enumerate(segments):
+        spk = seg.get("speaker", "UNKNOWN")
+        if spk in minority:
+            best_alt = None
+            best_dist = float("inf")
+            for d_spk in dominant:
+                nearest = _find_nearest_temporal(segments, i, d_spk)
+                if nearest is not None:
+                    dist = abs(nearest - i)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_alt = d_spk
+            if best_alt:
+                seg = {**seg, "speaker": best_alt}
+                logger.debug("Absorbed minority %s -> %s at %.1f (%.1fs total)",
+                             spk, best_alt, seg.get("start", 0), speaker_durations[spk])
+        result.append(seg)
+
+    return collapse_same_speaker_segments(result)
+
+
 def eliminate_ghost_speakers(
     segments: list,
     profiles: Optional[dict] = None,
