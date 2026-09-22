@@ -119,6 +119,7 @@
                             <div id="transcriptionPointer" style="display:none;position:absolute;top:0;height:100%;width:3px;background:#ff4444;z-index:10;transition:left 0.15s ease;"></div>
                         </div>
                         <div id="transcriptionPointerLabel" style="position:relative;height:18px;font-size:0.7rem;color:#666;margin-top:0.2rem;overflow:hidden;white-space:nowrap;"></div>
+                        <div id="transcriptionLegend" class="legend" style="display:none;margin-top:0.3rem;"></div>
                         <div id="transcriptionStage" style="font-size:0.78rem;color:#666;margin-top:0.15rem;">Waiting for diarization...</div>
                     </div>
                 </div>
@@ -334,6 +335,7 @@
             const transcriptionPointer = document.getElementById('transcriptionPointer');
             const transcriptionPointerLabel = document.getElementById('transcriptionPointerLabel');
             const transcriptionStage = document.getElementById('transcriptionStage');
+            const transcriptionLegend = document.getElementById('transcriptionLegend');
 
             btn.disabled = true;
             resultsArea.style.display = 'none';
@@ -346,6 +348,8 @@
             transcriptionSegments.innerHTML = '';
             transcriptionPointer.style.display = 'none';
             transcriptionPointerLabel.textContent = '';
+            transcriptionLegend.style.display = 'none';
+            transcriptionLegend.innerHTML = '';
 
             const allResults = [];
             const total = fileInput.files.length;
@@ -359,6 +363,8 @@
                 transcriptionSegments.innerHTML = '';
                 transcriptionPointer.style.display = 'none';
                 transcriptionPointerLabel.textContent = '';
+                transcriptionLegend.style.display = 'none';
+                transcriptionLegend.innerHTML = '';
 
                 const form = new FormData();
                 form.append('file', file);
@@ -468,6 +474,19 @@
 
                                                 transcriptionPointer.style.display = 'block';
                                                 transcriptionPointer.style.left = '0%';
+
+                                                transcriptionLegend.innerHTML = '';
+                                                for (const spk of allSpeakers) {
+                                                    const item = document.createElement('div');
+                                                    item.className = 'legend-item';
+                                                    const swatch = document.createElement('div');
+                                                    swatch.className = 'legend-swatch';
+                                                    swatch.style.background = getSpeakerColor(spk, allSpeakers);
+                                                    item.appendChild(swatch);
+                                                    item.appendChild(document.createTextNode(spk));
+                                                    transcriptionLegend.appendChild(item);
+                                                }
+                                                transcriptionLegend.style.display = allSpeakers.length ? 'flex' : 'none';
                                             }
                                         }
                                     }

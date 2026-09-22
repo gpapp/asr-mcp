@@ -85,8 +85,8 @@ class Diarizer:
         all_embeddings = []
         total_segs = len(speech_ts)
         for seg_idx, ts in enumerate(speech_ts):
-            if progress_callback and seg_idx % 5 == 0:
-                p = 0.15 + 0.45 * (seg_idx / max(total_segs, 1))
+            if progress_callback:
+                p = 0.15 + 0.45 * ((seg_idx + 1) / max(total_segs, 1))
                 await progress_callback({"stage": f"Extracting embeddings ({seg_idx+1}/{total_segs})", "progress": p})
             start_sample = ts["start"]
             end_sample = ts["end"]
