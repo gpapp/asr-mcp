@@ -309,9 +309,10 @@ async def transcribe_upload(
             known_speakers = _load_known_speakers(settings, user_id)
 
             async def progress_cb(evt):
+                evt.setdefault("phase", "diarization")
                 await queue.put(evt)
 
-            await queue.put({"stage": "Running diarization", "progress": 0.05})
+            await queue.put({"stage": "Running diarization", "progress": 0.0, "phase": "diarization"})
             diarization = await diarizer.run(
                 audio_path=str(wav_path), num_speakers=num_speakers,
                 known_speakers=known_speakers or None,
@@ -322,6 +323,7 @@ async def transcribe_upload(
             audio_np = waveform.numpy().squeeze().astype(np.float32)
 
             segments = diarization.get("segments", [])
+            audio_dur = diarization.get("audio_duration_sec", 0.0)
 
             try:
                 from asr_mcp.db.manager import DatabaseManager
@@ -336,21 +338,38 @@ async def transcribe_upload(
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
 
+            await queue.put({
+                "stage": "diarization_complete",
+                "progress": 1.0,
+                "phase": "diarization",
+                "segments": segments,
+                "audio_duration_sec": audio_dur,
+                "total_speakers": diarization.get("total_speakers", 0),
+            })
+
             if not segments:
-                await queue.put({"stage": "Transcribing audio", "progress": 0.85})
+                await queue.put({"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
                 mel = _compute_mel_spectrogram_fast(audio_np)
                 result = transcribe_audio_sync(mel_spectrogram=mel)
                 diarization["results"] = [TranscribeResult(**result).__dict__]
                 await queue.put({"stage": "done", "progress": 1.0, "result": diarization})
                 return
 
-            await queue.put({"stage": "Transcribing audio", "progress": 0.85})
+            await queue.put({"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
             results = []
             total_segs = len(segments)
             for seg_idx, seg in enumerate(segments):
-                if seg_idx % 3 == 0:
-                    p = 0.85 + 0.14 * (seg_idx / max(total_segs, 1))
-                    await queue.put({"stage": f"Transcribing segment {seg_idx+1}/{total_segs}", "progress": p})
+                p = seg_idx / max(total_segs, 1)
+                await queue.put({
+                    "stage": f"Transcribing segment {seg_idx+1}/{total_segs}",
+                    "progress": p,
+                    "phase": "transcription",
+                    "segment_index": seg_idx,
+                    "total_segments": total_segs,
+                    "segment_speaker": seg.get("speaker", "UNKNOWN"),
+                    "segment_start": seg.get("start", 0),
+                    "segment_end": seg.get("end", 0),
+                })
                 start_sample = int(seg["start"] * 16000)
                 end_sample = int(seg["end"] * 16000)
                 chunk = audio_np[start_sample:end_sample]
