@@ -129,14 +129,73 @@ def _transcribe_turn(audio_np, turn, sample_rate=16000):
     )]
 
 
-def _prepare_turns(segments, audio_duration_sec=None):
+def _gap_boundary(audio, gap_start_sec, gap_end_sec, sample_rate=16000,
+                  frame_ms=20.0, dip_ratio=0.35, min_dip_sec=0.12):
+    """Pick the cut point inside a gap: the centre of its quietest pause.
+
+    Frame RMS energies are computed over the gap; the longest run below
+    *dip_ratio* of the peak (same heuristic as split_at_energy_dips) is the
+    real inter-speaker pause and the cut goes to its centre, so the boundary
+    never lands mid-word. Falls back to the single quietest frame, then to
+    the midpoint, when no dip is found (continuous speech or no audio).
+    """
+    import numpy as np
+
+    mid = (gap_start_sec + gap_end_sec) / 2.0
+    if audio is None or len(audio) == 0:
+        return mid
+    s = max(0, int(gap_start_sec * sample_rate))
+    e = min(len(audio), int(gap_end_sec * sample_rate))
+    frame_len = max(1, int(frame_ms / 1000 * sample_rate))
+    if e - s < 2 * frame_len:
+        return mid
+    chunk = audio[s:e].astype(np.float32)
+    energies = [
+        float(np.sqrt(np.mean(chunk[i:i + frame_len] ** 2)))
+        for i in range(0, len(chunk) - frame_len + 1, frame_len)
+    ]
+    if not energies:
+        return mid
+    max_e = max(energies)
+    if max_e < 1e-8:
+        return mid
+    thresh = max_e * dip_ratio
+    runs = []
+    i = 0
+    while i < len(energies):
+        if energies[i] < thresh:
+            j = i
+            while j < len(energies) and energies[j] < thresh:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    min_frames = max(1, int(round(min_dip_sec * 1000 / frame_ms)))
+    eligible = [r for r in runs if r[1] - r[0] >= min_frames]
+    if eligible:
+        centre_idx = len(energies) / 2.0
+        best = max(
+            eligible,
+            key=lambda r: (r[1] - r[0], -abs((r[0] + r[1]) / 2.0 - centre_idx)),
+        )
+        cut_frame = (best[0] + best[1]) // 2
+    else:
+        cut_frame = min(range(len(energies)), key=lambda k: energies[k])
+    cut_sample = s + cut_frame * frame_len + frame_len // 2
+    return min(max(cut_sample / sample_rate, gap_start_sec), gap_end_sec)
+
+
+def _prepare_turns(segments, audio_duration_sec=None, audio=None, sample_rate=16000):
     """Merge diarized segments into turns, split long ones, close gaps.
 
-    Any positive gap between consecutive turns is split at its midpoint and
-    the neighbouring turn boundaries are extended to meet there, so every
-    second of the timeline is covered by exactly one transcription turn and
-    speech between diarized segments is not dropped. Edges are extended to
-    the file start/end as well.
+    Any positive gap between consecutive turns is closed by moving both
+    neighbouring boundaries to a cut point inside the gap: the centre of the
+    quietest pause when the waveform is available (_gap_boundary), so the
+    split follows the real speaker change instead of an arbitrary midpoint.
+    Every second of the timeline ends up covered by exactly one transcription
+    turn and speech between diarized segments is not dropped. Edges are
+    extended to the file start/end as well.
     """
     turns = _merge_into_turns(segments)
     split = []
@@ -146,9 +205,9 @@ def _prepare_turns(segments, audio_duration_sec=None):
         gap_start = split[i]["end"]
         gap_end = split[i + 1]["start"]
         if gap_end - gap_start > 1e-3:
-            mid = (gap_start + gap_end) / 2.0
-            split[i]["end"] = mid
-            split[i + 1]["start"] = mid
+            cut = _gap_boundary(audio, gap_start, gap_end, sample_rate)
+            split[i]["end"] = cut
+            split[i + 1]["start"] = cut
     if split and audio_duration_sec is not None:
         if split[0]["start"] > 1e-3:
             split[0]["start"] = 0.0
@@ -158,7 +217,12 @@ def _prepare_turns(segments, audio_duration_sec=None):
 
 
 def _transcribe_diarized(audio_np, segments, sample_rate=16000):
-    turns = _prepare_turns(segments, audio_duration_sec=len(audio_np) / sample_rate)
+    turns = _prepare_turns(
+        segments,
+        audio_duration_sec=len(audio_np) / sample_rate,
+        audio=audio_np,
+        sample_rate=sample_rate,
+    )
     all_results = []
     for turn in turns:
         all_results.extend(_transcribe_turn(audio_np, turn, sample_rate))
@@ -492,7 +556,12 @@ async def transcribe_upload(
                 await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
                 return
 
-            turns = _prepare_turns(segments, audio_duration_sec=audio_dur or None)
+            turns = _prepare_turns(
+                segments,
+                audio_duration_sec=audio_dur or None,
+                audio=audio_np,
+                sample_rate=sr or 16000,
+            )
             total_turns = len(turns)
             results = []
             for turn_idx, turn in enumerate(turns):
