@@ -60,7 +60,7 @@ class Diarizer:
             return {"error": "Failed to load audio"}
 
         if progress_callback:
-            await progress_callback({"stage": "vad", "progress": 0.1})
+            await progress_callback({"stage": "Detecting speech regions", "progress": 0.1})
 
         # Step 1: VAD
         speech_ts = self._run_vad(waveform, sample_rate, v_threshold, min_speech_ms)
@@ -71,7 +71,7 @@ class Diarizer:
         speech_ts = self._merge_nearby_speech(speech_ts, sample_rate, max_gap_sec=1.0)
 
         if progress_callback:
-            await progress_callback({"stage": "features", "progress": 0.2})
+            await progress_callback({"stage": "Splitting audio at silence boundaries", "progress": 0.15})
 
         # Step 2: Energy-dip splitting (only split at genuine pauses >1s)
         speech_ts = split_at_energy_dips(
@@ -83,7 +83,11 @@ class Diarizer:
         # Step 3: Extract one embedding per segment (energy-dip bounded)
         all_segments = []
         all_embeddings = []
-        for ts in speech_ts:
+        total_segs = len(speech_ts)
+        for seg_idx, ts in enumerate(speech_ts):
+            if progress_callback and seg_idx % 5 == 0:
+                p = 0.15 + 0.45 * (seg_idx / max(total_segs, 1))
+                await progress_callback({"stage": f"Extracting embeddings ({seg_idx+1}/{total_segs})", "progress": p})
             start_sample = ts["start"]
             end_sample = ts["end"]
             dur_sec = (end_sample - start_sample) / sample_rate
@@ -106,7 +110,7 @@ class Diarizer:
         raw_embeddings = np.array(all_embeddings, dtype=np.float32)
 
         if progress_callback:
-            await progress_callback({"stage": "clustering", "progress": 0.6})
+            await progress_callback({"stage": "Clustering speakers", "progress": 0.6})
 
         # Step 5: Clustering
         from sklearn.cluster import AgglomerativeClustering
@@ -127,7 +131,7 @@ class Diarizer:
         long_labels, cluster_centroids = greedy_merge_clusters(raw_embeddings, long_labels, merge_thresh)
 
         if progress_callback:
-            await progress_callback({"stage": "segments", "progress": 0.7})
+            await progress_callback({"stage": "Building speaker segments", "progress": 0.7})
 
         # Step 8: Map labels to segments (energy-dip boundaries)
         merged_segments = []
@@ -144,7 +148,7 @@ class Diarizer:
         merged_segments = absorb_islands(merged_segments, min_island_dur=1.0)
 
         if progress_callback:
-            await progress_callback({"stage": "profiling", "progress": 0.8})
+            await progress_callback({"stage": "Profiling speakers", "progress": 0.8})
 
         # Step 10: Speaker profiling
         profiles = profile_speakers(waveform, merged_segments, sample_rate)
@@ -158,18 +162,31 @@ class Diarizer:
         # Step 10c: Relabel by pitch (highest pitch = Speaker 1)
         merged_segments, profiles, label_map = relabel_by_pitch(merged_segments, profiles)
 
-        # Rebuild centroids dict keyed by new speaker names for boundary refinement
-        relabeled_centroids = {}
-        for old_label, new_label in label_map.items():
-            if old_label.startswith("Speaker "):
-                old_num = int(old_label.split()[-1]) - 1
-                if old_num in cluster_centroids:
-                    relabeled_centroids[new_label] = cluster_centroids[old_num]
+        # Renumber cluster_centroids to match relabeled segments (0, 1, 2...)
+        # label_map maps old names -> new names. Build new sequential centroids.
+        old_to_new = {}  # old integer label -> new integer label
+        new_num = 0
+        for old_name, new_name in sorted(label_map.items(),
+                                          key=lambda x: int(x[1].split()[-1])):
+            if old_name.startswith("Speaker "):
+                old_num = int(old_name.split()[-1]) - 1
+                new_num_val = int(new_name.split()[-1]) - 1
+                old_to_new[old_num] = new_num_val
+        renumbered_centroids = {}
+        for old_num, centroid in cluster_centroids.items():
+            if old_num in old_to_new:
+                renumbered_centroids[old_to_new[old_num]] = centroid
+        cluster_centroids = renumbered_centroids
 
-        # Step 11: Boundary refinement (uses relabeled centroids)
+        # Build string-keyed centroids for boundary refinement and known-speaker matching
+        string_centroids = {}
+        for num, centroid in cluster_centroids.items():
+            string_centroids[f"Speaker {num + 1}"] = centroid
+
+        # Step 11: Boundary refinement (uses string-keyed centroids)
         merged_segments = refine_speaker_boundaries(
             merged_segments, waveform, self._state.embedding_session,
-            relabeled_centroids, sample_rate,
+            string_centroids, sample_rate,
             embedding_cache=_embedding_cache,
         )
 
@@ -181,6 +198,7 @@ class Diarizer:
             merged_segments, match_info = match_known_speakers_full(
                 merged_segments, all_segments, list(range(len(all_segments))),
                 raw_embeddings, cluster_centroids, profiles, known_speakers, cfg,
+                renumber=True,
             )
 
         if progress_callback:

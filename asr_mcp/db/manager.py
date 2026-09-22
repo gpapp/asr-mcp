@@ -374,54 +374,62 @@ class TranscriptDB:
     def __init__(self, db_manager: DatabaseManager):
         self._db = db_manager
 
-    def save(self, audio_filename: str, result: dict, session_id: Optional[str] = None) -> int:
+    def save(self, audio_filename: str, result: dict, user_id: str = DEFAULT_USER,
+             file_hash: str = None, total_speakers: int = 0,
+             audio_duration_sec: float = 0.0, processing_time_sec: float = 0.0) -> int:
         with self._db.get_session() as session:
             tm = TranscriptModel(
-                session_id=session_id,
+                user_id=user_id,
                 audio_filename=audio_filename,
+                file_hash=file_hash,
+                total_speakers=total_speakers,
+                audio_duration_sec=audio_duration_sec,
+                processing_time_sec=processing_time_sec,
                 result=json.dumps(result),
             )
             session.add(tm)
             session.commit()
             return tm.id
 
-    def get(self, transcript_id: int) -> Optional[dict]:
+    def get(self, transcript_id: int, user_id: str = DEFAULT_USER) -> Optional[dict]:
         with self._db.get_session() as session:
-            tm = session.get(TranscriptModel, transcript_id)
+            tm = session.query(TranscriptModel).filter_by(
+                id=transcript_id, user_id=user_id
+            ).first()
             if not tm:
                 return None
-            return {
-                "id": tm.id,
-                "session_id": tm.session_id,
-                "audio_filename": tm.audio_filename,
-                "result": json.loads(tm.result),
-                "created_at": tm.created_at.isoformat(),
-            }
+            return self._row_to_dict(tm)
 
-    def list_by_session(self, session_id: str) -> list[dict]:
+    def list_all(self, user_id: str = DEFAULT_USER) -> list[dict]:
         with self._db.get_session() as session:
             rows = (
                 session.query(TranscriptModel)
-                .filter(TranscriptModel.session_id == session_id)
+                .filter_by(user_id=user_id)
                 .order_by(TranscriptModel.created_at.desc())
                 .all()
             )
-            return [
-                {
-                    "id": r.id,
-                    "session_id": r.session_id,
-                    "audio_filename": r.audio_filename,
-                    "result": json.loads(r.result),
-                    "created_at": r.created_at.isoformat(),
-                }
-                for r in rows
-            ]
+            return [self._row_to_dict(r) for r in rows]
 
-    def delete(self, transcript_id: int) -> bool:
+    def delete(self, transcript_id: int, user_id: str = DEFAULT_USER) -> bool:
         with self._db.get_session() as session:
-            tm = session.get(TranscriptModel, transcript_id)
+            tm = session.query(TranscriptModel).filter_by(
+                id=transcript_id, user_id=user_id
+            ).first()
             if not tm:
                 return False
             session.delete(tm)
             session.commit()
             return True
+
+    def _row_to_dict(self, tm: TranscriptModel) -> dict:
+        return {
+            "id": tm.id,
+            "user_id": tm.user_id,
+            "audio_filename": tm.audio_filename,
+            "file_hash": tm.file_hash,
+            "total_speakers": tm.total_speakers or 0,
+            "audio_duration_sec": tm.audio_duration_sec or 0.0,
+            "processing_time_sec": tm.processing_time_sec or 0.0,
+            "result": json.loads(tm.result) if tm.result else {},
+            "created_at": tm.created_at.isoformat() if tm.created_at else None,
+        }

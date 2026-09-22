@@ -76,6 +76,7 @@
         <nav>
             <a href="__PREFIX__/gui" class="active">Process Transcription</a>
             <a href="__PREFIX__/voices">Manage Voiceprints</a>
+            <a href="__PREFIX__/transcriptions">Transcriptions</a>
             <span class="user-info" id="userDisplay">...</span>
         </nav>
     </div>
@@ -102,6 +103,13 @@
                     <div class="formats">WAV, MP3, FLAC, OGG, M4A, WebM, Opus</div>
                 </div>
                 <div id="fileName" style="margin-top:0.8rem;font-size:0.85rem;color:#555;display:none;"></div>
+
+                <div id="progressArea" style="display:none;margin-top:1rem;">
+                    <div style="background:#e9ecef;border-radius:6px;overflow:hidden;height:24px;">
+                        <div id="progressBar" style="background:linear-gradient(90deg,#007bff,#0056b3);height:100%;width:0%;transition:width 0.3s;display:flex;align-items:center;justify-content:center;color:#fff;font-size:0.75rem;font-weight:600;">0%</div>
+                    </div>
+                    <div id="progressStage" style="font-size:0.8rem;color:#666;margin-top:0.3rem;">Preparing...</div>
+                </div>
 
                 <div class="options">
                     <label>Output:
@@ -306,10 +314,17 @@
             const resultsArea = document.getElementById('resultsArea');
             const resultsContent = document.getElementById('resultsContent');
             const timelineContainer = document.getElementById('timelineContainer');
+            const progressArea = document.getElementById('progressArea');
+            const progressBar = document.getElementById('progressBar');
+            const progressStage = document.getElementById('progressStage');
 
             btn.disabled = true;
             resultsArea.style.display = 'none';
             timelineContainer.innerHTML = '';
+            progressArea.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
+            progressStage.textContent = 'Uploading file...';
 
             const allResults = [];
             const total = fileInput.files.length;
@@ -317,6 +332,8 @@
             for (let i = 0; i < total; i++) {
                 const file = fileInput.files[i];
                 btn.innerHTML = '<span class="spinner"></span>Processing ' + (i + 1) + '/' + total + '...';
+                progressBar.style.width = '0%';
+                progressBar.textContent = '0%';
 
                 const form = new FormData();
                 form.append('file', file);
@@ -325,23 +342,72 @@
                 try {
                     const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
                     const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
-                    const data = await r.json();
-                    data._fileName = file.name;
-                    allResults.push({ file: file.name, result: data });
 
-                    if (data.segments && data.segments.length) {
-                        renderTimeline(data, timelineContainer);
+                    if (!r.ok) {
+                        const errText = await r.text();
+                        throw new Error(errText);
+                    }
+
+                    const reader = r.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    let finalData = null;
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop();
+
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const data = JSON.parse(line.slice(6));
+                                    if (data.progress !== undefined) {
+                                        const pct = Math.round(data.progress * 100);
+                                        progressBar.style.width = pct + '%';
+                                        progressBar.textContent = pct + '%';
+                                        if (data.stage) progressStage.textContent = data.stage;
+                                    }
+                                    if (data.stage === 'done' && data.result) {
+                                        finalData = data.result;
+                                    }
+                                    if (data.stage === 'error') {
+                                        throw new Error(data.error || 'Processing failed');
+                                    }
+                                } catch (pe) {
+                                    if (pe.message && !pe.message.includes('JSON')) throw pe;
+                                }
+                            }
+                        }
+                    }
+
+                    if (finalData) {
+                        finalData._fileName = file.name;
+                        allResults.push({ file: file.name, result: finalData });
+                        if (finalData.segments && finalData.segments.length) {
+                            renderTimeline(finalData, timelineContainer);
+                        }
                     }
                 } catch (e) {
                     allResults.push({ file: file.name, error: e.message });
+                    toast('Error processing ' + file.name + ': ' + e.message, true);
                 }
             }
+
+            progressBar.style.width = '100%';
+            progressBar.textContent = '100%';
+            progressStage.textContent = 'Complete!';
 
             resultsContent.textContent = JSON.stringify(allResults.length === 1 ? allResults[0] : allResults, null, 2);
             resultsArea.style.display = 'block';
             toast('Processing complete');
             btn.disabled = false;
             btn.innerHTML = 'Process Audio';
+
+            setTimeout(() => { progressArea.style.display = 'none'; }, 3000);
         }
 
         loadUser();

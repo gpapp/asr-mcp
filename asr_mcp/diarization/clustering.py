@@ -110,9 +110,7 @@ def merge_similar_speakers(
 
     cfg = cfg or {}
     matching_cfg = cfg.get("matching", {})
-    embed_thresh = matching_cfg.get("embed_only_threshold", 0.16)
-    accept_thresh = matching_cfg.get("accept_threshold", 0.35)
-    clear_gap = matching_cfg.get("clear_winner_gap", 0.02)
+    merge_thresh = matching_cfg.get("embed_only_threshold", 0.2)
 
     unique_labels = sorted(cluster_centroids.keys())
     if len(unique_labels) < 2:
@@ -142,34 +140,13 @@ def merge_similar_speakers(
             emb_dist = 1.0 - float(np.dot(emb_i, emb_j) /
                                    (np.linalg.norm(emb_i) * np.linalg.norm(emb_j) + 1e-8))
 
-            if emb_dist < embed_thresh:
+            if emb_dist < merge_thresh:
                 dur_i = voiceprints[str(li)].get("total_speech_sec", 0)
                 dur_j = voiceprints[str(lj)].get("total_speech_sec", 0)
                 target, source = (li, lj) if dur_i >= dur_j else (lj, li)
                 merge_map[source] = target
                 logger.info("Merge similar: Speaker %d -> Speaker %d (emb_dist=%.3f)",
                             source + 1, target + 1, emb_dist)
-            elif emb_dist < accept_thresh:
-                pi = voiceprints[str(li)]
-                pj = voiceprints[str(lj)]
-                dist_result = compute_distance(
-                    cluster_centroids[li].tolist(),
-                    pi.get("pitch_hz", 0.0), pi.get("energy_rms", 0.0),
-                    pj, cfg,
-                )
-                dist_reverse = compute_distance(
-                    cluster_centroids[lj].tolist(),
-                    pj.get("pitch_hz", 0.0), pj.get("energy_rms", 0.0),
-                    pi, cfg,
-                )
-                if (dist_result["total"] < accept_thresh and
-                        dist_reverse["total"] < accept_thresh):
-                    dur_i = voiceprints[str(li)].get("total_speech_sec", 0)
-                    dur_j = voiceprints[str(lj)].get("total_speech_sec", 0)
-                    target, source = (li, lj) if dur_i >= dur_j else (lj, li)
-                    merge_map[source] = target
-                    logger.info("Merge similar (multi-feat): Speaker %d -> Speaker %d (dist=%.3f)",
-                                source + 1, target + 1, dist_result["total"])
 
     if not merge_map:
         return segments, cluster_centroids, profiles
@@ -200,7 +177,6 @@ def merge_similar_speakers(
                 pass
 
     new_centroids = {}
-    merged_into = {}
     for label in unique_labels:
         target = label_remap[label]
         if target not in new_centroids:
@@ -251,17 +227,16 @@ def match_known_speakers_full(
     profiles: dict,
     known_speakers: dict,
     cfg: dict = None,
+    renumber: bool = False,
 ) -> Tuple[list[dict], dict]:
     from asr_mcp.speaker.matcher import match_clusters, merge_matched_clusters
-
-    unique_speakers = sorted(set(s.get("speaker", "") for s in merged_segments))
 
     clusters_data = {}
     for cluster_id, centroid in cluster_centroids.items():
         label = f"Speaker {cluster_id + 1}"
         profile = profiles.get(label, {})
-        clusters_data[str(cluster_id)] = {
-            "embedding": centroid.tolist(),
+        clusters_data[label] = {
+            "embedding": centroid.tolist() if isinstance(centroid, np.ndarray) else centroid,
             "pitch_hz": profile.get("pitch_hz", 0.0),
             "energy_rms": profile.get("energy_rms", 0.0),
         }

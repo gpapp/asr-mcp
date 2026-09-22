@@ -49,8 +49,12 @@ class TranscriptModel(Base):
     __tablename__ = "transcripts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    session_id = Column(String(255), nullable=True)
+    user_id = Column(String(255), nullable=False, default="default", index=True)
     audio_filename = Column(String(512), nullable=False)
+    file_hash = Column(String(64), nullable=True, index=True)
+    total_speakers = Column(Integer, default=0)
+    audio_duration_sec = Column(Float, default=0.0)
+    processing_time_sec = Column(Float, default=0.0)
     result = Column(Text, nullable=False, default="{}")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 

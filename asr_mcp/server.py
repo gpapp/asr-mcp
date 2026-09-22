@@ -259,6 +259,11 @@ async def voices(request: Request):
     return _render("voices.html")
 
 
+@app.get("/transcriptions", response_class=HTMLResponse)
+async def transcriptions_page(request: Request):
+    return _render("transcripts.html")
+
+
 @app.get("/api/user")
 async def get_user(request: Request):
     from asr_mcp.api.auth import get_session_user
