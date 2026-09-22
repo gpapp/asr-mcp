@@ -16,6 +16,7 @@ from asr_mcp.api.schemas import (
 from asr_mcp.api.security import verify_api_key, get_current_user
 from asr_mcp.api.auth import get_session_user
 from asr_mcp.config.settings import Settings, get_settings
+from asr_mcp.core import job_state
 from asr_mcp.speaker.vad import split_at_energy_dips
 
 logger = logging.getLogger("asr_mcp.api.asr_router")
@@ -614,6 +615,7 @@ async def _sse_put(queue: asyncio.Queue, evt) -> None:
     A short real sleep gives them that window.
     """
     await queue.put(evt)
+    job_state.publish(evt)
     await asyncio.sleep(0.01)
 
 
@@ -688,6 +690,13 @@ async def diarize_upload(
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
 ):
+    busy = job_state.get_running()
+    if busy is not None:
+        return JSONResponse(status_code=409, content={
+            "detail": "A transcription is already in progress",
+            "job": busy.meta(),
+        })
+
     content = await file.read()
     if len(content) > 200 * 1024 * 1024:
         return JSONResponse(status_code=413, detail="File too large (max 200MB)")
@@ -710,6 +719,7 @@ async def diarize_upload(
         return JSONResponse(status_code=400, content={"detail": f"Audio conversion failed: {e}"})
 
     queue = asyncio.Queue()
+    job = job_state.start_job(mode="diarize", filename=file.filename, user_id=user_id)
 
     async def run_diarize():
         try:
@@ -746,20 +756,19 @@ async def diarize_upload(
             logger.error("Diarize failed: %s", e)
             await _sse_put(queue, {"stage": "error", "error": str(e)})
         finally:
+            job_state.ensure_finished(job)
             await queue.put(None)
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     asyncio.create_task(run_diarize())
 
     async def event_stream():
-        import shutil
-        try:
-            while True:
-                evt = await queue.get()
-                if evt is None:
-                    break
-                yield f"data: {json.dumps(_safe_json(evt))}\n\n"
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        while True:
+            evt = await queue.get()
+            if evt is None:
+                break
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -826,6 +835,13 @@ async def transcribe_upload(
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
 ):
+    busy = job_state.get_running()
+    if busy is not None:
+        return JSONResponse(status_code=409, content={
+            "detail": "A transcription is already in progress",
+            "job": busy.meta(),
+        })
+
     content = await file.read()
     if len(content) > 200 * 1024 * 1024:
         return JSONResponse(status_code=413, content={"detail": "File too large (max 200MB)"})
@@ -851,6 +867,7 @@ async def transcribe_upload(
         return JSONResponse(status_code=503, content={"detail": "Models not loaded. CUDA GPU required."})
 
     queue = asyncio.Queue()
+    job = job_state.start_job(mode="transcribe", filename=file.filename, user_id=user_id)
 
     async def run_transcribe():
         try:
@@ -940,12 +957,16 @@ async def transcribe_upload(
                 })
 
                 def _make_window_cb(turn_idx=turn_idx, turn=turn):
+                    def _emit_window(evt):
+                        queue.put_nowait(evt)
+                        job_state.publish(evt)
+
                     def cb(i, n):
                         frac = (turn_idx + i / max(n, 1)) / max(total_turns, 1)
                         span = turn["end"] - turn["start"]
                         win_start = turn["start"] + span * ((i - 1) / max(n, 1))
                         win_end = turn["start"] + span * (i / max(n, 1))
-                        loop.call_soon_threadsafe(queue.put_nowait, {
+                        loop.call_soon_threadsafe(_emit_window, {
                             "stage": f"Transcribing turn {turn_idx+1}/{total_turns} — window {i}/{n} ({turn['speaker']})",
                             "progress": frac,
                             "phase": "transcription",
@@ -995,20 +1016,65 @@ async def transcribe_upload(
             logger.error("Transcribe failed: %s", e)
             await _sse_put(queue, {"stage": "error", "error": str(e)})
         finally:
+            job_state.ensure_finished(job)
             await queue.put(None)
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     asyncio.create_task(run_transcribe())
 
     async def event_stream():
-        import shutil
-        try:
-            while True:
-                evt = await queue.get()
-                if evt is None:
-                    break
-                yield f"data: {json.dumps(_safe_json(evt))}\n\n"
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        while True:
+            evt = await queue.get()
+            if evt is None:
+                break
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.get("/active")
+async def active_job(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+    _: str = Depends(verify_api_key),
+):
+    job = job_state.get_for_user(user_id)
+    if job is None:
+        return {"active": False}
+    return {"active": True, "job": job.meta()}
+
+
+@router.get("/active/stream")
+async def active_job_stream(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+    _: str = Depends(verify_api_key),
+):
+    job = job_state.get_for_user(user_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"detail": "No active job"})
+
+    snap, sub = job_state.attach(job)
+
+    async def event_stream():
+        for evt in snap:
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+        if sub is None:
+            return
+        while True:
+            evt = await sub.get()
+            if evt is None:
+                break
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
 
     return StreamingResponse(
         event_stream(),

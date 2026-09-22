@@ -300,168 +300,150 @@
             }
         });
 
-        async function processAudio() {
-            const fileInput = document.getElementById('audioFile');
-            if (!fileInput.files.length) { toast('Please select a file', true); return; }
-
-            const mode = document.getElementById('outputMode').value;
-            const numSpeakers = document.getElementById('numSpeakers').value;
+        function enterJobUi(label) {
+            document.getElementById('uploadArea').style.display = 'none';
+            document.querySelector('.options').style.display = 'none';
+            const fn = document.getElementById('fileName');
+            fn.textContent = label;
+            fn.style.display = 'block';
             const btn = document.getElementById('processBtn');
-            const resultsArea = document.getElementById('resultsArea');
-            const resultsContent = document.getElementById('resultsContent');
-            const timelineContainer = document.getElementById('timelineContainer');
-            const progressArea = document.getElementById('progressArea');
-            const diarProgressBar = document.getElementById('diarProgressBar');
-            const diarProgressStage = document.getElementById('diarProgressStage');
-            const transcriptionArea = document.getElementById('transcriptionArea');
-            const transcriptionSegments = document.getElementById('transcriptionSegments');
-            const transcriptionPointer = document.getElementById('transcriptionPointer');
-            const transcriptionPointerLabel = document.getElementById('transcriptionPointerLabel');
-            const transcriptionStage = document.getElementById('transcriptionStage');
-            const transcriptionLegend = document.getElementById('transcriptionLegend');
-
             btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Processing...';
+            const resultsArea = document.getElementById('resultsArea');
             resultsArea.style.display = 'none';
-            timelineContainer.innerHTML = '';
+            document.getElementById('timelineContainer').innerHTML = '';
+            const progressArea = document.getElementById('progressArea');
             progressArea.style.display = 'block';
-            diarProgressBar.style.width = '0%';
-            diarProgressBar.textContent = '0%';
-            diarProgressStage.textContent = 'Uploading file...';
-            transcriptionArea.style.display = 'none';
-            transcriptionSegments.innerHTML = '';
-            transcriptionPointer.style.display = 'none';
-            transcriptionPointerLabel.textContent = '';
-            transcriptionLegend.style.display = 'none';
-            transcriptionLegend.innerHTML = '';
+            document.getElementById('diarProgressBar').style.width = '0%';
+            document.getElementById('diarProgressBar').textContent = '0%';
+            document.getElementById('diarProgressStage').textContent = 'Preparing...';
+            document.getElementById('transcriptionArea').style.display = 'none';
+            document.getElementById('transcriptionSegments').innerHTML = '';
+            document.getElementById('transcriptionPointer').style.display = 'none';
+            document.getElementById('transcriptionPointerLabel').textContent = '';
+            document.getElementById('transcriptionLegend').style.display = 'none';
+            document.getElementById('transcriptionLegend').innerHTML = '';
+        }
 
-            const allResults = [];
-            const total = fileInput.files.length;
+        function exitJobUi() {
+            document.getElementById('uploadArea').style.display = '';
+            document.querySelector('.options').style.display = '';
+            const btn = document.getElementById('processBtn');
+            const files = document.getElementById('audioFile').files;
+            btn.innerHTML = 'Process Audio';
+            btn.disabled = !files.length;
+            const fn = document.getElementById('fileName');
+            if (!files.length) {
+                fn.style.display = 'none';
+                fn.textContent = '';
+            }
+        }
 
-            for (let i = 0; i < total; i++) {
-                const file = fileInput.files[i];
-                btn.innerHTML = '<span class="spinner"></span>Processing ' + (i + 1) + '/' + total + '...';
-                diarProgressBar.style.width = '0%';
-                diarProgressBar.textContent = '0%';
-                transcriptionArea.style.display = 'none';
-                transcriptionSegments.innerHTML = '';
-                transcriptionPointer.style.display = 'none';
-                transcriptionPointerLabel.textContent = '';
-                transcriptionLegend.style.display = 'none';
-                transcriptionLegend.innerHTML = '';
+        function newSseState(mode) {
+            return {
+                mode,
+                audioDur: 0,
+                allSpeakers: [],
+                finalData: null,
+                diarProgressBar: document.getElementById('diarProgressBar'),
+                diarProgressStage: document.getElementById('diarProgressStage'),
+                transcriptionArea: document.getElementById('transcriptionArea'),
+                transcriptionSegments: document.getElementById('transcriptionSegments'),
+                transcriptionPointer: document.getElementById('transcriptionPointer'),
+                transcriptionPointerLabel: document.getElementById('transcriptionPointerLabel'),
+                transcriptionStage: document.getElementById('transcriptionStage'),
+                transcriptionLegend: document.getElementById('transcriptionLegend'),
+            };
+        }
 
-                const form = new FormData();
-                form.append('file', file);
-                if (numSpeakers) form.append('num_speakers', numSpeakers);
+        function handleSseData(data, st) {
+            if (data.stage === 'error') {
+                throw new Error(data.error || 'Processing failed');
+            }
 
-                try {
-                    const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
-                    const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
+            if (data.stage === 'done' && data.result) {
+                st.finalData = data.result;
+                st.diarProgressBar.style.width = '100%';
+                st.diarProgressBar.textContent = '100%';
+                st.diarProgressStage.textContent = 'Complete!';
+                if (st.mode === 'transcribe') {
+                    if (st.transcriptionPointer) st.transcriptionPointer.style.left = '100%';
+                    st.transcriptionStage.textContent = 'Complete!';
+                }
+                return;
+            }
 
-                    if (!r.ok) {
-                        const errText = await r.text();
-                        throw new Error(errText);
+            if (data.phase === 'diarization') {
+                const pct = Math.round((data.progress || 0) * 100);
+                st.diarProgressBar.style.width = pct + '%';
+                st.diarProgressBar.textContent = pct + '%';
+                if (data.stage) st.diarProgressStage.textContent = data.stage;
+
+                if (data.stage === 'diarization_complete' && st.mode === 'transcribe') {
+                    const segments = data.segments || [];
+                    st.audioDur = data.audio_duration_sec || 0;
+                    st.allSpeakers = [...new Set(segments.map(s => s.speaker))].sort();
+
+                    if (st.audioDur > 0 && segments.length) {
+                        st.transcriptionArea.style.display = 'block';
+                        fillSpeakerBars(st.transcriptionSegments, segments, st.audioDur, st.allSpeakers);
+                        st.transcriptionPointer.style.display = 'block';
+                        st.transcriptionPointer.style.left = '0%';
+                        st.transcriptionLegend.style.display = 'none';
                     }
-
-                    const reader = r.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-                    let finalData = null;
-                    let allSpeakers = [];
-                    let audioDur = 0;
-
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-
-                        buffer += decoder.decode(value, { stream: true });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop();
-
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                try {
-                                    const data = JSON.parse(line.slice(6));
-
-                                    if (data.stage === 'error') {
-                                        throw new Error(data.error || 'Processing failed');
-                                    }
-
-                                    if (data.stage === 'done' && data.result) {
-                                        finalData = data.result;
-                                        if (mode === 'transcribe') {
-                                            diarProgressBar.style.width = '100%';
-                                            diarProgressBar.textContent = '100%';
-                                            diarProgressStage.textContent = 'Complete!';
-                                            if (transcriptionPointer) transcriptionPointer.style.left = '100%';
-                                            transcriptionStage.textContent = 'Complete!';
-                                        } else {
-                                            diarProgressBar.style.width = '100%';
-                                            diarProgressBar.textContent = '100%';
-                                            diarProgressStage.textContent = 'Complete!';
-                                        }
-                                        continue;
-                                    }
-
-                                    if (data.phase === 'diarization') {
-                                        const pct = Math.round(data.progress * 100);
-                                        diarProgressBar.style.width = pct + '%';
-                                        diarProgressBar.textContent = pct + '%';
-                                        if (data.stage) diarProgressStage.textContent = data.stage;
-
-                                        if (data.stage === 'diarization_complete' && mode === 'transcribe') {
-                                            const segments = data.segments || [];
-                                            audioDur = data.audio_duration_sec || 0;
-                                            allSpeakers = [...new Set(segments.map(s => s.speaker))].sort();
-
-                                            if (audioDur > 0 && segments.length) {
-                                                transcriptionArea.style.display = 'block';
-                                                fillSpeakerBars(transcriptionSegments, segments, audioDur, allSpeakers);
-                                                transcriptionPointer.style.display = 'block';
-                                                transcriptionPointer.style.left = '0%';
-                                                transcriptionLegend.style.display = 'none';
-                                            }
-                                        }
-                                    }
-
-                                    if (data.phase === 'transcription' && data.stage !== 'done') {
-                                        if (data.progress !== undefined) {
-                                            const pct = Math.round(data.progress * 100);
-                                            if (data.stage) transcriptionStage.textContent = data.stage;
-
-                                            if (data.segment_index !== undefined && audioDur > 0) {
-                                                const segStart = data.segment_start || 0;
-                                                const pointerPct = (segStart / audioDur * 100).toFixed(2);
-                                                transcriptionPointer.style.left = pointerPct + '%';
-                                                transcriptionPointerLabel.textContent = data.segment_speaker + ' @ ' + formatTime(segStart);
-                                            }
-                                        }
-                                    }
-                                } catch (pe) {
-                                    if (pe.message && !pe.message.includes('JSON')) throw pe;
-                                }
-                            }
-                        }
-                    }
-
-                    if (finalData) {
-                        finalData._fileName = file.name;
-                        allResults.push({ file: file.name, result: finalData });
-                        const hasResults = (finalData.results || []).some(r => r && (r.text || '').trim());
-                        if (mode === 'transcribe' && hasResults) {
-                            if (!renderTranscriptViewer(finalData, timelineContainer) &&
-                                finalData.segments && finalData.segments.length) {
-                                renderTimeline(finalData, timelineContainer);
-                            }
-                        } else if (finalData.segments && finalData.segments.length) {
-                            renderTimeline(finalData, timelineContainer);
-                        }
-                    }
-                } catch (e) {
-                    allResults.push({ file: file.name, error: e.message });
-                    toast('Error processing ' + file.name + ': ' + e.message, true);
                 }
             }
 
+            if (data.phase === 'transcription' && data.stage !== 'done') {
+                if (data.progress !== undefined) {
+                    const pct = Math.round(data.progress * 100);
+                    if (data.stage) st.transcriptionStage.textContent = data.stage;
+
+                    if (data.segment_index !== undefined && st.audioDur > 0) {
+                        const segStart = data.segment_start || 0;
+                        const pointerPct = (segStart / st.audioDur * 100).toFixed(2);
+                        st.transcriptionPointer.style.left = pointerPct + '%';
+                        st.transcriptionPointerLabel.textContent = data.segment_speaker + ' @ ' + formatTime(segStart);
+                    }
+                }
+            }
+        }
+
+        async function readSseBody(body, st) {
+            const reader = body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+                            handleSseData(data, st);
+                        } catch (pe) {
+                            if (pe.message && !pe.message.includes('JSON')) throw pe;
+                        }
+                    }
+                }
+            }
+        }
+
+        function renderResultToTimeline(result, container) {
+            if (!result) return;
+            const hasResults = (result.results || []).some(r => r && (r.text || '').trim());
+            if (hasResults) {
+                if (renderTranscriptViewer(result, container)) return;
+            }
+            if (result.segments && result.segments.length) {
+                renderTimeline(result, container);
+            }
+        }
+
+        function showDownloadLink(allResults) {
             const lines = [];
             for (const item of allResults) {
                 lines.push('=== ' + item.file + ' ===');
@@ -488,6 +470,7 @@
             const blob = new Blob([txt], { type: 'text/plain' });
             if (window._resultUrl) URL.revokeObjectURL(window._resultUrl);
             window._resultUrl = URL.createObjectURL(blob);
+            const resultsContent = document.getElementById('resultsContent');
             resultsContent.innerHTML = '';
             const dl = document.createElement('a');
             dl.href = window._resultUrl;
@@ -496,16 +479,113 @@
             dl.style.display = 'inline-block';
             dl.textContent = 'Download transcription';
             resultsContent.appendChild(dl);
-            resultsArea.style.display = 'block';
-            toast('Processing complete');
-            btn.disabled = false;
-            btn.innerHTML = 'Process Audio';
+            document.getElementById('resultsArea').style.display = 'block';
+        }
 
-            setTimeout(() => { progressArea.style.display = 'none'; }, 5000);
+        async function attachActiveJob(job) {
+            const mode = (job && job.mode) || 'transcribe';
+            const fname = (job && job.filename) || 'audio';
+            enterJobUi('Processing: ' + fname);
+            const st = newSseState(mode);
+            try {
+                const r = await fetch(P + '/api/asr/active/stream', { credentials: 'same-origin' });
+                if (!r.ok) throw new Error('Active job ended before attach');
+                await readSseBody(r.body, st);
+            } catch (e) {
+                toast('Failed to attach to running job: ' + e.message, true);
+                exitJobUi();
+                return;
+            }
+            if (!st.finalData) {
+                toast('Lost connection to running job', true);
+                exitJobUi();
+                return;
+            }
+            const allResults = [];
+            st.finalData._fileName = fname;
+            allResults.push({ file: fname, result: st.finalData });
+            renderResultToTimeline(st.finalData, document.getElementById('timelineContainer'));
+            showDownloadLink(allResults);
+            exitJobUi();
+            toast('Processing complete');
+            setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+        }
+
+        async function processAudio() {
+            const fileInput = document.getElementById('audioFile');
+            if (!fileInput.files.length) { toast('Please select a file', true); return; }
+
+            const mode = document.getElementById('outputMode').value;
+            const numSpeakers = document.getElementById('numSpeakers').value;
+            const btn = document.getElementById('processBtn');
+            const timelineContainer = document.getElementById('timelineContainer');
+
+            const allResults = [];
+            const total = fileInput.files.length;
+            enterJobUi(total === 1 ? fileInput.files[0].name : total + ' files');
+
+            for (let i = 0; i < total; i++) {
+                const file = fileInput.files[i];
+                btn.innerHTML = '<span class="spinner"></span>Processing ' + (i + 1) + '/' + total + '...';
+                enterJobUi('Processing ' + (i + 1) + '/' + total + ': ' + file.name);
+
+                const form = new FormData();
+                form.append('file', file);
+                if (numSpeakers) form.append('num_speakers', numSpeakers);
+
+                try {
+                    const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
+                    const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
+
+                    if (r.status === 409) {
+                        let info = {};
+                        try { info = await r.json(); } catch (e) { /* ignore */ }
+                        toast('Already processing — attaching to running job');
+                        await attachActiveJob(info.job || { mode, filename: file.name });
+                        return;
+                    }
+
+                    if (!r.ok) {
+                        const errText = await r.text();
+                        throw new Error(errText);
+                    }
+
+                    const st = newSseState(mode);
+                    await readSseBody(r.body, st);
+
+                    if (st.finalData) {
+                        st.finalData._fileName = file.name;
+                        allResults.push({ file: file.name, result: st.finalData });
+                        renderResultToTimeline(st.finalData, timelineContainer);
+                    }
+                } catch (e) {
+                    allResults.push({ file: file.name, error: e.message });
+                    toast('Error processing ' + file.name + ': ' + e.message, true);
+                }
+            }
+
+            showDownloadLink(allResults);
+            toast('Processing complete');
+            exitJobUi();
+            setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+        }
+
+        async function checkActiveJob() {
+            try {
+                const r = await fetch(P + '/api/asr/active', { credentials: 'same-origin' });
+                if (!r.ok) return;
+                const d = await r.json();
+                if (d.active && d.job) {
+                    await attachActiveJob(d.job);
+                }
+            } catch (e) {
+                /* no active job or network hiccup — keep normal UI */
+            }
         }
 
         loadUser();
         checkStatus();
+        checkActiveJob();
     </script>
 </body>
 </html>
