@@ -460,7 +460,7 @@ class VoiceprintService:
         embeddings = []
         for waveform in waveforms:
             try:
-                emb = extract_embedding(waveform, SAMPLE_RATE, self._embedding_session)
+                emb = extract_embedding(waveform, SAMPLE_RATE, self._emb_session())
                 embeddings.append(emb)
             except Exception as e:
                 logger.warning("Failed to embed snippet: %s", e)
