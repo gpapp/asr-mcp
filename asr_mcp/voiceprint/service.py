@@ -18,9 +18,10 @@ from asr_mcp.voiceprint.utils import load_audio, load_audio_segment, generate_se
 logger = logging.getLogger("asr_mcp.voiceprint.service")
 
 SAMPLE_RATE = 16000
-AUTO_COLLECT_MIN_DURATION = 1.5
+AUTO_COLLECT_MIN_DURATION = 3.0
 AUTO_COLLECT_MAX_TOTAL_SEC = 600.0
 AUTO_COLLECT_MAX_SEGMENT_SEC = 300.0
+AUTO_COLLECT_MIN_SPEAKER_SEGMENTS = 2
 MIN_SNIPPET_DURATION = 1.5
 
 
@@ -335,6 +336,8 @@ class VoiceprintService:
             by_speaker.setdefault(sp, []).append(seg)
 
         for speaker_name, segs in by_speaker.items():
+            if len(segs) < AUTO_COLLECT_MIN_SPEAKER_SEGMENTS:
+                continue
             current_total = speaker_totals.get(speaker_name, 0.0)
             if current_total >= AUTO_COLLECT_MAX_TOTAL_SEC:
                 continue

@@ -368,7 +368,7 @@ def transcribe_audio_sync(
         text = clean_transcript(text)
 
     inference_time = time.time() - start_time
-    audio_duration = len(mel_spectrogram[0]) * HOP_LENGTH / SAMPLE_RATE if mel_spectrogram is not None else 0
+    audio_duration = mel_spectrogram.shape[0] * HOP_LENGTH / SAMPLE_RATE if mel_spectrogram is not None else 0
 
     if segments_out and audio_duration > 0:
         for s in segments_out:

@@ -18,6 +18,7 @@ services:
       - TRANSCRIBE_DB_PATH=/app/data/asr_mcp.db
       - TRANSCRIBE_HTPASSWD_PATH=/app/data/.htpasswd
       - TRANSCRIBE_PREFIX=/asr-mcp
+      - TRANSCRIBE_LOG_LEVEL=${TRANSCRIBE_LOG_LEVEL:-INFO}
       - TRANSCRIBE_MODEL_TTL_MINUTES=${TRANSCRIBE_MODEL_TTL_MINUTES:-5}
     volumes:
       - ${DATA_DIR:-.}/data:/app/data

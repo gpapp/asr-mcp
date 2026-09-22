@@ -20,103 +20,122 @@ from asr_mcp.speaker.vad import split_at_energy_dips
 logger = logging.getLogger("asr_mcp.api.asr_router")
 router = APIRouter(prefix="/asr", tags=["ASR"])
 
-BATCH_MAX_SEC = 25.0
 MIN_CHUNK_SAMPLES = 1600
+MAX_TURN_SEC = 30.0
 
 
-def _batch_segments(segments, max_batch_sec=BATCH_MAX_SEC):
+def _merge_into_turns(segments, max_gap_sec=1.5):
+    """Merge consecutive same-speaker segments into full speaker turns.
+
+    A turn is a continuous span attributed to one speaker.  Segments from the
+    same speaker separated by <= *max_gap_sec* are folded into a single turn
+    so the transcriber receives coherent, single-speaker audio.
+    """
     if not segments:
         return []
-    batches = []
-    current = [segments[0]]
+    turns = []
+    cur = {
+        "start": segments[0]["start"],
+        "end": segments[0]["end"],
+        "speaker": segments[0].get("speaker", "UNKNOWN"),
+        "segments": [segments[0]],
+    }
     for seg in segments[1:]:
-        if seg["end"] - current[0]["start"] > max_batch_sec:
-            batches.append(current)
-            current = [seg]
+        same_speaker = seg.get("speaker") == cur["speaker"]
+        gap = seg["start"] - cur["end"]
+        if same_speaker and gap <= max_gap_sec:
+            cur["end"] = seg["end"]
+            cur["segments"].append(seg)
         else:
-            current.append(seg)
-    batches.append(current)
-    return batches
+            turns.append(cur)
+            cur = {
+                "start": seg["start"],
+                "end": seg["end"],
+                "speaker": seg.get("speaker", "UNKNOWN"),
+                "segments": [seg],
+            }
+    turns.append(cur)
+    return turns
 
 
-def _assign_text_to_segments(model_segments, batch, batch_start_time):
-    if not model_segments or len(batch) == 1:
-        text = " ".join(s["text"] for s in model_segments) if model_segments else ""
-        return [{"text": text, **{k: v for k, v in batch[0].items() if k != "index"}}]
+def _split_long_turn(turn):
+    """Split a turn longer than MAX_TURN_SEC at the largest internal gap."""
+    if turn["end"] - turn["start"] <= MAX_TURN_SEC:
+        return [turn]
+    segs = turn["segments"]
+    if len(segs) <= 1:
+        return [turn]
+    best_gap, best_idx = 0, 1
+    for i in range(1, len(segs)):
+        gap = segs[i]["start"] - segs[i - 1]["end"]
+        if gap > best_gap:
+            best_gap = gap
+            best_idx = i
+    t1 = {
+        "start": turn["start"],
+        "end": segs[best_idx - 1]["end"],
+        "speaker": turn["speaker"],
+        "segments": segs[:best_idx],
+    }
+    t2 = {
+        "start": segs[best_idx]["start"],
+        "end": turn["end"],
+        "speaker": turn["speaker"],
+        "segments": segs[best_idx:],
+    }
+    out = []
+    out.extend(_split_long_turn(t1))
+    out.extend(_split_long_turn(t2))
+    return out
 
-    abs_segments = []
-    for ms in model_segments:
-        abs_segments.append({
-            "start": ms["start"] + batch_start_time,
-            "end": ms["end"] + batch_start_time,
-            "text": ms["text"],
-        })
 
-    results = []
-    for seg in batch:
-        parts = []
-        for as_ in abs_segments:
-            overlap_start = max(as_["start"], seg["start"])
-            overlap_end = min(as_["end"], seg["end"])
-            if overlap_end > overlap_start and as_["end"] > as_["start"]:
-                ratio = (overlap_end - overlap_start) / (as_["end"] - as_["start"])
-                if ratio > 0.3:
-                    parts.append(as_["text"])
-        results.append({
-            "text": " ".join(parts),
-            "start": seg["start"],
-            "end": seg["end"],
-            "speaker": seg.get("speaker", "UNKNOWN"),
-        })
-    return results
-
-
-def _transcribe_batch(audio_np, batch, sample_rate=16000):
+def _transcribe_turn(audio_np, turn, sample_rate=16000):
+    """Transcribe a single speaker turn as one coherent audio chunk."""
     from asr_mcp.core.transcriber import transcribe_audio_sync
-    import numpy as np
 
-    batch_start_time = batch[0]["start"]
-    start_sample = int(batch_start_time * sample_rate)
-    end_sample = int(batch[-1]["end"] * sample_rate)
-    batch_audio = audio_np[start_sample:end_sample]
+    start_sample = int(turn["start"] * sample_rate)
+    end_sample = int(turn["end"] * sample_rate)
+    turn_audio = audio_np[start_sample:end_sample]
 
-    if len(batch_audio) < MIN_CHUNK_SAMPLES:
+    if len(turn_audio) < MIN_CHUNK_SAMPLES:
         return []
 
-    logger.info("Transcribing batch: %.1f-%.1fs (%d samples, %d segments)",
-                batch[0]["start"], batch[-1]["end"], len(batch_audio), len(batch))
+    dur = (end_sample - start_sample) / sample_rate
+    logger.info("Transcribing turn: %.1f-%.1fs (%.1fs, %s)",
+                turn["start"], turn["end"], dur, turn["speaker"])
 
-    tr = transcribe_audio_sync(audio=batch_audio)
+    tr = transcribe_audio_sync(audio=turn_audio)
 
-    logger.info("Batch result: text=%d chars, segments=%d, tokens=%d",
-                len(tr.get("text", "")), len(tr.get("segments") or []), tr.get("tokens_generated", 0))
+    logger.info("Turn result: text=%d chars, tokens=%d, inference=%.2fs",
+                len(tr.get("text", "")), tr.get("tokens_generated", 0),
+                tr.get("inference_time_sec", 0))
 
-    model_segments = tr.get("segments") or []
-    assigned = _assign_text_to_segments(model_segments, batch, batch_start_time)
+    return [TranscribeResult(
+        text=tr.get("text", "").strip(),
+        segments=tr.get("segments"),
+        start=turn["start"],
+        end=turn["end"],
+        speaker=turn["speaker"],
+        audio_duration_sec=tr.get("audio_duration_sec", 0),
+        inference_time_sec=tr.get("inference_time_sec", 0),
+        tokens_generated=tr.get("tokens_generated", 0),
+    )]
 
-    results = []
-    for a in assigned:
-        text = a.get("text", "")
-        if not text.strip():
-            text = tr.get("text", "") if len(batch) == 1 else ""
-        results.append(TranscribeResult(
-            text=text.strip(),
-            segments=tr.get("segments") if len(batch) == 1 else None,
-            start=a["start"],
-            end=a["end"],
-            speaker=a.get("speaker", "UNKNOWN"),
-            audio_duration_sec=tr.get("audio_duration_sec", 0),
-            inference_time_sec=tr.get("inference_time_sec", 0),
-            tokens_generated=tr.get("tokens_generated", 0),
-        ))
-    return results
+
+def _prepare_turns(segments):
+    """Merge diarized segments into turns, split long ones."""
+    turns = _merge_into_turns(segments)
+    split = []
+    for t in turns:
+        split.extend(_split_long_turn(t))
+    return split
 
 
 def _transcribe_diarized(audio_np, segments, sample_rate=16000):
-    batches = _batch_segments(segments)
+    turns = _prepare_turns(segments)
     all_results = []
-    for batch in batches:
-        all_results.extend(_transcribe_batch(audio_np, batch, sample_rate))
+    for turn in turns:
+        all_results.extend(_transcribe_turn(audio_np, turn, sample_rate))
     return all_results
 
 
@@ -424,26 +443,23 @@ async def transcribe_upload(
                 await queue.put({"stage": "done", "progress": 1.0, "result": diarization})
                 return
 
-            batches = _batch_segments(segments)
-            total_batches = len(batches)
+            turns = _prepare_turns(segments)
+            total_turns = len(turns)
             results = []
-            for batch_idx, batch in enumerate(batches):
-                batch_start = batch[0]["start"]
-                batch_end = batch[-1]["end"]
-                speakers = sorted(set(s.get("speaker", "?") for s in batch))
-                p = batch_idx / max(total_batches, 1)
+            for turn_idx, turn in enumerate(turns):
+                p = turn_idx / max(total_turns, 1)
                 await queue.put({
-                    "stage": f"Transcribing batch {batch_idx+1}/{total_batches} ({', '.join(speakers)})",
+                    "stage": f"Transcribing turn {turn_idx+1}/{total_turns} ({turn['speaker']})",
                     "progress": p,
                     "phase": "transcription",
-                    "segment_index": batch_idx,
-                    "total_segments": total_batches,
-                    "segment_speaker": ", ".join(speakers),
-                    "segment_start": batch_start,
-                    "segment_end": batch_end,
+                    "segment_index": turn_idx,
+                    "total_segments": total_turns,
+                    "segment_speaker": turn["speaker"],
+                    "segment_start": turn["start"],
+                    "segment_end": turn["end"],
                 })
-                batch_results = _transcribe_batch(audio_np, batch, sample_rate=16000)
-                results.extend(batch_results)
+                turn_results = _transcribe_turn(audio_np, turn, sample_rate=16000)
+                results.extend(turn_results)
 
             diarization["results"] = [_result_to_dict(r) for r in results]
             diarization["total_time_sec"] = sum(

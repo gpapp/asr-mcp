@@ -8,7 +8,7 @@ import torch
 
 from asr_mcp.core.model_state import state, LRUCache
 from asr_mcp.diarization.clustering import (
-    greedy_merge_clusters, merge_similar_speakers, match_known_speakers_full,
+    cap_clusters, greedy_merge_clusters, merge_similar_speakers, match_known_speakers_full,
 )
 from asr_mcp.diarization.segment_ops import (
     collapse_same_speaker_segments, absorb_islands, eliminate_ghost_speakers,
@@ -125,6 +125,10 @@ class Diarizer:
                 metric="cosine", linkage="average",
             )
         long_labels = clustering.fit_predict(raw_embeddings)
+
+        # Step 5b: Cap clusters if too many
+        max_clusters = cfg.get("diarization", {}).get("max_clusters", 15)
+        long_labels = cap_clusters(raw_embeddings, long_labels, max_clusters=max_clusters)
 
         # Step 6: Greedy merge
         merge_thresh = cfg.get("diarization", {}).get("merge_threshold", 0.45)
