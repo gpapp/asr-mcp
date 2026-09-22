@@ -34,6 +34,8 @@ async def lifespan(app: FastAPI):
     logger.info("Starting asr-mcp server...")
     logger.info("CUDA device: %s", settings.cuda_device)
     logger.info("DB path: %s", settings.db_path)
+    logger.info("Log level: %s", settings.log_level)
+    logger.debug("Debug logging is active")
 
     # Initialize database
     db_manager = DatabaseManager(settings.db_path)
