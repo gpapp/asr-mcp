@@ -109,7 +109,7 @@ def relabel_by_pitch(
 
     label_map = {}
     for new_idx, old_label in enumerate(sorted_speakers):
-        new_label = f"SPEAKER_{new_idx:02d}"
+        new_label = f"Speaker {new_idx + 1}"
         label_map[old_label] = new_label
 
     new_segments = []

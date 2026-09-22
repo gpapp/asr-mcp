@@ -165,13 +165,14 @@ class Diarizer:
         # Renumber cluster_centroids to match relabeled segments (0, 1, 2...)
         # label_map maps old names -> new names. Build new sequential centroids.
         old_to_new = {}  # old integer label -> new integer label
-        new_num = 0
-        for old_name, new_name in sorted(label_map.items(),
-                                          key=lambda x: int(x[1].split()[-1])):
-            if old_name.startswith("Speaker "):
-                old_num = int(old_name.split()[-1]) - 1
-                new_num_val = int(new_name.split()[-1]) - 1
-                old_to_new[old_num] = new_num_val
+        for old_name, new_name in label_map.items():
+            if old_name.startswith("Speaker ") and new_name.startswith("Speaker "):
+                try:
+                    old_num = int(old_name.split()[-1]) - 1
+                    new_num_val = int(new_name.split()[-1]) - 1
+                    old_to_new[old_num] = new_num_val
+                except (ValueError, IndexError):
+                    pass
         renumbered_centroids = {}
         for old_num, centroid in cluster_centroids.items():
             if old_num in old_to_new:

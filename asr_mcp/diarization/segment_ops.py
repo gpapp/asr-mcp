@@ -87,9 +87,9 @@ def eliminate_ghost_speakers(
                 logger.debug("Ghost %s -> %s at %.1f", spk, best_alt, seg.get("start", 0))
             else:
                 if result and result[-1].get("speaker") != spk:
-                    seg["speaker"] = result[-1].get("speaker", "SPEAKER_00")
+                    seg["speaker"] = result[-1].get("speaker", "Speaker 1")
                 else:
-                    seg["speaker"] = "SPEAKER_00"
+                    seg["speaker"] = "Speaker 1"
         result.append(seg)
 
     return collapse_same_speaker_segments(result)
