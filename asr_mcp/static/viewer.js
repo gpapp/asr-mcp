@@ -88,7 +88,18 @@ function seekPane(pane, caret, audioDur, clientX, layer) {
         prev = b;
     }
     if (!target) target = prev || blocks[0];
-    if (target) pane.scrollTop = target.offsetTop;
+    if (!target) return;
+    const bs = parseFloat(target.dataset.start) || 0;
+    const be = parseFloat(target.dataset.end) || 0;
+    const inner = be > bs ? Math.min(Math.max((t - bs) / (be - bs), 0), 1) : 0;
+    const paneRect = pane.getBoundingClientRect();
+    const blockRect = target.getBoundingClientRect();
+    const pointY = blockRect.top + inner * blockRect.height;
+    const delta = pointY - (paneRect.top + pane.clientHeight / 2);
+    pane.scrollTop = Math.min(
+        Math.max(pane.scrollTop + delta, 0),
+        pane.scrollHeight - pane.clientHeight
+    );
 }
 
 function renderTranscriptViewer(result, container) {
