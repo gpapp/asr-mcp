@@ -25,6 +25,7 @@ def _get_service(settings: Settings):
 
     db = DatabaseManager(settings.db_path)
     service = VoiceprintService(settings.data_dir, db)
+    service.set_voices_dir(settings.voices_dir)
     service.set_embedding_session(state.embedding_session)
     return service
 

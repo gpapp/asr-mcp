@@ -2,7 +2,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from asr_mcp.api.schemas import (
@@ -10,6 +10,7 @@ from asr_mcp.api.schemas import (
     TranscribeResponse, TranscribeResult,
 )
 from asr_mcp.api.security import verify_api_key, get_current_user
+from asr_mcp.api.auth import get_session_user
 from asr_mcp.config.settings import Settings, get_settings
 from asr_mcp.speaker.vad import split_at_energy_dips
 
@@ -141,6 +142,7 @@ async def diarize_upload(
 @router.post("/transcribe")
 async def transcribe_endpoint(
     req: DiarizeRequest,
+    request: Request,
     settings: Settings = Depends(get_settings),
     _: str = Depends(verify_api_key),
 ):
@@ -158,7 +160,8 @@ async def transcribe_endpoint(
         )
 
     diarizer = Diarizer(state, settings)
-    known_speakers = req.known_speakers or _load_known_speakers(settings, "default")
+    user_id = get_session_user(request) or "default"
+    known_speakers = req.known_speakers or _load_known_speakers(settings, user_id)
     diarization = await diarizer.run(
         audio_path=req.wav_path, num_speakers=req.num_speakers,
         known_speakers=known_speakers,

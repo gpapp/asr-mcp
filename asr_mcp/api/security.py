@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 
 from asr_mcp.config.settings import Settings, get_settings
 
@@ -24,9 +24,16 @@ async def verify_api_key(
 
 
 async def get_current_user(
+    request: Request,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     settings: Settings = Depends(get_settings),
 ) -> str:
+    # Session-based auth (web UI) — check session cookie first
+    from asr_mcp.api.auth import get_session_user
+    session_user = get_session_user(request)
+    if session_user:
+        return session_user
+    # API key auth
     if not settings.api_keys:
         return DEFAULT_USER
     if not x_api_key or x_api_key not in settings.api_key_set:
