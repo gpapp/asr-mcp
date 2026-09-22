@@ -62,6 +62,17 @@
         .segment-list tr:hover td { background: #f8f9fa; }
         .segment-list .spk-badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.72rem; font-weight: 600; color: #fff; }
 
+        .bar-row { position: relative; height: 24px; margin-bottom: 3px; background: #e9ecef; border-radius: 4px; }
+        .bar-row:last-child { margin-bottom: 0; }
+        .bar-act { position: absolute; top: 0; height: 100%; border-radius: 3px; min-width: 1px; }
+        .bar-name { position: absolute; left: calc(100% + 8px); top: 50%; transform: translateY(-50%); font-size: 0.72rem; color: #555; white-space: nowrap; }
+        .tv-viewer { display: flex; gap: 14px; align-items: stretch; margin-top: 0.5rem; }
+        .tv-bars { flex: 0 0 62%; box-sizing: border-box; position: relative; padding-right: 96px; min-width: 0; }
+        .tv-text { flex: 1; position: relative; max-height: 480px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 6px; padding: 10px 12px; background: #fff; min-width: 0; }
+        .tp-block { margin-bottom: 14px; }
+        .tp-head { font-size: 0.72rem; color: #888; font-weight: 600; margin-bottom: 3px; }
+        .tp-text { font-size: 0.85rem; color: #333; white-space: pre-wrap; line-height: 1.5; }
+
         .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 0.5rem; vertical-align: middle; }
         @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -106,11 +117,11 @@
                     </div>
                     <div id="transcriptionArea" style="display:none;">
                         <div style="font-size:0.8rem;font-weight:600;color:#444;margin-bottom:0.25rem;">Transcription</div>
-                        <div style="position:relative;padding-bottom:11px;">
-                            <div id="transcriptionBarContainer" style="position:relative;background:#e9ecef;border-radius:6px;height:36px;overflow:hidden;">
-                                <div id="transcriptionSegments"></div>
+                        <div id="transcriptionBarArea" style="position:relative;padding-right:96px;margin-top:4px;">
+                            <div id="transcriptionSegments"></div>
+                            <div id="transcriptionCaretLayer" style="position:absolute;top:0;bottom:0;left:0;right:96px;pointer-events:none;">
+                                <div id="transcriptionPointer" style="display:none;position:absolute;top:0;bottom:0;left:0;width:2px;background:#ff4444;transition:left 0.15s ease;z-index:10;"></div>
                             </div>
-                            <div id="transcriptionPointer" style="display:none;position:absolute;top:calc(100% - 11px);left:0;transform:translateX(-50%);width:0;height:0;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:9px solid #ff4444;transition:left 0.15s ease;z-index:10;"></div>
                         </div>
                         <div id="transcriptionPointerLabel" style="position:relative;height:18px;font-size:0.7rem;color:#666;margin-top:0.2rem;overflow:hidden;white-space:nowrap;"></div>
                         <div id="transcriptionLegend" style="display:none;"></div>
@@ -142,6 +153,7 @@
 
     <div class="toast" id="toast"></div>
 
+    <script src="__PREFIX__/static/viewer.js"></script>
     <script>
     const P = '__PREFIX__';
         function escHtml(s) {
@@ -155,24 +167,6 @@
             t.textContent = msg;
             t.className = 'toast show' + (isError ? ' error' : '');
             setTimeout(() => t.className = 'toast', 4000);
-        }
-
-        const SPEAKER_COLORS = [
-            '#007bff','#28a745','#dc3545','#fd7e14','#6f42c1',
-            '#20c997','#e83e8c','#17a2b8','#ffc658','#6610f2',
-            '#2d6a4f','#d63384','#0dcaf0','#198754','#cf222e',
-        ];
-
-        function getSpeakerColor(name, allSpeakers) {
-            const idx = allSpeakers.indexOf(name);
-            return SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
-        }
-
-        function formatTime(sec) {
-            const m = Math.floor(sec / 60);
-            const s = Math.floor(sec % 60);
-            const ms = Math.floor((sec % 1) * 100);
-            return m + ':' + String(s).padStart(2, '0') + '.' + String(ms).padStart(2, '0');
         }
 
         function buildLegendTable(allSpeakers, durations) {
@@ -245,25 +239,6 @@
                 durations[spk] = segments.filter(s => s.speaker === spk).reduce((acc, s) => acc + (s.end - s.start), 0);
             }
             container.appendChild(buildLegendTable(allSpeakers, durations));
-
-            if (segments.length > 0) {
-                const listDiv = document.createElement('div');
-                listDiv.className = 'segment-list';
-                const table = document.createElement('table');
-                const thead = document.createElement('thead');
-                thead.innerHTML = '<tr><th>#</th><th>Speaker</th><th>Start</th><th>End</th><th>Duration</th></tr>';
-                table.appendChild(thead);
-                const tbody = document.createElement('tbody');
-                segments.forEach((seg, i) => {
-                    const tr = document.createElement('tr');
-                    const color = getSpeakerColor(seg.speaker, allSpeakers);
-                    tr.innerHTML = '<td>' + (i + 1) + '</td><td><span class="spk-badge" style="background:' + color + '">' + escHtml(seg.speaker) + '</span></td><td>' + formatTime(seg.start) + '</td><td>' + formatTime(seg.end) + '</td><td>' + (seg.end - seg.start).toFixed(1) + 's</td>';
-                    tbody.appendChild(tr);
-                });
-                table.appendChild(tbody);
-                listDiv.appendChild(table);
-                container.appendChild(listDiv);
-            }
         }
 
         async function loadUser() {
@@ -440,56 +415,10 @@
 
                                             if (audioDur > 0 && segments.length) {
                                                 transcriptionArea.style.display = 'block';
-                                                transcriptionSegments.innerHTML = '';
-                                                const containerWidth = transcriptionSegments.parentElement.offsetWidth || 600;
-
-                                                const gaps = [];
-                                                let prevEnd = 0;
-                                                const sorted = [...segments].sort((a, b) => a.start - b.start);
-                                                for (const seg of sorted) {
-                                                    if (seg.start > prevEnd + 0.05) {
-                                                        gaps.push({ start: prevEnd, end: seg.start });
-                                                    }
-                                                    prevEnd = seg.end;
-                                                }
-                                                if (prevEnd < audioDur - 0.05) {
-                                                    gaps.push({ start: prevEnd, end: audioDur });
-                                                }
-
-                                                for (const gap of gaps) {
-                                                    const left = (gap.start / audioDur * 100).toFixed(4);
-                                                    const width = ((gap.end - gap.start) / audioDur * 100).toFixed(4);
-                                                    const div = document.createElement('div');
-                                                    div.style.cssText = 'position:absolute;top:0;height:100%;background:#d3d3d3;opacity:0.7;';
-                                                    div.style.left = left + '%';
-                                                    div.style.width = width + '%';
-                                                    transcriptionSegments.appendChild(div);
-                                                }
-
-                                                for (const seg of segments) {
-                                                    const left = (seg.start / audioDur * 100).toFixed(4);
-                                                    const width = ((seg.end - seg.start) / audioDur * 100).toFixed(4);
-                                                    const color = getSpeakerColor(seg.speaker, allSpeakers);
-                                                    const div = document.createElement('div');
-                                                    div.className = 'bar-seg';
-                                                    div.style.left = left + '%';
-                                                    div.style.width = width + '%';
-                                                    div.style.background = color;
-                                                    div.title = seg.speaker + '  ' + formatTime(seg.start) + ' - ' + formatTime(seg.end);
-                                                    if (parseFloat(width) > 3) div.textContent = seg.speaker.replace('Speaker ', 'S');
-                                                    transcriptionSegments.appendChild(div);
-                                                }
-
+                                                fillSpeakerBars(transcriptionSegments, segments, audioDur, allSpeakers);
                                                 transcriptionPointer.style.display = 'block';
                                                 transcriptionPointer.style.left = '0%';
-
-                                                transcriptionLegend.innerHTML = '';
-                                                if (allSpeakers.length) {
-                                                    transcriptionLegend.appendChild(buildLegendTable(allSpeakers, null));
-                                                    transcriptionLegend.style.display = 'block';
-                                                } else {
-                                                    transcriptionLegend.style.display = 'none';
-                                                }
+                                                transcriptionLegend.style.display = 'none';
                                             }
                                         }
                                     }
@@ -517,7 +446,13 @@
                     if (finalData) {
                         finalData._fileName = file.name;
                         allResults.push({ file: file.name, result: finalData });
-                        if (finalData.segments && finalData.segments.length) {
+                        const hasResults = (finalData.results || []).some(r => r && (r.text || '').trim());
+                        if (mode === 'transcribe' && hasResults) {
+                            if (!renderTranscriptViewer(finalData, timelineContainer) &&
+                                finalData.segments && finalData.segments.length) {
+                                renderTimeline(finalData, timelineContainer);
+                            }
+                        } else if (finalData.segments && finalData.segments.length) {
                             renderTimeline(finalData, timelineContainer);
                         }
                     }
@@ -527,17 +462,39 @@
                 }
             }
 
-            const jsonStr = JSON.stringify(allResults.length === 1 ? allResults[0] : allResults, null, 2);
-            const blob = new Blob([jsonStr], { type: 'application/json' });
+            const lines = [];
+            for (const item of allResults) {
+                lines.push('=== ' + item.file + ' ===');
+                if (item.error) {
+                    lines.push('ERROR: ' + item.error);
+                    lines.push('');
+                    continue;
+                }
+                const res = item.result || {};
+                const turns = (res.results || []).filter(r => r && (r.text || '').trim());
+                if (turns.length) {
+                    for (const t of turns) {
+                        lines.push('[' + (t.speaker || '?') + '] ' +
+                            formatTime(t.start || 0) + ' - ' + formatTime(t.end || 0));
+                        lines.push(t.text.trim());
+                        lines.push('');
+                    }
+                } else {
+                    lines.push(JSON.stringify(res, null, 2));
+                    lines.push('');
+                }
+            }
+            const txt = lines.join('\n');
+            const blob = new Blob([txt], { type: 'text/plain' });
             if (window._resultUrl) URL.revokeObjectURL(window._resultUrl);
             window._resultUrl = URL.createObjectURL(blob);
             resultsContent.innerHTML = '';
             const dl = document.createElement('a');
             dl.href = window._resultUrl;
-            dl.download = 'asr-results.json';
+            dl.download = 'transcription.txt';
             dl.className = 'btn btn-primary';
             dl.style.display = 'inline-block';
-            dl.textContent = 'Download result (JSON)';
+            dl.textContent = 'Download transcription';
             resultsContent.appendChild(dl);
             resultsArea.style.display = 'block';
             toast('Processing complete');
