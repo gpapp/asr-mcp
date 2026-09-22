@@ -324,7 +324,7 @@
 
                 try {
                     const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
-                    const r = await fetch(endpoint, { method: 'POST', body: form });
+                    const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
                     const data = await r.json();
                     data._fileName = file.name;
                     allResults.push({ file: file.name, result: data });
