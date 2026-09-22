@@ -962,6 +962,7 @@ async def transcribe_upload(
             loop = asyncio.get_running_loop()
             results = []
             for turn_idx, turn in enumerate(turns):
+                state.touch()
                 p = turn_idx / max(total_turns, 1)
                 await _sse_put(queue, {
                     "stage": f"Transcribing turn {turn_idx+1}/{total_turns} ({turn['speaker']})",

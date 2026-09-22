@@ -207,7 +207,7 @@ class Diarizer:
             )
 
         if progress_callback:
-            await progress_callback({"stage": "done", "progress": 1.0})
+            await progress_callback({"stage": "diarization_finished", "progress": 1.0})
 
         total_time = time.time() - start_time
 

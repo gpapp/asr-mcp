@@ -66,7 +66,7 @@ def publish(evt) -> None:
     for q in list(job.subscribers):
         q.put_nowait(evt)
     stage = evt.get("stage")
-    if stage in ("done", "error"):
+    if stage in ("done", "error") and evt.get("phase") != "diarization":
         finish(job, "done" if stage == "done" else "error")
 
 
