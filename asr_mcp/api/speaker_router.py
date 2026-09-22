@@ -27,6 +27,7 @@ async def register_speaker(
     from asr_mcp.speaker.service import SpeakerService
     from asr_mcp.db.manager import DatabaseManager
 
+    state.ensure_ready()
     db = DatabaseManager(settings.db_path)
     service = SpeakerService(settings.data_dir, db)
     service._db._db = db
@@ -75,6 +76,7 @@ async def register_speaker_upload(
     from asr_mcp.speaker.embedding import extract_embedding, compute_pitch, compute_energy
     from asr_mcp.core.model_state import state
 
+    state.ensure_ready()
     embedding = extract_embedding(chunk, 16000, state.embedding_session)
     pitch_hz, pitch_std = compute_pitch(chunk, 16000)
     energy_rms = compute_energy(chunk)
@@ -110,6 +112,7 @@ async def identify_speaker(
     from asr_mcp.db.manager import DatabaseManager
     from asr_mcp.speaker.service import SpeakerService
 
+    state.ensure_ready()
     waveform, sr = load_audio_segment(req.wav_path, req.start_sec, req.end_sec or 99999)
     embedding = extract_embedding(waveform, 16000, state.embedding_session)
 

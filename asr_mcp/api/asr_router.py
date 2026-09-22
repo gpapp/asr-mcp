@@ -645,6 +645,9 @@ async def diarize_endpoint(
     from asr_mcp.diarization.pipeline import Diarizer
 
     state.ensure_ready()
+    if not state.is_ready:
+        return DiarizeResponse(segments=[], total_time_sec=0, error="Models not loaded. CUDA GPU required.")
+    state.unload_encoder()
     diarizer = Diarizer(state, settings)
     known_speakers = req.known_speakers or _load_known_speakers(settings, user_id)
     result = await diarizer.run(
@@ -666,7 +669,6 @@ async def diarize_endpoint(
         db = DatabaseManager(settings.db_path)
         vp_service = VoiceprintService(settings.data_dir, db)
         vp_service.set_voices_dir(settings.voices_dir)
-        vp_service.set_embedding_session(state.embedding_session)
         collected = vp_service.auto_collect_from_diarization(
             audio_path=req.wav_path, segments=segments, user_id=user_id,
         )
@@ -718,8 +720,16 @@ async def diarize_upload(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return JSONResponse(status_code=400, content={"detail": f"Audio conversion failed: {e}"})
 
+    if not state.is_ready:
+        state.ensure_ready()
+    if not state.is_ready:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return JSONResponse(status_code=503, content={"detail": "Models not loaded. CUDA GPU required."})
+
     queue = asyncio.Queue()
     job = job_state.start_job(mode="diarize", filename=file.filename, user_id=user_id)
+    state.unload_encoder()
 
     from asr_mcp.core.model_state import log_gpu_memory
     log_gpu_memory("diarize start")
@@ -747,7 +757,6 @@ async def diarize_upload(
                 db = DatabaseManager(settings.db_path)
                 vp_service = VoiceprintService(settings.data_dir, db)
                 vp_service.set_voices_dir(settings.voices_dir)
-                vp_service.set_embedding_session(state.embedding_session)
                 vp_service.auto_collect_from_diarization(
                     audio_path=str(wav_path), segments=segments, user_id=user_id,
                 )
@@ -905,7 +914,6 @@ async def transcribe_upload(
                 db = DatabaseManager(settings.db_path)
                 vp_service = VoiceprintService(settings.data_dir, db)
                 vp_service.set_voices_dir(settings.voices_dir)
-                vp_service.set_embedding_session(state.embedding_session)
                 vp_service.auto_collect_from_diarization(
                     audio_path=str(wav_path), segments=segments, user_id=user_id,
                 )
@@ -939,6 +947,8 @@ async def transcribe_upload(
                 "audio_duration_sec": audio_dur,
                 "total_speakers": diarization.get("total_speakers", 0),
             })
+
+            state.unload_embedding()
 
             if not segments:
                 await _sse_put(queue, {"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})

@@ -122,6 +122,15 @@ class ModelState:
             self.vad_session is not None,
         ])
 
+    @property
+    def any_loaded(self) -> bool:
+        return any([
+            self.encoder_session is not None,
+            self.decoder_session is not None,
+            self.embedding_session is not None,
+            self.vad_session is not None,
+        ])
+
     def touch(self):
         """Record last usage time."""
         self._last_used = time.monotonic()
@@ -133,34 +142,78 @@ class ModelState:
         return time.monotonic() - self._last_used
 
     def unload_models(self):
-        """Unload all GPU models to free VRAM."""
+        """Unload all loaded models to free VRAM."""
         import gc
         with self._lock:
-            if not self.is_ready:
+            loaded = [n for n in ("encoder_session", "decoder_session", "embedding_session", "vad_session") if getattr(self, n) is not None]
+            if not loaded:
                 return
-            logger.info("Unloading GPU models (idle %.0fs)", self.idle_seconds())
+            logger.info("Unloading models (idle %.0fs): %s", self.idle_seconds(), ", ".join(loaded))
             self.encoder_session = None
             self.decoder_session = None
             self.embedding_session = None
             self.vad_session = None
             self._last_used = 0.0
         gc.collect()
-        logger.info("GPU models unloaded")
+        log_gpu_memory("models unloaded")
+        logger.info("Models unloaded")
+
+    def unload_encoder(self):
+        import gc
+        with self._lock:
+            if self.encoder_session is None:
+                return
+            logger.info("Unloading encoder session (VRAM)")
+            self.encoder_session = None
+        gc.collect()
+        log_gpu_memory("encoder unloaded")
+
+    def unload_embedding(self):
+        import gc
+        with self._lock:
+            if self.embedding_session is None:
+                return
+            logger.info("Unloading embedding session (VRAM)")
+            self.embedding_session = None
+        gc.collect()
+        log_gpu_memory("embedding unloaded")
+
 
     def reload_models(self):
-        """Reload models if they were unloaded."""
+        """Load any missing models (full cold start or granular fill)."""
         if self.is_ready:
             self.touch()
             return
         if not self.settings:
-            logger.warning("Cannot reload models: no settings stored")
-            return
-        logger.info("Auto-reloading models after idle period...")
-        from asr_mcp.core.model_loader import load_models
+            from asr_mcp.config.settings import get_settings
+            self.settings = get_settings()
+        from asr_mcp.core.model_loader import load_models, reload_encoder_session, reload_embedding_session
         try:
-            load_models(self.settings)
+            cold = (
+                self.tokens is None
+                and self.encoder_session is None
+                and self.decoder_session is None
+                and self.embedding_session is None
+                and self.vad_session is None
+            )
+            if cold:
+                logger.info("Cold-loading all models...")
+                load_models(self.settings)
+            else:
+                if self.encoder_session is None:
+                    logger.info("Loading encoder session (partial)...")
+                    reload_encoder_session(self.settings)
+                if self.embedding_session is None:
+                    logger.info("Loading embedding session (partial)...")
+                    reload_embedding_session(self.settings)
+                if self.decoder_session is None or self.vad_session is None or self.tokens is None:
+                    logger.info("Loading remaining models (full reload)...")
+                    load_models(self.settings)
             self.touch()
-            logger.info("Models reloaded successfully")
+            if self.is_ready:
+                logger.info("Models ready")
+            else:
+                logger.warning("Model load incomplete")
         except Exception as e:
             logger.error("Failed to reload models: %s", e)
 

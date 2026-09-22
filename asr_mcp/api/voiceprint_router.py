@@ -18,15 +18,16 @@ logger = logging.getLogger("asr_mcp.api.voiceprint_router")
 router = APIRouter(prefix="/voiceprint", tags=["Voiceprint"])
 
 
-def _get_service(settings: Settings):
+def _get_service(settings: Settings, ensure_gpu: bool = False):
     from asr_mcp.db.manager import DatabaseManager
     from asr_mcp.voiceprint.service import VoiceprintService
     from asr_mcp.core.model_state import state
 
+    if ensure_gpu:
+        state.ensure_ready()
     db = DatabaseManager(settings.db_path)
     service = VoiceprintService(settings.data_dir, db)
     service.set_voices_dir(settings.voices_dir)
-    service.set_embedding_session(state.embedding_session)
     return service
 
 
@@ -60,7 +61,7 @@ async def rename_speaker(
     user_id: str = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ):
-    service = _get_service(settings)
+    service = _get_service(settings, ensure_gpu=True)
     return service.rename_speaker(speaker_name, req.new_name, user_id=user_id)
 
 
@@ -70,7 +71,7 @@ async def merge_speakers(
     user_id: str = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ):
-    service = _get_service(settings)
+    service = _get_service(settings, ensure_gpu=True)
     return service.merge_speakers(req.primary, req.secondary, user_id=user_id)
 
 
@@ -94,7 +95,7 @@ async def upload_snippet(
         waveform, sr = load_audio(str(tmp_path))
         audio_data = waveform.numpy().squeeze()
 
-        service = _get_service(settings)
+        service = _get_service(settings, ensure_gpu=True)
         result = service.add_snippet(
             speaker_name=speaker_name,
             audio_data=audio_data,
@@ -157,5 +158,5 @@ async def rescan_voices(
     user_id: str = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ):
-    service = _get_service(settings)
+    service = _get_service(settings, ensure_gpu=True)
     return service.rescan_voices_dir(user_id=user_id)

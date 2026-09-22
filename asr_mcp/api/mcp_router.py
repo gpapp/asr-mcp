@@ -112,6 +112,9 @@ async def mcp_call(
         return {"error": "tool_name is required"}
     from asr_mcp.core.model_state import state
 
+    if tool_name in {"diarize_audio", "transcribe_audio", "identify_speaker", "register_voiceprint"}:
+        state.ensure_ready()
+
     if tool_name == "diarize_audio":
         from asr_mcp.diarization.pipeline import Diarizer
         diarizer = Diarizer(state, settings)

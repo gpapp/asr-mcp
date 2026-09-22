@@ -20,13 +20,13 @@ async def lifespan(app: FastAPI):
     from asr_mcp.config.settings import get_settings
     from asr_mcp.config.logging import setup_logging
     from asr_mcp.db.manager import DatabaseManager
-    from asr_mcp.core.model_loader import load_models
     from asr_mcp.core.model_state import state, executor as _executor
     import asr_mcp.core.model_state as ms
     from concurrent.futures import ThreadPoolExecutor
     from asr_mcp.speaker.service import SpeakerService
     from asr_mcp.sessions.manager import SessionManager
     from asr_mcp.voiceprint.service import VoiceprintService
+    from asr_mcp.api.job_state import job_state
 
     settings = get_settings()
     setup_logging(settings.log_dir, log_level=settings.log_level)
@@ -55,28 +55,22 @@ async def lifespan(app: FastAPI):
     app.state.htpasswd_users = parse_htpasswd(settings.htpasswd_path)
     logger.info("Loaded %d user(s) from htpasswd", len(app.state.htpasswd_users))
 
-    # Load GPU models
-    try:
-        load_models(settings)
-        app.state.voiceprint_service.set_embedding_session(state.embedding_session)
-        logger.info("All models loaded successfully")
-    except Exception as e:
-        logger.error("Failed to load models: %s", e)
-        logger.warning("Server starting without GPU models")
-
     await app.state.speaker_service.initialize()
     await app.state.session_manager.initialize()
     await app.state.voiceprint_service.initialize()
 
-    # Background TTL monitor — unload GPU models after N minutes idle
+    # Background TTL monitor — unload GPU models after N minutes idle (skip if job active)
     ttl_task = None
     if settings.model_ttl_minutes > 0:
         async def _ttl_monitor():
             interval = 60
             while True:
                 await asyncio.sleep(interval)
-                if state.is_ready and state.idle_seconds() > settings.model_ttl_minutes * 60:
-                    state.unload_models()
+                if state.any_loaded and state.idle_seconds() > settings.model_ttl_minutes * 60:
+                    if job_state.get_running() is None:
+                        state.unload_models()
+                    else:
+                        logger.debug("TTL skip: job active")
 
         ttl_task = asyncio.create_task(_ttl_monitor())
         logger.info("Model TTL monitor started (%d min)", settings.model_ttl_minutes)

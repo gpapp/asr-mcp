@@ -35,7 +35,7 @@ def _get_cpu_encoder_session() -> ort.InferenceSession:
 
 
 def _run_encoder(feed: dict):
-    """Run encoder on GPU with one retry, then CPU fallback on OOM.
+    """Run encoder on GPU with arena-reset retry, then CPU fallback on OOM.
 
     Successful CPU fallback returns outputs without raising — windows are
     never silently dropped due to GPU memory exhaustion.
@@ -45,15 +45,17 @@ def _run_encoder(feed: dict):
     except RuntimeError as e:
         if not is_gpu_oom(e):
             raise
-        logger.warning("GPU OOM on encoder, retrying once: %s", e)
-        log_gpu_memory("encoder OOM retry")
+        logger.warning("GPU OOM on encoder, reloading fresh arena: %s", e)
+        log_gpu_memory("encoder OOM before reload")
         try:
-            time.sleep(0.5)
+            from asr_mcp.core.model_loader import reload_encoder_session
+            reload_encoder_session(state.settings)
+            log_gpu_memory("encoder OOM after reload")
             return state.encoder_session.run(None, feed)
         except RuntimeError as e2:
             if not is_gpu_oom(e2):
                 raise
-            logger.warning("GPU OOM persisted, falling back to CPU encoder: %s", e2)
+            logger.warning("GPU OOM persisted after arena reset, falling back to CPU encoder: %s", e2)
             log_gpu_memory("encoder CPU fallback")
             return _get_cpu_encoder_session().run(None, feed)
 

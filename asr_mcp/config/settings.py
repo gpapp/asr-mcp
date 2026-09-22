@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     vad_min_speech_duration_ms: int = 250
 
     # Model idle timeout (minutes). 0 = never unload
-    model_ttl_minutes: int = Field(default=0, description="Unload GPU models after N minutes of inactivity. 0=never")
+    model_ttl_minutes: int = Field(default=5, description="Unload GPU models after N minutes of inactivity. 0=never")
 
     # Logging
     log_level: str = Field(default="INFO", description="Log level: DEBUG, INFO, WARNING, ERROR")

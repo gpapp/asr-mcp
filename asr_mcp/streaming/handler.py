@@ -38,6 +38,7 @@ async def handle_ws_stream(websocket: WebSocket):
     from asr_mcp.core.transcriber import transcribe_audio_sync, _compute_mel_spectrogram_fast
 
     settings = get_settings()
+    state.ensure_ready()
     mic_buffer = bytearray()
     speaker_buffer = bytearray()
     mic_audio_chunks = []
@@ -102,6 +103,7 @@ async def _process_utterance(
     if not audio_chunks:
         return
 
+    state.touch()
     pcm_data = b"".join(audio_chunks)
     audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
 

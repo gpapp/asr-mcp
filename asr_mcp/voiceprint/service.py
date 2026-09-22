@@ -45,6 +45,10 @@ class VoiceprintService:
     def set_embedding_session(self, session):
         self._embedding_session = session
 
+    def _emb_session(self):
+        from asr_mcp.core.model_state import state
+        return self._embedding_session or state.embedding_session
+
     async def initialize(self):
         self._voices_dir.mkdir(parents=True, exist_ok=True)
         count = self._db.count()
@@ -430,7 +434,7 @@ class VoiceprintService:
         return collected
 
     def _auto_refine(self, speaker_name: str, user_id: str = DEFAULT_USER):
-        if self._embedding_session is None:
+        if self._emb_session() is None:
             logger.warning("No embedding session, skipping auto-refine for %s", speaker_name)
             return
 
@@ -528,7 +532,7 @@ class VoiceprintService:
             return {"error": "No valid segments"}
 
         combined = torch.cat(all_audio, dim=-1)
-        embedding = extract_embedding(combined, SAMPLE_RATE, self._embedding_session)
+        embedding = extract_embedding(combined, SAMPLE_RATE, self._emb_session())
         pitch_hz, pitch_std = compute_pitch(combined, SAMPLE_RATE)
         energy_rms = compute_energy(combined)
 
@@ -541,7 +545,7 @@ class VoiceprintService:
 
     def register_from_audio(self, name, wav_path, start_sec, end_sec, user_id=DEFAULT_USER):
         waveform, sr = load_audio_segment(wav_path, start_sec, end_sec)
-        embedding = extract_embedding(waveform, SAMPLE_RATE, self._embedding_session)
+        embedding = extract_embedding(waveform, SAMPLE_RATE, self._emb_session())
         pitch_hz, pitch_std = compute_pitch(waveform, SAMPLE_RATE)
         energy_rms = compute_energy(waveform)
         total_duration = end_sec - start_sec
@@ -555,7 +559,7 @@ class VoiceprintService:
 
     def identify_in_audio(self, wav_path, start_sec=0.0, end_sec=None, top_k=5, user_id=DEFAULT_USER):
         waveform, sr = load_audio_segment(wav_path, start_sec, end_sec or 99999)
-        embedding = extract_embedding(waveform, SAMPLE_RATE, self._embedding_session)
+        embedding = extract_embedding(waveform, SAMPLE_RATE, self._emb_session())
         return self._db.search(embedding, user_id=user_id, top_k=top_k)
 
     def get_voiceprint(self, name, user_id=DEFAULT_USER):
