@@ -45,20 +45,22 @@ After completing any code changes:
 
 ### Transcription Chunking (Long Audio)
 
-Long diarized segments (>30s) are split at **VAD energy-dip boundaries** before encoding, never at arbitrary time points. This prevents cutting mid-word.
+**Turn preparation** (`asr_router.py::_prepare_turns`) — every second of the timeline is covered by exactly one turn:
+1. Merge same-speaker diarized segments into turns (gap ≤1.5s)
+2. Split turns >30s (`MAX_TURN_SEC`) at their largest internal diarized-segment gap
+3. **Exact boundary refinement** (`_refine_boundaries_with_vad`): raw uncollapsed VAD over the full file; each VAD section spanning a gap is embedded and attributed to the better-matching adjacent speaker (known DB voiceprint, else ≤30s of that speaker's own turn audio); `_best_split` picks the ownership cut (margin-weighted); both turns move to one shared cut at the exact start of the first section owned by the incoming speaker (or gap end if the gap is entirely the left speaker's)
+4. **Fallback chain for any remaining gap**: energy-dip cut (`_gap_boundary`, quietest pause centre) → midpoint
+5. Edges extended to 0.0 / audio_duration
+6. `_transcribe_turn` slices the waveform per turn → one `transcribe_audio_sync()` call
 
-**Router-level splitting** (`asr_router.py`):
-1. Each diarized segment is extracted from the full audio
-2. If segment > 30s: `split_at_energy_dips()` finds natural pause boundaries (dip_ratio=0.35, min_dip_dur=0.3s)
-3. Sub-segments are accumulated into a buffer up to 30s
-4. **Buffer flushes at >0.5s pauses**: if gap between consecutive sub-segments > 0.5s, the buffer is flushed and a new chunk starts — this preserves speaker-change boundaries within diarized segments
-5. Each buffer is concatenated and sent to `transcribe_audio_sync()`
+**Decode windowing** (`transcriber.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
+- Plans ≤30s windows (`_plan_window_bounds`), each cut snapped to the minimum frame-energy point inside a ±100-frame band (never mid-word); tails <300 frames merge into the previous window
+- Each window decoded separately (`_no_window=True` avoids recursion); segment times offset by window start; texts joined
+- Window errors are ALWAYS surfaced in `result["error"]`, even when earlier windows produced text (otherwise failures look like silent truncation)
 
-**Encoder-level chunking** (`transcriber.py`) — safety fallback if router chunking is bypassed:
-- Mel spectrogram is split into overlapping windows (MAX_ENCODER_SEC=30s, 25% overlap)
-- Each window is encoded independently
-- Encoder outputs are concatenated along sequence dimension
-- Overlap is trimmed from non-first chunks to avoid duplication
+**Encoder-level chunking** (`transcriber.py`) — safety fallback inside a single decode when a window still exceeds the encoder limit:
+- Mel split into overlapping windows (MAX_ENCODER_SEC=30s, 25% overlap), encoded independently, concatenated along sequence dimension
+- Overlap trim must happen in OUTPUT space: `trim = min(round(overlap_frames * out_seq/in_len), out_seq)` (subsample-safe — input-frame counts don't match output-frame counts)
 
 **Decoder interface**: The decoder ONNX model requires `encoder_hidden_states` as a direct input (not just KV caches). `_parse_encoder_outputs()` extracts the hidden states tensor from encoder output and passes it through. Cross-attention KV caches (8 layers × key/value) are initialized as empty (seq_len=0).
 
@@ -136,6 +138,7 @@ asr-mcp/
 │   │   └── thresholds.json    # All tunable diarization/matching/VAD params
 │   ├── static/
 │   └── templates/
+│       ├── _nav.html          # Shared top menu snippet (__NAV__ + __ACT_*__ markers)
 │       ├── login.html          # Dark-themed login form
 │       ├── index.html          # Audio processing dashboard (upload + results)
 │       ├── transcripts.html    # Transcription history (card grid)
@@ -282,3 +285,70 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - The 13-step pipeline has strict ordering: profiling → merge_similar → relabel → renumber centroids → boundary refine → ghost → match.
 - After any reorder, check that centroid key formats (integer vs string "Speaker N"), segment label formats, and lookup methods all still match.
 - **Why**: Mismatched centroid keys caused silent failures where `match_known_speakers_full` received empty clusters.
+
+### 12. Cohere Prompt Tokens: Exact Order via token_to_id (Not tokenizer.encode)
+- Build the prompt with **direct `token_to_id` lookups** (`if t in token_to_id`), never `tokenizer.encode()` per token.
+- Exact order: `<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|lang|> <|lang|> <|pnc|> <|noitn|> <|timestamp|> <|nodiarize|>` — note the **duplicate language token** and startofcontext FIRST.
+- `eos_id = token_to_id["endoftext"]` — never hardcode (was wrongly `3`).
+- **Why**: Missing `<|startofcontext|>`, a single language token, or wrong order made the model emit punctuation-only garbage (`,,`, `e`, `at`) even though the encoder/decoder ran fine.
+
+### 13. Mel Features Must Match the Reference Pipeline Exactly
+- Required: `nperseg=512` hann, `noverlap=352` (hop 160), `mode='magnitude'`, `power_to_db(ref=np.max)`, NO dither, pre-emphasis, per-mel-band z-norm. Returns `[T,128]`.
+- **Why**: A 400-sample window + `np.log(mel+1e-8)` variant produced off-distribution features → same garbage-text symptom as a bad prompt. Prompt AND features must both be right; matching one hides nothing.
+- Magnitude vs power is a constant factor that cancels under z-norm — but window length and log-vs-power_to_db do NOT cancel.
+
+### 14. Decoder attention_mask = Full past + current Length
+- `attention_mask = ones(batch, past_seq_len + tokens_this_call + encoder_seq_len)`; `position_ids` offset by `past_seq_len`.
+- Masking only the current tokens while position grows desynchronizes RoPE/positions across multi-step decode.
+
+### 15. Cohere Timestamps Are `<|spltokenN|>` Tokens, Not `<|1.23|>`
+- `SPLIT_TOKEN_BASE = token_to_id["<|spltoken0|>"]`, 34 bins; segment end = `audio_duration * (token_id - BASE) / 34`.
+- The regex `<\|(\d+\.?\d*)\|>` NEVER matches these tokens → without split-token handling every result is a single segment `{start:0, end:full_duration}` (the observed symptom).
+- Skip other `<|...|>` specials during decode; map `▁` → space; run `clean_transcript` per flushed segment.
+
+### 16. Decode Long Audio in ≤30s Windows (Encoder Chunking Alone Is Not Enough)
+- One decode over a 951s turn ends in early EOS/max_new_tokens → text truncated after the first ~30s of speech even though encoder chunking ran.
+- `_transcribe_windowed` + `_plan_window_bounds` (energy-snap cuts, min 300-frame tail) fix this. Streaming/KV-bridge paths set `_no_window=True` (bridging already chunks).
+- **Never swallow partial window errors**: if window 2+ fails but window 0 has text, still set `result["error"]` — otherwise output looks like benign truncation. (`TranscribeResult.error` is optional; both text and error may be present.)
+
+### 17. Every Second Must Be Covered by Exactly One Transcription Turn
+- Inter-turn gaps (e.g. 22.6→28.0s) where speech exists are silently UNTRANSCRIBED — no error, no empty row, just missing text.
+- `_prepare_turns` must close every gap >1ms between consecutive turns AND extend edges to 0/duration. Full coverage is an invariant; keep it through any refactor.
+- Fallback chain per gap (cheap → expensive): VAD-section voiceprint attribution → energy-dip centre (`_gap_boundary`) → midpoint.
+
+### 18. Exact Turn Boundaries: Uncollapsed VAD Sections + Voiceprint Attribution
+- Use RAW VAD (`run_vad_onnx` over the full file — no `_merge_nearby_speech`, no `split_at_energy_dips`) so each speech region keeps its true edges.
+- Embed every section spanning the gap (`extract_embedding`); reference per speaker = known DB voiceprint if the turn label matches (try `name.strip("[]")`), else ≤30s of that speaker's own diarized turn audio. Both refs required — otherwise fall back to energy.
+- Ownership split via `_best_split(owners, weights)` with weights = embedding-distance margin (confident matches dominate noise). Same-speaker boundaries (from long-turn splits) are all-left → left absorbs the gap.
+- Apply ONE shared cut per gap (`left.end == right.start`), clamped into `[gap_start, gap_end]` so turns stay contiguous and can never overlap or chain-react. Cut = exact start of the first right-owned section, or `gap_end` when all-left.
+- Log `Boundary refinement N: ... cut at X.XXs` — grep this to confirm the refinement is active after a rebuild.
+
+### 12. SSE Producers Must Yield AND Run Heavy Work Off-Loop
+- `await queue.put()` on an unbounded `asyncio.Queue` NEVER suspends — the consumer doesn't run and all events flush in one burst when the job ends.
+- `_sse_put()` = `queue.put()` + `await asyncio.sleep(0.01)`. `sleep(0)` alone is insufficient: the BaseHTTPMiddleware body pump + uvicorn transport need a real tick to flush bytes.
+- Yielding is not enough for CPU-heavy work (ONNX decode, clustering): it starves the loop regardless. Run turns via `loop.run_in_executor(None, ...)`; thread-side progress uses `loop.call_soon_threadsafe(queue.put_nowait, evt)`.
+
+### 13. Starlette Middleware Order — Last Added Runs Outermost
+- `app.add_middleware()` prepends to the stack: the LAST middleware added wraps all earlier ones and runs FIRST.
+- Working order in `server.py`: AuthMiddleware added first (inner), SessionMiddleware added second (outer) → Session populates `request.scope["session"]` before Auth reads it.
+- **Why**: An attempted swap (to "fix" SSE 401s) broke auth and was reverted. SSE endpoints are not in `PUBLIC_PATHS` and depend on this order to see the session cookie. Do not reorder without tracing who populates `scope["session"]` first.
+
+### 14. CSS for JS-generated Elements Must Not Be Scoped Under Classes JS Never Adds
+- Timeline styles were scoped `.speaker-timeline .bar-seg`, but `renderTimeline()` never added that class → `position:absolute` etc. silently no-op'd: segments stacked (one visible speaker), legend swatches got zero size.
+- Rule: add the scoping class in JS OR write selectors against the real elements. Verify by inspecting computed styles, not just rendered HTML.
+
+### 15. Display REFINED Segments, Not Raw Diarization
+- `_prepare_turns()` closes inter-turn gaps (VAD voiceprint attribution + midpoint cuts) so turns cover the full timeline. Emit ITS output in `diarization_complete` and set `diarization["segments"]` to it — raw segments leave visible gaps between bands.
+- Strip the nested `segments` list before emitting (`{start, end, speaker}` only) to keep SSE payloads small.
+- `auto_collect_from_diarization()` must still receive the RAW segments (happens before replacement).
+
+### 16. Progress UI Needs Sub-Turn Time Interpolation
+- Window-progress events for one long turn all carried the same `segment_start`/`segment_end` → the caret never moved despite events arriving.
+- Interpolate per window in `_make_window_cb`: `win_start = turn.start + span * (i-1)/n`.
+- Elements shown under a bar whose container has `overflow:hidden` must live in a sibling wrapper or they are clipped (caret moved into `position:relative; padding-bottom` wrapper).
+- UI chrome shared across pages (top nav) lives in `templates/_nav.html`, injected by `_render(name, active=...)` via `__NAV__` + `__ACT_*__` markers — edit the snippet, not each page.
+
+### 17. Paragraph Breaks at Pauses Must Snap to Sentence Ends
+- `_apply_paragraph_breaks()` (asr_router.py): RMS interior pauses ≥ `PARAGRAPH_PAUSE_SEC` (1.5s), map each to the nearest decoder split-token segment boundary, then snap to `[.!?…]` within **40 chars**.
+- If no punctuation is close: break at the boundary anyway and append `.` (after stripping trailing `,;—`) so the break is still a sentence boundary.
+- **Why 40 chars**: a 120-char window snapped BACKWARD across the pause to an earlier sentence end, burying the pause mid-paragraph. Keep the snap window tight.
