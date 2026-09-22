@@ -366,45 +366,40 @@ def transcribe_audio_sync(
 
         seg_text_parts = []
         current_seg_start = 0.0
-        split_flushed = False
+
+        def _flush_segment(seg_end: float):
+            nonlocal seg_text_parts, current_seg_start
+            seg_text = "".join(seg_text_parts).strip()
+            seg_text_parts = []
+            if seg_text:
+                cleaned = clean_transcript(seg_text)
+                if cleaned.strip():
+                    segments_out.append({
+                        "start": round(current_seg_start, 3),
+                        "end": round(seg_end, 3),
+                        "text": cleaned.strip(),
+                    })
+            current_seg_start = seg_end
 
         for tok_id in generated_tokens:
             tok_str = state.tokens.get(tok_id, "")
             if tok_str.startswith("<|"):
                 if SPLIT_TOKEN_BASE != -1 and SPLIT_TOKEN_BASE <= tok_id < SPLIT_TOKEN_BASE + NUM_SPLIT_BINS:
                     seg_end = audio_duration * (tok_id - SPLIT_TOKEN_BASE) / NUM_SPLIT_BINS
-                    seg_text = clean_transcript("".join(seg_text_parts).strip())
-                    if seg_text.strip():
-                        segments_out.append({
-                            "start": round(current_seg_start, 3),
-                            "end": round(seg_end, 3),
-                            "text": seg_text.strip(),
-                        })
-                    current_seg_start = seg_end
-                    seg_text_parts = []
-                    split_flushed = True
-                else:
-                    split_flushed = False
+                    _flush_segment(seg_end)
                 continue
-            if not split_flushed:
-                seg_text_parts.append(tok_str.replace("\u2581", " "))
-            else:
-                split_flushed = False
+            seg_text_parts.append(tok_str.replace("\u2581", " "))
 
-        tail_text = clean_transcript("".join(seg_text_parts).strip())
-        if tail_text.strip():
-            segments_out.append({
-                "start": round(current_seg_start, 3),
-                "end": round(audio_duration, 3),
-                "text": tail_text.strip(),
-            })
+        _flush_segment(audio_duration)
 
         if segments_out:
             text = " ".join(s["text"] for s in segments_out)
         else:
-            text = clean_transcript(state.tokenizer.decode(generated_tokens, skip_special_tokens=True))
+            text = state.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            text = clean_transcript(text)
     else:
-        text = clean_transcript("".join(chr(t) if 32 <= t < 127 else "" for t in generated_tokens))
+        text = "".join(chr(t) if 32 <= t < 127 else "" for t in generated_tokens)
+        text = clean_transcript(text)
 
     inference_time = time.time() - start_time
 
