@@ -767,11 +767,30 @@ async def transcribe_upload(
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
 
+            turns = []
+            if segments:
+                try:
+                    turns = _prepare_turns(
+                        segments,
+                        audio_duration_sec=audio_dur or None,
+                        audio=audio_np,
+                        sample_rate=sr or 16000,
+                        known_speakers=known_speakers or None,
+                    )
+                except Exception as e:
+                    logger.warning("Boundary refinement failed: %s", e)
+                    turns = list(segments)
+            display_segments = (
+                [{"start": t["start"], "end": t["end"], "speaker": t["speaker"]} for t in turns]
+                if turns else segments
+            )
+            diarization["segments"] = display_segments
+
             await _sse_put(queue, {
                 "stage": "diarization_complete",
                 "progress": 1.0,
                 "phase": "diarization",
-                "segments": segments,
+                "segments": display_segments,
                 "audio_duration_sec": audio_dur,
                 "total_speakers": diarization.get("total_speakers", 0),
             })
@@ -784,13 +803,6 @@ async def transcribe_upload(
                 await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
                 return
 
-            turns = _prepare_turns(
-                segments,
-                audio_duration_sec=audio_dur or None,
-                audio=audio_np,
-                sample_rate=sr or 16000,
-                known_speakers=known_speakers or None,
-            )
             total_turns = len(turns)
             loop = asyncio.get_running_loop()
             results = []

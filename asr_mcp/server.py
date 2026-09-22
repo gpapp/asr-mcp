@@ -161,10 +161,17 @@ if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
-def _render(template_name: str) -> HTMLResponse:
+def _render(template_name: str, active: str = "") -> HTMLResponse:
     path = templates_dir / template_name
     if path.exists():
         content = path.read_text(encoding="utf-8")
+        nav_path = templates_dir / "_nav.html"
+        if "__NAV__" in content and nav_path.exists():
+            nav = nav_path.read_text(encoding="utf-8")
+            for key in ("GUI", "VOICES", "TRANSCRIPTS"):
+                nav = nav.replace(f"__ACT_{key}__",
+                                  ' class="active"' if key.lower() == active else "")
+            content = content.replace("__NAV__", nav)
         prefix = _init_settings().prefix
         content = content.replace("__PREFIX__", prefix)
         return HTMLResponse(content=content)
@@ -253,17 +260,17 @@ async def logout_post(request: Request):
 
 @app.get("/gui", response_class=HTMLResponse)
 async def gui(request: Request):
-    return _render("index.html")
+    return _render("index.html", active="gui")
 
 
 @app.get("/voices", response_class=HTMLResponse)
 async def voices(request: Request):
-    return _render("voices.html")
+    return _render("voices.html", active="voices")
 
 
 @app.get("/transcriptions", response_class=HTMLResponse)
 async def transcriptions_page(request: Request):
-    return _render("transcripts.html")
+    return _render("transcripts.html", active="transcripts")
 
 
 @app.get("/api/user")

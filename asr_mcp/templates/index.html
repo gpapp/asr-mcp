@@ -71,15 +71,7 @@
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>ASR-MCP</h1>
-        <nav>
-            <a href="__PREFIX__/gui" class="active">Process Transcription</a>
-            <a href="__PREFIX__/voices">Manage Voiceprints</a>
-            <a href="__PREFIX__/transcriptions">Transcriptions</a>
-            <span class="user-info" id="userDisplay">...</span>
-        </nav>
-    </div>
+    __NAV__
 
     <div class="container">
         <div class="card">
@@ -114,9 +106,11 @@
                     </div>
                     <div id="transcriptionArea" style="display:none;">
                         <div style="font-size:0.8rem;font-weight:600;color:#444;margin-bottom:0.25rem;">Transcription</div>
-                        <div id="transcriptionBarContainer" style="position:relative;background:#e9ecef;border-radius:6px;height:36px;overflow:hidden;">
-                            <div id="transcriptionSegments"></div>
-                            <div id="transcriptionPointer" style="display:none;position:absolute;top:0;height:100%;width:3px;background:#ff4444;z-index:10;transition:left 0.15s ease;"></div>
+                        <div style="position:relative;padding-bottom:11px;">
+                            <div id="transcriptionBarContainer" style="position:relative;background:#e9ecef;border-radius:6px;height:36px;overflow:hidden;">
+                                <div id="transcriptionSegments"></div>
+                            </div>
+                            <div id="transcriptionPointer" style="display:none;position:absolute;top:calc(100% - 11px);left:0;transform:translateX(-50%);width:0;height:0;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:9px solid #ff4444;transition:left 0.15s ease;z-index:10;"></div>
                         </div>
                         <div id="transcriptionPointerLabel" style="position:relative;height:18px;font-size:0.7rem;color:#666;margin-top:0.2rem;overflow:hidden;white-space:nowrap;"></div>
                         <div id="transcriptionLegend" style="display:none;"></div>
@@ -140,7 +134,7 @@
                 <div class="results-area" id="resultsArea" style="display:none;">
                     <h3 style="margin-bottom:0.5rem;">Results</h3>
                     <div id="timelineContainer"></div>
-                    <pre id="resultsContent"></pre>
+                    <div id="resultsContent"></div>
                 </div>
             </div>
         </div>
@@ -533,7 +527,18 @@
                 }
             }
 
-            resultsContent.textContent = JSON.stringify(allResults.length === 1 ? allResults[0] : allResults, null, 2);
+            const jsonStr = JSON.stringify(allResults.length === 1 ? allResults[0] : allResults, null, 2);
+            const blob = new Blob([jsonStr], { type: 'application/json' });
+            if (window._resultUrl) URL.revokeObjectURL(window._resultUrl);
+            window._resultUrl = URL.createObjectURL(blob);
+            resultsContent.innerHTML = '';
+            const dl = document.createElement('a');
+            dl.href = window._resultUrl;
+            dl.download = 'asr-results.json';
+            dl.className = 'btn btn-primary';
+            dl.style.display = 'inline-block';
+            dl.textContent = 'Download result (JSON)';
+            resultsContent.appendChild(dl);
             resultsArea.style.display = 'block';
             toast('Processing complete');
             btn.disabled = false;
