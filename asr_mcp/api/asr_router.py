@@ -308,7 +308,15 @@ async def diarize_upload(
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/transcribe")
