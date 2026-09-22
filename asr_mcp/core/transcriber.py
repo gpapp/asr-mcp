@@ -284,6 +284,7 @@ def transcribe_audio_sync(
     max_new = state.settings.max_new_tokens if state.settings else 448
 
     for step in range(max_new):
+        seq_len = input_ids.shape[1]
         feed = _build_decoder_inputs(
             dec_input_names, input_ids, position, cross_kv, self_kv,
             encoder_hidden_states=encoder_hidden_states,
@@ -323,7 +324,7 @@ def transcribe_audio_sync(
 
         generated_tokens.append(next_token)
         input_ids = np.array([[next_token]], dtype=np.int64)
-        position += 1
+        position += seq_len
 
     segments_out = []
     if state.tokenizer:

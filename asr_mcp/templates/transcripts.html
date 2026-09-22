@@ -216,7 +216,15 @@
             const results = result.results || [];
             if (results.length) {
                 for (const r of results) {
-                    text += (r.text || '') + '\n';
+                    const speaker = r.speaker || '';
+                    const start = r.start;
+                    const end = r.end;
+                    const textVal = r.text || '';
+                    if (speaker && start !== undefined && end !== undefined) {
+                        text += '[' + speaker + '] ' + start.toFixed(1) + 's - ' + end.toFixed(1) + 's: ' + textVal + '\n';
+                    } else {
+                        text += textVal + '\n';
+                    }
                 }
             } else {
                 const segments = result.segments || [];
