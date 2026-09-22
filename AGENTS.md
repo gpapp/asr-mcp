@@ -76,6 +76,7 @@ Long diarized segments (>30s) are split at **VAD energy-dip boundaries** before 
 8. Collapse same-speaker (max_gap=0.5s) + absorb islands
 9. Boundary refinement (re-embed boundary frames)
 10. Speaker profiling (pitch, energy, MFCC)
+10b. merge_similar_speakers (embed-only threshold=0.2)
 11. Relabel by pitch (highest = Speaker 1)
 12. Ghost elimination (total_dur < 5s → absorb to nearest neighbor)
 13. Known-speaker matching (multi-feature: 60% embedding + 15% pitch + 10% spectral + 10% MFCC)
@@ -94,9 +95,10 @@ asr-mcp/
 │   ├── server.py              # FastAPI app + lifespan + auth routes
 │   ├── api/
 │   │   ├── router.py          # Combines sub-routers under /api
-│   │   ├── asr_router.py      # POST /asr/diarize, /transcribe, /diarize/upload, /transcribe/upload
+│   │   ├── asr_router.py      # POST /asr/diarize, /transcribe, /diarize/upload, /transcribe/upload (SSE)
 │   │   ├── speaker_router.py  # POST /speaker/register, /identify, GET /list, DELETE /{name}
 │   │   ├── voiceprint_router.py # CRUD + upload + merge + rename + rescan
+│   │   ├── transcript_router.py # User-scoped transcript CRUD + download
 │   │   ├── mcp_router.py      # MCP tools + resources + /call
 │   │   ├── schemas.py         # Pydantic request/response models
 │   │   ├── security.py        # API key auth + path validation
@@ -108,7 +110,7 @@ asr-mcp/
 │   │   ├── model_loader.py    # HuggingFace download + ORT session init (CUDA EP)
 │   │   └── transcriber.py     # Cohere ASR: mel-spec → encoder → decoder → text
 │   ├── diarization/
-│   │   ├── pipeline.py        # Diarizer: 11-step pipeline
+│   │   ├── pipeline.py        # Diarizer: 13-step pipeline
 │   │   ├── clustering.py      # AgglomerativeClustering, greedy merge, voiceprint matching
 │   │   └── segment_ops.py     # Collapse, absorb islands, eliminate ghosts
 │   ├── speaker/
@@ -136,6 +138,7 @@ asr-mcp/
 │   └── templates/
 │       ├── login.html          # Dark-themed login form
 │       ├── index.html          # Audio processing dashboard (upload + results)
+│       ├── transcripts.html    # Transcription history (card grid)
 │       └── voices.html         # Voiceprint management dashboard
 ├── Dockerfile                 # nvidia/cuda:12.2.0 base
 ├── docker-compose.yml         # GPU passthrough + named volumes + port 8087
@@ -181,6 +184,10 @@ asr-mcp/
 | `/api/voiceprint/merge` | POST | Session | Merge speakers |
 | `/api/voiceprint/rename` | POST | Session | Rename speaker |
 | `/api/voiceprint/rescan` | POST | Session | Rescan voices directory |
+| `/api/transcripts` | GET | Session | List all transcriptions for user |
+| `/api/transcripts/{id}` | GET | Session | Get transcription by ID |
+| `/api/transcripts/{id}/download` | GET | Session | Download as plain text |
+| `/api/transcripts/{id}` | DELETE | Session | Delete transcription |
 | `/api/auth/login` | POST | No | Login (JSON + session cookie) |
 | `/api/auth/logout` | POST/GET | No | Logout |
 | `/api/user` | GET | No | Current user info |
@@ -214,3 +221,64 @@ asr-mcp/
 - **No CUDA available**: Server starts but models fail to load; API returns errors for ASR operations
 - **SQLite locking**: Concurrent writes may fail under heavy load; WAL mode recommended for production
 - **ffmpeg required**: Audio format conversion requires ffmpeg installed in Docker image
+
+## Lessons Learned (Critical Behavior Rules)
+
+These are hard-won bugs that **will** reappear if violated. Follow these rules when modifying any code.
+
+### 1. Speaker Labels: ALWAYS "Speaker N" (1-indexed)
+- Every code path that creates or assigns speaker labels MUST use `f"Speaker {n}"` with 1-indexed integers.
+- NEVER use `"SPEAKER_00"`, `"SPEAKER_01"`, or any zero-indexed underscore format.
+- **Why**: The renumbering logic in `pipeline.py` parses labels with `int(name.split()[-1])`. Non-"Speaker N" labels cause `ValueError: invalid literal for int() with base 10`.
+- Affected files: `profiling.py` (`relabel_by_pitch`), `segment_ops.py` (`absorb_islands`), `clustering.py` (`match_known_speakers_full`), `pipeline.py` (renumbering block).
+
+### 2. Wire Up Loaded Models — Don't Just Load Them
+- If an ONNX session is loaded into `ModelState`, every code path that uses it MUST pass the session object through.
+- **Why**: Silero VAD was loaded but `_run_vad()` never passed `state.vad_session` to `run_vad_onnx()`, silently falling back to energy-based VAD for weeks.
+- **Rule**: After loading a model in `model_loader.py`, grep for all call sites and verify the session is actually used.
+
+### 3. Diarization Segments Must Be Speech-Length, Not Window-Length
+- VAD + energy-dip splitting produces the base segments. Sliding windows are ONLY for embedding extraction, NOT for defining segment boundaries.
+- After embedding/clustering, `collapse_same_speaker_segments(max_gap=0.5)` merges same-speaker windows.
+- **Why**: 2.0s windows with 1.2s stride create overlapping segments that don't match natural speech.
+- Current params: window_sec=3.0, stride_sec=2.5, collapse max_gap=0.5s, absorb_islands gap 0.5s.
+
+### 4. Merge Nearby VAD Regions Before Splitting
+- `_merge_nearby_speech(speech_ts, sample_rate, max_gap_sec=1.0)` merges VAD regions separated by <1s silence.
+- **Why**: Silero VAD produces many short regions during brief pauses (breaths, filler sounds) within a single speaker's turn.
+
+### 5. ONNX Runtime Error Handling
+- `onnxruntime` has NO `ORTRuntimeError` attribute. Catch `RuntimeError` instead.
+- Check error message content: `"Failed to allocate memory"` indicates GPU OOM.
+- **Why**: Every OOM was silently re-raised because the except clause itself threw `AttributeError`.
+
+### 6. Embedding GPU OOM → CPU Fallback with Chunking
+- ECAPA-TDNN512 embedding on CUDA can OOM after encoder has consumed VRAM.
+- `_run_with_cpu_fallback()` catches `RuntimeError` and retries on CPU with cached sessions.
+- For long audio: `extract_embedding()` chunks fbank into 60s pieces, embeds each, averages, L2-normalizes.
+- `batch_embed_files()` uses `block_sec=60.0` (not 600.0) to prevent huge ONNX calls.
+
+### 7. Encoder Chunking for Long Audio
+- Mel spectrogram must be split into overlapping windows (MAX_ENCODER_SEC=30s, 25% overlap) for audio >30s.
+- Each window encoded independently, outputs concatenated along sequence dimension.
+- Decoder receives `encoder_hidden_states` as direct input (not just KV caches).
+
+### 8. Decoder KV Cache Name Mapping
+- HuggingFace ONNX outputs use `present.{i}.decoder.key` but decoder inputs expect `past_key_values.{i}.decoder.key`.
+- After step 0, map output names: `name.replace("present.", "past_key_values.")`.
+- Cross-attention KV caches initialized as empty (seq_len=0).
+
+### 9. SSE for Long-Running Endpoints
+- Upload endpoints that run diarization/transcription MUST use `StreamingResponse(media_type="text/event-stream")`.
+- nginx `proxy_read_timeout` defaults to 120s — set to 600s in `nginx_snippet.conf`.
+- Frontend reads SSE via `ReadableStream` + `TextDecoder()`, parses `data:` lines.
+
+### 10. Session Auth Requires `credentials: 'same-origin'`
+- All `fetch()` calls for authenticated endpoints MUST include `credentials: 'same-origin'`.
+- Without it, the session cookie isn't sent, AuthMiddleware redirects to `/login` (HTML), and frontend tries to parse HTML as JSON.
+- Use `window.location.replace()` not `window.location.href` for login redirects (avoids back-button loops).
+
+### 11. When Modifying Pipeline Order, Update ALL Downstream Code
+- The 13-step pipeline has strict ordering: profiling → merge_similar → relabel → renumber centroids → boundary refine → ghost → match.
+- After any reorder, check that centroid key formats (integer vs string "Speaker N"), segment label formats, and lookup methods all still match.
+- **Why**: Mismatched centroid keys caused silent failures where `match_known_speakers_full` received empty clusters.
