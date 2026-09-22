@@ -186,21 +186,248 @@ def _gap_boundary(audio, gap_start_sec, gap_end_sec, sample_rate=16000,
     return min(max(cut_sample / sample_rate, gap_start_sec), gap_end_sec)
 
 
-def _prepare_turns(segments, audio_duration_sec=None, audio=None, sample_rate=16000):
+def _raw_vad_sections(audio, sample_rate):
+    """Run uncollapsed VAD over the whole file (no merge / dip splitting)."""
+    import numpy as np
+    import torch
+    from asr_mcp.config import get_config
+    from asr_mcp.core.model_state import state
+    from asr_mcp.speaker.vad import run_vad_chunked, run_vad_onnx
+
+    try:
+        cfg = get_config() or {}
+    except Exception:
+        cfg = {}
+    vcfg = cfg.get("vad", {}) if isinstance(cfg, dict) else {}
+    threshold = vcfg.get("default_threshold", 0.5)
+    min_ms = int(vcfg.get("min_speech_duration_ms", 250))
+    wf = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
+    if state.vad_session is not None:
+        return run_vad_onnx(
+            wf, state.vad_session,
+            sample_rate=sample_rate, threshold=threshold,
+            min_speech_duration_ms=min_ms,
+        )
+    return run_vad_chunked(
+        wf, sample_rate=sample_rate,
+        threshold=threshold, min_speech_duration_ms=min_ms,
+    )
+
+
+def _embed_section(audio, start_sample, end_sample, sample_rate):
+    """Voiceprint embedding for one VAD section, or None if unusable."""
+    import numpy as np
+    import torch
+    from asr_mcp.core.model_state import state
+    from asr_mcp.speaker.embedding import extract_embedding
+
+    if state.embedding_session is None:
+        return None
+    chunk = audio[start_sample:end_sample]
+    if len(chunk) < int(0.3 * sample_rate):
+        return None
+    try:
+        return extract_embedding(
+            torch.from_numpy(np.ascontiguousarray(chunk, dtype=np.float32)),
+            sample_rate, state.embedding_session,
+        )
+    except Exception as e:
+        logger.warning("Section embedding failed: %s", e)
+        return None
+
+
+def _speaker_refs(turns, audio, sample_rate, known_speakers=None):
+    """One reference embedding per distinct turn speaker.
+
+    Known DB voiceprints win when the turn label matches; otherwise up to 30s
+    of that speaker's own diarized turn audio is embedded as the reference.
+    """
+    import numpy as np
+    import torch
+    from asr_mcp.core.model_state import state
+    from asr_mcp.speaker.embedding import extract_embedding
+
+    refs = {}
+    seen = []
+    for t in turns:
+        name = t.get("speaker")
+        if name and name not in seen:
+            seen.append(name)
+
+    for name in seen:
+        emb = None
+        if known_speakers:
+            for key in (name, str(name).strip("[]")):
+                entry = known_speakers.get(key)
+                if entry:
+                    e = entry.get("embedding")
+                    if e is not None:
+                        e = np.asarray(e, dtype=np.float32).ravel()
+                        nrm = float(np.linalg.norm(e))
+                        if nrm > 1e-8:
+                            emb = e / nrm
+                    break
+        if emb is None and audio is not None and state.embedding_session is not None:
+            for t in turns:
+                if t.get("speaker") != name:
+                    continue
+                s = int(t["start"] * sample_rate)
+                e = min(len(audio), s + int(30 * sample_rate))
+                if e - s < int(0.3 * sample_rate):
+                    continue
+                try:
+                    emb = extract_embedding(
+                        torch.from_numpy(
+                            np.ascontiguousarray(audio[s:e], dtype=np.float32)
+                        ),
+                        sample_rate, state.embedding_session,
+                    )
+                except Exception as ex:
+                    logger.warning("Speaker ref embed failed for %s: %s", name, ex)
+                    emb = None
+                if emb is not None:
+                    break
+        if emb is not None:
+            refs[name] = np.asarray(emb, dtype=np.float32)
+    return refs
+
+
+def _best_split(owners, weights):
+    """Best cut index k (before section k) minimising weighted disagreements.
+
+    owners[i] = 0 for the left turn's speaker, 1 for the right turn's.
+    Cost of cut k: right-owned sections left of k plus left-owned sections
+    right of k, weighted by embedding-distance margin (confident mistakes
+    cost more). Same-speaker boundaries (all one side) collapse to k = n.
+    """
+    n = len(owners)
+    if n == 0:
+        return 0
+    best_k, best_cost = 0, float("inf")
+    for k in range(n + 1):
+        cost = 0.0
+        for i in range(k):
+            if owners[i] == 1:
+                cost += weights[i]
+        for i in range(k, n):
+            if owners[i] == 0:
+                cost += weights[i]
+        if cost < best_cost - 1e-12:
+            best_cost = cost
+            best_k = k
+    return best_k
+
+
+def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None):
+    """Exact turn boundaries from uncollapsed VAD sections + voiceprints.
+
+    For every gap between consecutive turns: collect the raw VAD sections
+    spanning it, embed each one, attribute it to the better-matching adjacent
+    turn speaker (known voiceprint or reference embedding of that speaker's
+    own turn audio), find the ownership split, then extend both turns to a
+    single shared cut at the exact start of the first right-owned section
+    (or the gap end when the gap belongs entirely to the left speaker).
+    Full timeline coverage is preserved; gaps without usable sections or
+    references are left for the energy-dip fallback in _prepare_turns.
+    """
+    import numpy as np
+
+    if not turns or audio is None or len(audio) == 0 or len(turns) < 2:
+        return turns
+
+    gaps = [
+        (i, turns[i]["end"], turns[i + 1]["start"])
+        for i in range(len(turns) - 1)
+        if turns[i + 1]["start"] - turns[i]["end"] > 1e-3
+    ]
+    if not gaps:
+        return turns
+
+    try:
+        sections = _raw_vad_sections(audio, sample_rate)
+    except Exception as e:
+        logger.warning("Uncollapsed VAD failed during boundary refinement: %s", e)
+        return turns
+    if not sections:
+        return turns
+
+    try:
+        refs = _speaker_refs(turns, audio, sample_rate, known_speakers)
+    except Exception as e:
+        logger.warning("Speaker reference embeddings failed: %s", e)
+        return turns
+    if not refs:
+        return turns
+
+    sections = sorted(sections, key=lambda s: s["start"])
+    refined = 0
+    for i, gap_start, gap_end in gaps:
+        left = turns[i]
+        right = turns[i + 1]
+        ref_l = refs.get(left.get("speaker"))
+        ref_r = refs.get(right.get("speaker"))
+        if ref_l is None or ref_r is None:
+            continue
+        gap_secs = [
+            s for s in sections
+            if s["end"] > int(gap_start * sample_rate)
+            and s["start"] < int(gap_end * sample_rate)
+        ]
+        owners, weights, valid = [], [], []
+        for s in gap_secs:
+            emb = _embed_section(audio, s["start"], s["end"], sample_rate)
+            if emb is None:
+                continue
+            sa = float(np.dot(emb, ref_l))
+            sb = float(np.dot(emb, ref_r))
+            owners.append(0 if sa >= sb else 1)
+            weights.append(abs(sa - sb) + 1e-3)
+            valid.append(s)
+        if not valid:
+            continue
+        k = _best_split(owners, weights)
+        if k < len(valid):
+            cut = valid[k]["start"] / sample_rate
+            cut = min(max(cut, gap_start), gap_end)
+        else:
+            cut = gap_end
+        n_left = sum(1 for o in owners if o == 0)
+        logger.info(
+            "Boundary refinement %d: %.2f-%.2fs, %d VAD sections "
+            "(%d left / %d right), cut at %.2fs",
+            i, gap_start, gap_end, len(valid), n_left, len(valid) - n_left, cut,
+        )
+        left["end"] = float(cut)
+        right["start"] = float(cut)
+        refined += 1
+    if refined:
+        logger.info("Refined %d/%d turn boundaries via VAD voiceprint attribution",
+                    refined, len(gaps))
+    return turns
+
+
+def _prepare_turns(segments, audio_duration_sec=None, audio=None,
+                   sample_rate=16000, known_speakers=None):
     """Merge diarized segments into turns, split long ones, close gaps.
 
-    Any positive gap between consecutive turns is closed by moving both
-    neighbouring boundaries to a cut point inside the gap: the centre of the
-    quietest pause when the waveform is available (_gap_boundary), so the
-    split follows the real speaker change instead of an arbitrary midpoint.
-    Every second of the timeline ends up covered by exactly one transcription
-    turn and speech between diarized segments is not dropped. Edges are
-    extended to the file start/end as well.
+    Boundaries are first refined exactly: every gap is stepped through using
+    uncollapsed VAD sections attributed to the adjacent speaker by voiceprint
+    similarity (_refine_boundaries_with_vad), so each turn is extended to the
+    exact length of its attributed speech. Any gap still open (no VAD
+    sections, no references, VAD failure) falls back to the energy-dip cut
+    (_gap_boundary). Every second of the timeline ends up covered by exactly
+    one transcription turn. Edges are extended to the file start/end as well.
     """
     turns = _merge_into_turns(segments)
     split = []
     for t in turns:
         split.extend(_split_long_turn(t))
+    try:
+        split = _refine_boundaries_with_vad(
+            split, audio, sample_rate, known_speakers,
+        )
+    except Exception as e:
+        logger.warning("VAD voiceprint boundary refinement failed: %s", e)
     for i in range(len(split) - 1):
         gap_start = split[i]["end"]
         gap_end = split[i + 1]["start"]
@@ -216,12 +443,13 @@ def _prepare_turns(segments, audio_duration_sec=None, audio=None, sample_rate=16
     return split
 
 
-def _transcribe_diarized(audio_np, segments, sample_rate=16000):
+def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=None):
     turns = _prepare_turns(
         segments,
         audio_duration_sec=len(audio_np) / sample_rate,
         audio=audio_np,
         sample_rate=sample_rate,
+        known_speakers=known_speakers,
     )
     all_results = []
     for turn in turns:
@@ -464,7 +692,7 @@ async def transcribe_endpoint(
             total_time_sec=result.get("inference_time_sec", 0),
         )
 
-    results = _transcribe_diarized(audio_np, segments, sr)
+    results = _transcribe_diarized(audio_np, segments, sr, known_speakers=known_speakers)
 
     total_time = sum(r.inference_time_sec for r in results)
     return TranscribeResponse(results=results, total_time_sec=total_time)
@@ -561,6 +789,7 @@ async def transcribe_upload(
                 audio_duration_sec=audio_dur or None,
                 audio=audio_np,
                 sample_rate=sr or 16000,
+                known_speakers=known_speakers or None,
             )
             total_turns = len(turns)
             loop = asyncio.get_running_loop()
