@@ -166,15 +166,17 @@ def _safe_json(obj):
 
 
 async def _sse_put(queue: asyncio.Queue, evt) -> None:
-    """Put an SSE event, then yield so event_stream() can flush it.
+    """Put an SSE event, then yield long enough for it to reach the socket.
 
-    The producer does heavy CPU work (ONNX, clustering) inside an async
-    task. queue.put() on an unbounded queue does not suspend, so without
-    an explicit yield the consumer never runs until the job finishes and
-    the browser receives every message at once.
+    The producer does heavy sync CPU work (ONNX, clustering, transcription)
+    inside an async task. queue.put() never suspends, and a single
+    asyncio.sleep(0) only lets the consumer grab the item — the
+    BaseHTTPMiddleware body pump and uvicorn transport need additional
+    loop cycles to flush the bytes before the producer blocks again.
+    A short real sleep gives them that window.
     """
     await queue.put(evt)
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
 
 
 def _load_known_speakers(settings, user_id: str) -> dict:
