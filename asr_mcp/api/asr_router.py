@@ -721,6 +721,9 @@ async def diarize_upload(
     queue = asyncio.Queue()
     job = job_state.start_job(mode="diarize", filename=file.filename, user_id=user_id)
 
+    from asr_mcp.core.model_state import log_gpu_memory
+    log_gpu_memory("diarize start")
+
     async def run_diarize():
         try:
             diarizer = Diarizer(state, settings)
@@ -757,6 +760,8 @@ async def diarize_upload(
             await _sse_put(queue, {"stage": "error", "error": str(e)})
         finally:
             job_state.ensure_finished(job)
+            from asr_mcp.core.model_state import log_gpu_memory as _log_gpu
+            _log_gpu("diarize end")
             await queue.put(None)
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -868,6 +873,9 @@ async def transcribe_upload(
 
     queue = asyncio.Queue()
     job = job_state.start_job(mode="transcribe", filename=file.filename, user_id=user_id)
+
+    from asr_mcp.core.model_state import log_gpu_memory
+    log_gpu_memory("transcribe start")
 
     async def run_transcribe():
         try:
@@ -1017,6 +1025,8 @@ async def transcribe_upload(
             await _sse_put(queue, {"stage": "error", "error": str(e)})
         finally:
             job_state.ensure_finished(job)
+            from asr_mcp.core.model_state import log_gpu_memory as _log_gpu
+            _log_gpu("transcribe end")
             await queue.put(None)
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)

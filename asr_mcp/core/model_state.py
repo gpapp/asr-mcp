@@ -188,3 +188,29 @@ def run_embedding(input_feed: dict) -> list[np.ndarray]:
     import onnxruntime as ort
     output_names = [o.name for o in state.embedding_session.get_outputs()]
     return state.embedding_session.run(output_names, input_feed)
+
+
+def is_gpu_oom(err: BaseException) -> bool:
+    s = str(err).lower()
+    return (
+        "failed to allocate memory" in s
+        or "out of memory" in s
+        or "out_of_memory" in s
+    )
+
+
+def log_gpu_memory(tag: str) -> None:
+    """Best-effort GPU memory usage log (for OOM diagnosis)."""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            lines = [ln.strip() for ln in r.stdout.strip().splitlines() if ln.strip()]
+            logger.info("GPU memory [%s]: %s MiB used / %s MiB total",
+                        tag, " | ".join(l.split(",")[0] for l in lines),
+                        " | ".join(l.split(",")[1] for l in lines))
+    except Exception:
+        logger.debug("GPU memory query unavailable [%s]", tag, exc_info=True)

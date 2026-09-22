@@ -7,6 +7,8 @@ import onnxruntime as ort
 import torch
 import torchaudio
 
+from asr_mcp.core.model_state import is_gpu_oom, log_gpu_memory
+
 logger = logging.getLogger("asr_mcp.speaker.embedding")
 
 _cpu_embedding_cache: dict[str, ort.InferenceSession] = {}
@@ -16,8 +18,9 @@ def _run_with_cpu_fallback(session, feed, output_names):
     try:
         return session.run(output_names, feed)
     except RuntimeError as e:
-        if "Failed to allocate memory" in str(e):
-            logger.warning("GPU OOM on embedding, falling back to CPU")
+        if is_gpu_oom(e):
+            logger.warning("GPU OOM on embedding, falling back to CPU: %s", e)
+            log_gpu_memory("embedding OOM fallback")
             model_path = session.get_modelmeta().model_path
             if model_path not in _cpu_embedding_cache:
                 cpu_so = ort.SessionOptions()

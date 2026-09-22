@@ -20,11 +20,27 @@ def get_session_options(settings: Settings = None) -> ort.SessionOptions:
     return so
 
 
-def _get_providers(settings: Settings = None) -> list[str]:
+def _cuda_provider_options(settings: Settings = None, kind: str = "encoder") -> dict:
+    total_gb = float(settings.gpu_memory_limit_gb) if settings else 4.0
+    total_bytes = int(total_gb * (1024 ** 3))
+    if kind == "encoder":
+        limit = int(total_bytes * 0.625)  # ~2.5GB of default 4GB budget
+    else:
+        limit = min(total_bytes // 8, 512 * 1024 * 1024)  # embedding ≤512MB
+    return {
+        "gpu_mem_limit": limit,
+        "arena_extend_strategy": "kNextPowerOfTwo",
+        "cudnn_conv_algo_search": "HEURISTIC",
+    }
+
+
+def _get_providers(settings: Settings = None, kind: str = "encoder") -> list:
     available = ort.get_available_providers()
     if settings and "CUDAExecutionProvider" in available:
-        logger.info("Using CUDAExecutionProvider")
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        opts = _cuda_provider_options(settings, kind)
+        logger.info("Using CUDAExecutionProvider (%s, gpu_mem_limit=%d MiB)",
+                    kind, opts["gpu_mem_limit"] // (1024 * 1024))
+        return [("CUDAExecutionProvider", opts), "CPUExecutionProvider"]
     logger.info("Falling back to CPUExecutionProvider")
     return ["CPUExecutionProvider"]
 
@@ -155,16 +171,16 @@ def _build_prompt_ids(tokenizer, language: str = "en") -> list[int]:
 
 
 def load_models(settings: Settings) -> None:
-    providers = _get_providers(settings)
     so = get_session_options(settings)
 
     model_dir = ensure_model(settings)
     encoder_file = f"onnx/encoder_model{settings.encoder_model_type}.onnx"
     decoder_file = f"onnx/decoder_model_merged{settings.decoder_model_type}.onnx"
 
-    logger.info("Loading encoder session (providers=%s)", providers)
+    enc_providers = _get_providers(settings, "encoder")
+    logger.info("Loading encoder session (providers=%s)", enc_providers)
     state.encoder_session = ort.InferenceSession(
-        str(model_dir / encoder_file), sess_options=so, providers=providers
+        str(model_dir / encoder_file), sess_options=so, providers=enc_providers
     )
 
     enc_inputs = [inp.name for inp in state.encoder_session.get_inputs()]
@@ -205,9 +221,10 @@ def load_models(settings: Settings) -> None:
     )
 
     emb_path = ensure_embedding_model(settings)
-    logger.info("Loading embedding session (providers=%s)", providers)
+    emb_providers = _get_providers(settings, "embedding")
+    logger.info("Loading embedding session (providers=%s)", emb_providers)
     state.embedding_session = ort.InferenceSession(
-        str(emb_path), sess_options=so, providers=providers
+        str(emb_path), sess_options=so, providers=emb_providers
     )
 
     state.settings = settings
@@ -219,7 +236,7 @@ def reload_encoder_session(settings: Settings, force_cpu: bool = False) -> None:
     so = get_session_options(settings)
     model_dir = Path(settings.model_dir)
     encoder_file = f"onnx/encoder_model{settings.encoder_model_type}.onnx"
-    providers = ["CPUExecutionProvider"] if force_cpu else _get_providers(settings)
+    providers = ["CPUExecutionProvider"] if force_cpu else _get_providers(settings, "encoder")
     state.encoder_session = ort.InferenceSession(
         str(model_dir / encoder_file), sess_options=so, providers=providers
     )
@@ -228,7 +245,7 @@ def reload_encoder_session(settings: Settings, force_cpu: bool = False) -> None:
 def reload_embedding_session(settings: Settings, force_cpu: bool = False) -> None:
     so = get_session_options(settings)
     emb_path = ensure_embedding_model(settings)
-    providers = ["CPUExecutionProvider"] if force_cpu else _get_providers(settings)
+    providers = ["CPUExecutionProvider"] if force_cpu else _get_providers(settings, "embedding")
     state.embedding_session = ort.InferenceSession(
         str(emb_path), sess_options=so, providers=providers
     )

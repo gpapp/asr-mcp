@@ -10,11 +10,52 @@ from typing import Optional
 
 import numpy as np
 import librosa
+import onnxruntime as ort
 from scipy.signal import spectrogram
 
-from asr_mcp.core.model_state import state
+from asr_mcp.core.model_state import state, is_gpu_oom, log_gpu_memory
 
 logger = logging.getLogger("asr_mcp.core.transcriber")
+
+_cpu_encoder_cache: dict[str, ort.InferenceSession] = {}
+
+
+def _get_cpu_encoder_session() -> ort.InferenceSession:
+    model_path = state.encoder_session.get_modelmeta().model_path
+    sess = _cpu_encoder_cache.get(model_path)
+    if sess is None:
+        cpu_so = ort.SessionOptions()
+        cpu_so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        logger.warning("Loading CPU encoder fallback session: %s", model_path)
+        sess = ort.InferenceSession(
+            model_path, sess_options=cpu_so, providers=["CPUExecutionProvider"],
+        )
+        _cpu_encoder_cache[model_path] = sess
+    return sess
+
+
+def _run_encoder(feed: dict):
+    """Run encoder on GPU with one retry, then CPU fallback on OOM.
+
+    Successful CPU fallback returns outputs without raising — windows are
+    never silently dropped due to GPU memory exhaustion.
+    """
+    try:
+        return state.encoder_session.run(None, feed)
+    except RuntimeError as e:
+        if not is_gpu_oom(e):
+            raise
+        logger.warning("GPU OOM on encoder, retrying once: %s", e)
+        log_gpu_memory("encoder OOM retry")
+        try:
+            time.sleep(0.5)
+            return state.encoder_session.run(None, feed)
+        except RuntimeError as e2:
+            if not is_gpu_oom(e2):
+                raise
+            logger.warning("GPU OOM persisted, falling back to CPU encoder: %s", e2)
+            log_gpu_memory("encoder CPU fallback")
+            return _get_cpu_encoder_session().run(None, feed)
 
 _mel_filterbank_cache: Optional[np.ndarray] = None
 SAMPLE_RATE = 16000
@@ -352,8 +393,8 @@ def transcribe_audio_sync(
 
     try:
         if mel_spectrogram.shape[0] <= max_frames:
-            encoder_outputs = state.encoder_session.run(
-                None, {encoder_input_name: encoder_feed_value}
+            encoder_outputs = _run_encoder(
+                {encoder_input_name: encoder_feed_value}
             )
         else:
             enc_output_names = [o.name for o in state.encoder_session.get_outputs()]
@@ -364,8 +405,8 @@ def transcribe_audio_sync(
             while pos < mel_spectrogram.shape[0]:
                 end = min(pos + max_frames, mel_spectrogram.shape[0])
                 chunk = mel_spectrogram[pos:end]
-                chunk_out = state.encoder_session.run(
-                    None, {encoder_input_name: chunk[np.newaxis] if encoder_input_name != "input_features" else chunk[np.newaxis].astype(np.float32)}
+                chunk_out = _run_encoder(
+                    {encoder_input_name: chunk[np.newaxis] if encoder_input_name != "input_features" else chunk[np.newaxis].astype(np.float32)}
                 )
                 for name, val in zip(enc_output_names, chunk_out):
                     arr = val.astype(np.float32)
