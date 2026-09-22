@@ -366,19 +366,21 @@ def transcribe_audio_sync(
 
         seg_text_parts = []
         current_seg_start = 0.0
+        pending_start = 0.0
 
         def _flush_segment(seg_end: float):
-            nonlocal seg_text_parts, current_seg_start
+            nonlocal seg_text_parts, current_seg_start, pending_start
             seg_text = "".join(seg_text_parts).strip()
             seg_text_parts = []
             if seg_text:
                 cleaned = clean_transcript(seg_text)
                 if cleaned.strip():
                     segments_out.append({
-                        "start": round(current_seg_start, 3),
+                        "start": round(pending_start, 3),
                         "end": round(seg_end, 3),
                         "text": cleaned.strip(),
                     })
+                    pending_start = seg_end
             current_seg_start = seg_end
 
         for tok_id in generated_tokens:
