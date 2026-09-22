@@ -138,20 +138,20 @@ def _load_tokenizer(model_dir: Path):
 
 
 def _build_prompt_ids(tokenizer, language: str = "en") -> list[int]:
+    token_to_id = tokenizer.get_vocab()
+    lang_token = f"<|{language}|>"
     prompt_tokens = [
+        "<|startofcontext|>",
         "<|startoftranscript|>",
-        f"<|{language}|>",
+        "<|emo:undefined|>",
+        lang_token,
+        lang_token,
         "<|pnc|>",
         "<|noitn|>",
-        "<|nodiarize|>",
-        "<|emo:undefined|>",
         "<|timestamp|>",
+        "<|nodiarize|>",
     ]
-    ids = []
-    for tok in prompt_tokens:
-        encoded = tokenizer.encode(tok)
-        ids.extend(encoded.ids)
-    return ids
+    return [token_to_id[t] for t in prompt_tokens if t in token_to_id]
 
 
 def load_models(settings: Settings) -> None:
@@ -186,10 +186,12 @@ def load_models(settings: Settings) -> None:
     state.tokenizer = _load_tokenizer(model_dir)
     if state.tokenizer:
         state.prompt_ids = _build_prompt_ids(state.tokenizer)
-        logger.info("Decoder prompt token IDs: %s", state.prompt_ids)
-
-        state.eos_token_id = 3
+        token_to_id = state.tokenizer.get_vocab()
+        state.tokens = {v: k for k, v in token_to_id.items()}
+        state.eos_token_id = token_to_id.get("endoftext", 3)
         state.decoder_start_token_id = 13764
+        logger.info("Decoder prompt token IDs: %s", state.prompt_ids)
+        logger.info("EOS token ID: %d", state.eos_token_id)
     else:
         state.prompt_ids = [13764, 13902, 14190, 14021, 14074, 14254, 13912]
         state.eos_token_id = 3

@@ -20,10 +20,10 @@ _mel_filterbank_cache: Optional[np.ndarray] = None
 SAMPLE_RATE = 16000
 N_MELS = 128
 N_FFT = 512
-WIN_LENGTH = 400
+WIN_LENGTH = 512
 HOP_LENGTH = 160
 PREEMPHASIS = 0.97
-DITHER = 1e-5
+DITHER = 0.0
 
 NUM_LAYERS = 8
 NUM_HEADS = 8
@@ -38,7 +38,6 @@ def _get_mel_filterbank() -> np.ndarray:
         return _mel_filterbank_cache
     _mel_filterbank_cache = librosa.filters.mel(
         sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS,
-        fmin=0.0, fmax=SAMPLE_RATE / 2, norm="slaney",
     ).astype(np.float32)
     return _mel_filterbank_cache
 
@@ -54,24 +53,22 @@ def _compute_mel_spectrogram_fast(audio: np.ndarray) -> np.ndarray:
 
     audio = _preemphasis(audio)
 
-    win = np.hanning(WIN_LENGTH)
-
     f, t, Sxx = spectrogram(
-        audio, fs=SAMPLE_RATE, nperseg=WIN_LENGTH,
-        noverlap=WIN_LENGTH - HOP_LENGTH, nfft=N_FFT,
-        window=win, scaling="spectrum",
+        audio, fs=SAMPLE_RATE, window='hann',
+        nperseg=WIN_LENGTH, noverlap=WIN_LENGTH - HOP_LENGTH,
+        return_onesided=True, mode='magnitude',
     )
 
-    Sxx = np.maximum(Sxx, 1e-10)
     mel_fb = _get_mel_filterbank()
     mel_spec = mel_fb @ Sxx
-    log_mel = np.log(mel_spec + 1e-8).astype(np.float32)
 
-    mean = log_mel.mean(axis=1, keepdims=True)
-    std = log_mel.std(axis=1, keepdims=True) + 1e-5
-    log_mel = ((log_mel - mean) / std).astype(np.float32)
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
 
-    return log_mel.T
+    mean = mel_spec_db.mean(axis=1, keepdims=True)
+    std = mel_spec_db.std(axis=1, keepdims=True) + 1e-8
+    mel_spec_db = ((mel_spec_db - mean) / std).astype(np.float32)
+
+    return mel_spec_db.T
 
 
 @contextmanager
@@ -91,34 +88,51 @@ def inference_timeout(seconds: int):
 
 
 def _trim_partial_prefix(before: str, unit: str) -> str:
-    if not before:
-        return ""
-    trimmed = before.rstrip()
-    if unit == "word" and trimmed and not trimmed[-1].isspace():
-        parts = trimmed.rsplit(" ", 1)
-        if len(parts) > 1:
-            return parts[0] + " "
-        return ""
-    return trimmed + " " if trimmed else ""
+    words = unit.lower().split()
+    b = before.rstrip()
+    b_lower = b.lower()
+    for start in range(len(words)):
+        suffix = " ".join(words[start:])
+        if b_lower.endswith(suffix):
+            return b[: len(b) - len(suffix)].rstrip()
+    return b
 
 
 def _trim_partial_suffix(after: str, unit: str) -> str:
-    if not after:
-        return ""
-    trimmed = after.lstrip()
-    if unit == "word" and trimmed and not trimmed[0].isspace():
-        parts = trimmed.split(" ", 1)
-        if len(parts) > 1:
-            return " " + parts[1]
-        return ""
-    return " " + trimmed if trimmed else ""
+    words = unit.lower().split()
+    a = after.lstrip()
+    a_lower = a.lower()
+    for end in range(len(words), 0, -1):
+        prefix = " ".join(words[:end])
+        if a_lower.startswith(prefix):
+            return a[len(prefix):].lstrip()
+    return a
+
+
+_LOOP_RE = re.compile(r'(.{4,120}?)(?:\s+\1){2,}', re.IGNORECASE)
 
 
 def clean_transcript(text: str) -> str:
-    pattern = r'(.{2,}?)\1{2,}'
-    cleaned = re.sub(pattern, r'\1', text)
-    cleaned = re.sub(r'\[inaudible\](\s*\[inaudible\])+', '[inaudible]', cleaned)
-    return cleaned.strip()
+    text = re.sub(r'\b(\w{3,})\s+\1\b', r'\1', text)
+    text = re.sub(r'\b(\w{2})\s+\1\b', r'\1', text)
+    prev = None
+    while prev != text:
+        prev = text
+        m = _LOOP_RE.search(text)
+        if not m:
+            break
+        unit = m.group(1)
+        before = _trim_partial_prefix(text[:m.start()], unit)
+        after = _trim_partial_suffix(text[m.end():], unit)
+        parts = [p for p in (before, '[inaudible]', after) if p]
+        text = ' '.join(parts)
+    text = re.sub(r'(\[inaudible\]\s*){2,}', '[inaudible] ', text)
+    text = re.sub(
+        r'\[inaudible\]\s+(?:\w[\w\s,\']{0,80}?)\s+\[inaudible\]',
+        '[inaudible]',
+        text,
+    )
+    return text.strip()
 
 
 def _parse_encoder_outputs(encoder_outputs, encoder_session):
@@ -177,13 +191,15 @@ def _init_self_kv_cache():
     return self_kv
 
 
-def _build_decoder_inputs(dec_input_names, input_ids, position, cross_kv, self_kv, encoder_hidden_states=None, enc_hs_input_name=None, num_logits_to_keep=1):
+def _build_decoder_inputs(dec_input_names, input_ids, position, past_seq_len, tokens_this_call, cross_kv, self_kv, encoder_hidden_states=None, enc_hs_input_name=None, num_logits_to_keep=1):
     batch_size = input_ids.shape[0]
     seq_len = input_ids.shape[1]
 
+    total_seq_len = past_seq_len + tokens_this_call + seq_len
+
     inputs = {}
     inputs["input_ids"] = input_ids.astype(np.int64)
-    inputs["attention_mask"] = np.ones((batch_size, seq_len), dtype=np.int64)
+    inputs["attention_mask"] = np.ones((batch_size, total_seq_len), dtype=np.int64)
     inputs["position_ids"] = np.arange(position, position + seq_len, dtype=np.int64).reshape(1, -1)
     inputs["num_logits_to_keep"] = np.array(num_logits_to_keep, dtype=np.int64)
 
@@ -289,13 +305,16 @@ def transcribe_audio_sync(
         input_ids = np.array([state.prompt_ids], dtype=np.int64)
 
     position = 0
+    past_seq_len = 0
+    tokens_this_call = 0
     generated_tokens = []
     max_new = state.settings.max_new_tokens if state.settings else 448
 
     for step in range(max_new):
         seq_len = input_ids.shape[1]
         feed = _build_decoder_inputs(
-            dec_input_names, input_ids, position, cross_kv, self_kv,
+            dec_input_names, input_ids, position, past_seq_len, tokens_this_call,
+            cross_kv, self_kv,
             encoder_hidden_states=encoder_hidden_states,
             enc_hs_input_name=enc_hs_input_name,
         )
@@ -334,41 +353,50 @@ def transcribe_audio_sync(
 
         generated_tokens.append(next_token)
         input_ids = np.array([[next_token]], dtype=np.int64)
+        tokens_this_call += seq_len
         position += seq_len
 
+    audio_duration = mel_spectrogram.shape[0] * HOP_LENGTH / SAMPLE_RATE if mel_spectrogram is not None else 0
+
     segments_out = []
-    if state.tokenizer:
-        full_decode = state.tokenizer.decode(generated_tokens, skip_special_tokens=False)
-        text_tokens = []
-        current_time = 0.0
-        current_text_start = 0.0
+    if state.tokenizer and state.tokens:
+        token_to_id = state.tokenizer.get_vocab()
+        SPLIT_TOKEN_BASE = token_to_id.get("<|spltoken0|>", -1)
+        NUM_SPLIT_BINS = 34
+
+        seg_text_parts = []
+        current_seg_start = 0.0
+
         for tok_id in generated_tokens:
-            tok_str = state.tokenizer.decode([tok_id], skip_special_tokens=False)
-            ts_match = re.match(r'<\|(\d+\.?\d*)\|>', tok_str)
-            if ts_match:
-                ts_val = float(ts_match.group(1))
-                if text_tokens:
-                    seg_text = state.tokenizer.decode(text_tokens, skip_special_tokens=True)
-                    seg_text = clean_transcript(seg_text)
-                    if seg_text.strip():
-                        segments_out.append({
-                            "start": round(current_text_start, 2),
-                            "end": round(ts_val, 2),
-                            "text": seg_text.strip(),
-                        })
-                    text_tokens = []
-                current_text_start = ts_val
-            elif tok_id != state.eos_token_id:
-                text_tokens.append(tok_id)
-        if text_tokens:
-            seg_text = state.tokenizer.decode(text_tokens, skip_special_tokens=True)
+            tok_str = state.tokens.get(tok_id, "")
+            if tok_str.startswith("<|"):
+                if SPLIT_TOKEN_BASE != -1 and SPLIT_TOKEN_BASE <= tok_id < SPLIT_TOKEN_BASE + NUM_SPLIT_BINS:
+                    seg_text = "".join(seg_text_parts).strip()
+                    if seg_text:
+                        seg_end = audio_duration * (tok_id - SPLIT_TOKEN_BASE) / NUM_SPLIT_BINS
+                        seg_text = clean_transcript(seg_text)
+                        if seg_text.strip():
+                            segments_out.append({
+                                "start": round(current_seg_start, 3),
+                                "end": round(seg_end, 3),
+                                "text": seg_text.strip(),
+                            })
+                        current_seg_start = seg_end
+                    seg_text_parts = []
+                continue
+            tok_str = tok_str.replace("▁", " ")
+            seg_text_parts.append(tok_str)
+
+        seg_text = "".join(seg_text_parts).strip()
+        if seg_text:
             seg_text = clean_transcript(seg_text)
             if seg_text.strip():
                 segments_out.append({
-                    "start": round(current_text_start, 2),
-                    "end": round(current_time, 2),
+                    "start": round(current_seg_start, 3),
+                    "end": round(audio_duration, 3),
                     "text": seg_text.strip(),
                 })
+
         if segments_out:
             text = " ".join(s["text"] for s in segments_out)
         else:
@@ -379,14 +407,6 @@ def transcribe_audio_sync(
         text = clean_transcript(text)
 
     inference_time = time.time() - start_time
-    audio_duration = mel_spectrogram.shape[0] * HOP_LENGTH / SAMPLE_RATE if mel_spectrogram is not None else 0
-
-    if segments_out and audio_duration > 0:
-        for s in segments_out:
-            if s["end"] == 0.0 and s != segments_out[-1]:
-                pass
-            elif s["end"] == 0.0:
-                s["end"] = round(audio_duration, 2)
 
     return {
         "text": text,
