@@ -89,7 +89,7 @@ def _split_long_turn(turn):
     return out
 
 
-def _transcribe_turn(audio_np, turn, sample_rate=16000):
+def _transcribe_turn(audio_np, turn, sample_rate=16000, progress_cb=None):
     """Transcribe a single speaker turn as one coherent audio chunk."""
     from asr_mcp.core.transcriber import transcribe_audio_sync
 
@@ -104,7 +104,7 @@ def _transcribe_turn(audio_np, turn, sample_rate=16000):
     logger.info("Transcribing turn: %.1f-%.1fs (%.1fs, %s)",
                 turn["start"], turn["end"], dur, turn["speaker"])
 
-    tr = transcribe_audio_sync(audio=turn_audio)
+    tr = transcribe_audio_sync(audio=turn_audio, progress_cb=progress_cb)
 
     logger.info("Turn result: text=%d chars, tokens=%d, inference=%.2fs, error=%s",
                 len(tr.get("text", "")), tr.get("tokens_generated", 0),
@@ -563,6 +563,7 @@ async def transcribe_upload(
                 sample_rate=sr or 16000,
             )
             total_turns = len(turns)
+            loop = asyncio.get_running_loop()
             results = []
             for turn_idx, turn in enumerate(turns):
                 p = turn_idx / max(total_turns, 1)
@@ -576,7 +577,28 @@ async def transcribe_upload(
                     "segment_start": turn["start"],
                     "segment_end": turn["end"],
                 })
-                turn_results = _transcribe_turn(audio_np, turn, sample_rate=16000)
+
+                def _make_window_cb(turn_idx=turn_idx, turn=turn):
+                    def cb(i, n):
+                        frac = (turn_idx + i / max(n, 1)) / max(total_turns, 1)
+                        loop.call_soon_threadsafe(queue.put_nowait, {
+                            "stage": f"Transcribing turn {turn_idx+1}/{total_turns} — window {i}/{n} ({turn['speaker']})",
+                            "progress": frac,
+                            "phase": "transcription",
+                            "segment_index": turn_idx,
+                            "total_segments": total_turns,
+                            "segment_speaker": turn["speaker"],
+                            "segment_start": turn["start"],
+                            "segment_end": turn["end"],
+                            "window": i,
+                            "total_windows": n,
+                        })
+                    return cb
+
+                turn_results = await loop.run_in_executor(
+                    None,
+                    _transcribe_turn, audio_np, turn, 16000, _make_window_cb(),
+                )
                 results.extend(turn_results)
 
             diarization["results"] = [_result_to_dict(r) for r in results]

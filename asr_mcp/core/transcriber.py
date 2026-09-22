@@ -242,17 +242,21 @@ def _transcribe_windowed(
     language: str = "en",
     timeout_sec: int = 120,
     max_frames: Optional[int] = None,
+    progress_cb: Optional[callable] = None,
 ) -> dict:
     """Transcribe long mel in <=MAX_ENCODER_SEC windows and merge results.
 
     A single decode over a very long encoding truncates early (max_new_tokens /
     EOS after the first window of speech). Each window gets its own prompt and
     decode; segment times are offset back to the full-audio timeline.
+
+    progress_cb(i, n) is invoked before each window is decoded (i is 1-based).
     """
     if max_frames is None:
         max_frames = int(MAX_ENCODER_SEC * (SAMPLE_RATE / HOP_LENGTH))
     bounds = _plan_window_bounds(mel, max_frames)
-    logger.info("Windowing long audio: %d frames -> %d windows", mel.shape[0], len(bounds) - 1)
+    n_windows = len(bounds) - 1
+    logger.info("Windowing long audio: %d frames -> %d windows", mel.shape[0], n_windows)
 
     segments_out = []
     text_parts = []
@@ -260,9 +264,14 @@ def _transcribe_windowed(
     inference_total = 0.0
     errors = []
 
-    for i in range(len(bounds) - 1):
+    for i in range(n_windows):
         s, e = bounds[i], bounds[i + 1]
         off = s * HOP_LENGTH / SAMPLE_RATE
+        if progress_cb:
+            try:
+                progress_cb(i + 1, n_windows)
+            except Exception:
+                logger.debug("progress_cb failed", exc_info=True)
         r = transcribe_audio_sync(
             mel_spectrogram=mel[s:e],
             language=language,
@@ -307,6 +316,7 @@ def transcribe_audio_sync(
     past_kv_cache_ort: Optional[dict] = None,
     prefix_ids: Optional[list[int]] = None,
     _no_window: bool = False,
+    progress_cb: Optional[callable] = None,
 ) -> dict:
     start_time = time.time()
 
@@ -329,7 +339,8 @@ def transcribe_audio_sync(
         and mel_spectrogram.shape[0] > max_frames
     ):
         return _transcribe_windowed(
-            mel_spectrogram, language=language, timeout_sec=timeout_sec, max_frames=max_frames
+            mel_spectrogram, language=language, timeout_sec=timeout_sec,
+            max_frames=max_frames, progress_cb=progress_cb,
         )
 
     enc_input_names = [inp.name for inp in state.encoder_session.get_inputs()]
