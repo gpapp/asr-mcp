@@ -109,18 +109,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Auth middleware — added FIRST so it's innermost (runs AFTER SessionMiddleware)
-class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        from asr_mcp.api.auth import require_auth
-        redirect = require_auth(request)
-        if redirect:
-            return redirect
-        return await call_next(request)
-
-app.add_middleware(AuthMiddleware)
-
-# Session middleware
+# Session middleware — added FIRST so it's outermost (runs first, populates session)
 from asr_mcp.config.settings import get_settings as _init_settings
 _init_secret = _init_settings().session_secret
 app.add_middleware(
@@ -131,6 +120,17 @@ app.add_middleware(
     same_site="lax",
     https_only=False,
 )
+
+# Auth middleware — added SECOND so it's inner (runs AFTER SessionMiddleware)
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        from asr_mcp.api.auth import require_auth
+        redirect = require_auth(request)
+        if redirect:
+            return redirect
+        return await call_next(request)
+
+app.add_middleware(AuthMiddleware)
 
 # CORS
 app.add_middleware(

@@ -165,6 +165,18 @@ def _safe_json(obj):
     return obj
 
 
+async def _sse_put(queue: asyncio.Queue, evt) -> None:
+    """Put an SSE event, then yield so event_stream() can flush it.
+
+    The producer does heavy CPU work (ONNX, clustering) inside an async
+    task. queue.put() on an unbounded queue does not suspend, so without
+    an explicit yield the consumer never runs until the job finishes and
+    the browser receives every message at once.
+    """
+    await queue.put(evt)
+    await asyncio.sleep(0)
+
+
 def _load_known_speakers(settings, user_id: str) -> dict:
     """Load all stored voiceprints from DB for speaker matching."""
     try:
@@ -265,7 +277,8 @@ async def diarize_upload(
             known_speakers = _load_known_speakers(settings, user_id)
 
             async def progress_cb(evt):
-                await queue.put(evt)
+                evt.setdefault("phase", "diarization")
+                await _sse_put(queue, evt)
 
             result = await diarizer.run(
                 audio_path=str(wav_path),
@@ -288,10 +301,10 @@ async def diarize_upload(
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
 
-            await queue.put({"stage": "done", "progress": 1.0, "result": result})
+            await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": result})
         except Exception as e:
             logger.error("Diarize failed: %s", e)
-            await queue.put({"stage": "error", "error": str(e)})
+            await _sse_put(queue, {"stage": "error", "error": str(e)})
         finally:
             await queue.put(None)
 
@@ -406,9 +419,9 @@ async def transcribe_upload(
 
             async def progress_cb(evt):
                 evt.setdefault("phase", "diarization")
-                await queue.put(evt)
+                await _sse_put(queue, evt)
 
-            await queue.put({"stage": "Running diarization", "progress": 0.0, "phase": "diarization"})
+            await _sse_put(queue, {"stage": "Running diarization", "progress": 0.0, "phase": "diarization"})
             diarization = await diarizer.run(
                 audio_path=str(wav_path), num_speakers=num_speakers,
                 known_speakers=known_speakers or None,
@@ -434,7 +447,7 @@ async def transcribe_upload(
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
 
-            await queue.put({
+            await _sse_put(queue, {
                 "stage": "diarization_complete",
                 "progress": 1.0,
                 "phase": "diarization",
@@ -444,11 +457,11 @@ async def transcribe_upload(
             })
 
             if not segments:
-                await queue.put({"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
+                await _sse_put(queue, {"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
                 mel = _compute_mel_spectrogram_fast(audio_np)
                 result = transcribe_audio_sync(mel_spectrogram=mel)
                 diarization["results"] = [_result_to_dict(TranscribeResult(**result))]
-                await queue.put({"stage": "done", "progress": 1.0, "result": diarization})
+                await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
                 return
 
             turns = _prepare_turns(segments)
@@ -456,7 +469,7 @@ async def transcribe_upload(
             results = []
             for turn_idx, turn in enumerate(turns):
                 p = turn_idx / max(total_turns, 1)
-                await queue.put({
+                await _sse_put(queue, {
                     "stage": f"Transcribing turn {turn_idx+1}/{total_turns} ({turn['speaker']})",
                     "progress": p,
                     "phase": "transcription",
@@ -492,10 +505,10 @@ async def transcribe_upload(
             except Exception as e:
                 logger.warning("Failed to save transcription: %s", e)
 
-            await queue.put({"stage": "done", "progress": 1.0, "result": diarization})
+            await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
         except Exception as e:
             logger.error("Transcribe failed: %s", e)
-            await queue.put({"stage": "error", "error": str(e)})
+            await _sse_put(queue, {"stage": "error", "error": str(e)})
         finally:
             await queue.put(None)
 
@@ -512,7 +525,15 @@ async def transcribe_upload(
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/stream")
