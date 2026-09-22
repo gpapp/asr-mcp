@@ -237,6 +237,16 @@ class SnippetDB:
             session.commit()
             return count
 
+    def update_file_path(self, snippet_id: int, file_path: str, user_id: str = DEFAULT_USER) -> bool:
+        with self._db.get_session() as session:
+            count = (
+                session.query(SnippetModel)
+                .filter_by(id=snippet_id, user_id=user_id)
+                .update({"file_path": file_path})
+            )
+            session.commit()
+            return bool(count)
+
     def total_duration(self, speaker_name: str, user_id: str = DEFAULT_USER) -> float:
         with self._db.get_session() as session:
             from sqlalchemy import func

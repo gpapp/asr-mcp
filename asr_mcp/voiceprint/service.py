@@ -220,6 +220,18 @@ class VoiceprintService:
             else:
                 old_dir.rename(new_dir)
 
+        old_prefix = str(old_dir)
+        new_prefix = str(new_dir)
+        paths_updated = 0
+        for sn in self._snippets.list_by_speaker(new_name, user_id=user_id):
+            fp = sn["file_path"]
+            try:
+                rel = Path(fp).relative_to(old_prefix)
+            except ValueError:
+                continue
+            if self._snippets.update_file_path(sn["id"], str(new_prefix / rel), user_id=user_id):
+                paths_updated += 1
+
         transcripts_updated = 0
         try:
             from asr_mcp.db.manager import TranscriptDB
@@ -235,6 +247,7 @@ class VoiceprintService:
             "from": old_name,
             "to": new_name,
             "snippets_moved": count,
+            "paths_updated": paths_updated,
             "transcripts_updated": transcripts_updated,
         }
 
