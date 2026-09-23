@@ -48,23 +48,38 @@ def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
     return result
 
 
-def absorb_minority_speakers(segments: list, min_speaker_dur: float = 3.0) -> list:
-    """Reassign all segments of speakers whose total duration < min_speaker_dur
-    to the temporally nearest dominant speaker."""
+def absorb_minority_speakers(
+    segments: list,
+    max_utterance_sec: float = 5.0,
+    min_speaker_dur: float = 8.0,
+) -> list:
+    """Reassign all utterances of minority speakers to the temporally nearest main speaker.
+
+    A speaker is "main" if they have at least one utterance of
+    max_utterance_sec or longer (per-utterance criterion), OR a total
+    duration of min_speaker_dur or more. Everyone else is a minority
+    speaker and their utterances are absorbed into the nearest main speaker.
+    """
     if len(segments) < 2:
         return segments
 
-    speaker_durations = {}
+    speaker_totals = {}
+    speaker_longest = {}
     for seg in segments:
         spk = seg.get("speaker", "UNKNOWN")
         dur = seg.get("end", 0) - seg.get("start", 0)
-        speaker_durations[spk] = speaker_durations.get(spk, 0) + dur
+        speaker_totals[spk] = speaker_totals.get(spk, 0) + dur
+        speaker_longest[spk] = max(speaker_longest.get(spk, 0), dur)
 
-    dominant = {spk for spk, dur in speaker_durations.items() if dur >= min_speaker_dur}
-    if not dominant or len(dominant) == len(speaker_durations):
+    main = {
+        spk for spk in speaker_totals
+        if speaker_longest.get(spk, 0) >= max_utterance_sec
+        or speaker_totals.get(spk, 0) >= min_speaker_dur
+    }
+    if not main or len(main) == len(speaker_totals):
         return segments
 
-    minority = set(speaker_durations) - dominant
+    minority = set(speaker_totals) - main
 
     result = []
     for i, seg in enumerate(segments):
@@ -72,17 +87,18 @@ def absorb_minority_speakers(segments: list, min_speaker_dur: float = 3.0) -> li
         if spk in minority:
             best_alt = None
             best_dist = float("inf")
-            for d_spk in dominant:
-                nearest = _find_nearest_temporal(segments, i, d_spk)
+            for m_spk in main:
+                nearest = _find_nearest_temporal(segments, i, m_spk)
                 if nearest is not None:
                     dist = abs(nearest - i)
                     if dist < best_dist:
                         best_dist = dist
-                        best_alt = d_spk
+                        best_alt = m_spk
             if best_alt:
                 seg = {**seg, "speaker": best_alt}
-                logger.debug("Absorbed minority %s -> %s at %.1f (%.1fs total)",
-                             spk, best_alt, seg.get("start", 0), speaker_durations[spk])
+                logger.debug("Absorbed minority %s -> %s at %.1f (%.1fs utter)",
+                             spk, best_alt, seg.get("start", 0),
+                             seg.get("end", 0) - seg.get("start", 0))
         result.append(seg)
 
     return collapse_same_speaker_segments(result)

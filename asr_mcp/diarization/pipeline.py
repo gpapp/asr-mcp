@@ -151,7 +151,7 @@ class Diarizer:
         # Step 9: Collapse + absorb islands + absorb minority speakers
         merged_segments = collapse_same_speaker_segments(merged_segments, max_gap=0.5)
         merged_segments = absorb_islands(merged_segments, min_island_dur=1.0)
-        merged_segments = absorb_minority_speakers(merged_segments, min_speaker_dur=3.0)
+        merged_segments = absorb_minority_speakers(merged_segments, max_utterance_sec=5.0, min_speaker_dur=8.0)
 
         if progress_callback:
             await progress_callback({"stage": "Profiling speakers", "progress": 0.8})
