@@ -9,6 +9,7 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -70,10 +71,17 @@ class SnippetModel(Base):
     source_audio = Column(String(1024), nullable=True)
     start_sec = Column(Float, nullable=True)
     end_sec = Column(Float, nullable=True)
+    file_mtime = Column(Float, nullable=True)
+    file_size = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 def init_db(db_path: str) -> sessionmaker:
     engine = create_engine(f"sqlite:///{db_path}", echo=False)
     Base.metadata.create_all(engine)
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(snippets)"))}
+        for name, decl in (("file_mtime", "REAL"), ("file_size", "INTEGER")):
+            if name not in cols:
+                conn.execute(text(f"ALTER TABLE snippets ADD COLUMN {name} {decl}"))
     return sessionmaker(bind=engine)

@@ -182,7 +182,8 @@ class SnippetDB:
 
     def add(self, speaker_name: str, file_path: str, duration_sec: float,
             user_id: str = DEFAULT_USER, source_audio: str = None,
-            start_sec: float = None, end_sec: float = None) -> int:
+            start_sec: float = None, end_sec: float = None,
+            file_mtime: float = None, file_size: int = None) -> int:
         with self._db.get_session() as session:
             sn = SnippetModel(
                 user_id=user_id,
@@ -192,10 +193,23 @@ class SnippetDB:
                 source_audio=source_audio,
                 start_sec=start_sec,
                 end_sec=end_sec,
+                file_mtime=file_mtime,
+                file_size=file_size,
             )
             session.add(sn)
             session.commit()
             return sn.id
+
+    def update_fingerprint(self, snippet_id: int, file_mtime: float,
+                           file_size: int, user_id: str = DEFAULT_USER) -> bool:
+        with self._db.get_session() as session:
+            count = (
+                session.query(SnippetModel)
+                .filter_by(id=snippet_id, user_id=user_id)
+                .update({"file_mtime": file_mtime, "file_size": file_size})
+            )
+            session.commit()
+            return bool(count)
 
     def list_by_speaker(self, speaker_name: str, user_id: str = DEFAULT_USER) -> list[dict]:
         with self._db.get_session() as session:
@@ -302,6 +316,8 @@ class SnippetDB:
             "source_audio": sn.source_audio,
             "start_sec": sn.start_sec,
             "end_sec": sn.end_sec,
+            "file_mtime": sn.file_mtime,
+            "file_size": sn.file_size,
             "created_at": sn.created_at.isoformat() if sn.created_at else None,
         }
 

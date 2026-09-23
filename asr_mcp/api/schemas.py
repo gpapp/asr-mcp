@@ -139,6 +139,8 @@ class VoiceprintSnippetListResponse(BaseModel):
 class RescanResponse(BaseModel):
     scanned: int = 0
     added: int = 0
+    invalidated: int = 0
+    rebuilt: int = 0
     speakers: list[str] = []
 
 

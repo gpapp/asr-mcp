@@ -93,6 +93,11 @@ class VoiceprintService:
         file_path = speaker_dir / filename
 
         sf.write(str(file_path), audio_data.astype(np.float32), sample_rate, format="FLAC")
+        try:
+            fst = file_path.stat()
+            file_mtime, file_size = fst.st_mtime, fst.st_size
+        except OSError:
+            file_mtime, file_size = None, None
 
         snippet_id = self._snippets.add(
             speaker_name=speaker_name,
@@ -102,6 +107,8 @@ class VoiceprintService:
             source_audio=source_audio,
             start_sec=start_sec,
             end_sec=end_sec,
+            file_mtime=file_mtime,
+            file_size=file_size,
         )
 
         return {
@@ -294,14 +301,22 @@ class VoiceprintService:
     def rescan_voices_dir(
         self, user_id: str = DEFAULT_USER, progress_callback=None,
     ) -> dict:
-        """Scan the voices directory and register new snippets.
+        """Scan the voices directory; add new snippets and rebuild stale voiceprints.
+
+        Two phases:
+          1. Scan: register audio files that are new (or new directories) and
+             fingerprint-check every already-registered file (mtime+size) to
+             detect CHANGED snippets.
+          2. Rebuild: invalidate the voiceprint of any speaker whose snippet
+             changed, then recompute the voiceprint for every speaker that is
+             new, changed, or missing (has snippets but no voiceprint row).
 
         ``progress_callback(evt: dict)`` is invoked (optionally) after each
         file, so an SSE stream can reflect live scan/add/refine state.
         """
         user_dir = self._voices_dir / user_id
         if not user_dir.exists():
-            return {"scanned": 0, "added": 0, "speakers": []}
+            return {"scanned": 0, "added": 0, "invalidated": 0, "rebuilt": 0, "speakers": []}
 
         def _progress(evt: dict):
             if progress_callback is None:
@@ -311,14 +326,16 @@ class VoiceprintService:
             except Exception as e:
                 logger.warning("Progress callback error: %s", e)
 
-        existing_paths = set()
+        existing = {}
         for speaker_name in self._snippets.all_speakers(user_id=user_id):
             for sn in self._snippets.list_by_speaker(speaker_name, user_id=user_id):
-                existing_paths.add(sn["file_path"])
+                existing[sn["file_path"]] = sn
 
         audio_exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
         added = 0
         scanned = 0
+        new_speakers = set()
+        changed_speakers = set()
         speakers_found = []
 
         total_files = 0
@@ -346,50 +363,127 @@ class VoiceprintService:
                     "added": added,
                     "progress": (scanned / total_files) if total_files else 0.0,
                 })
-                if str(audio_file) in existing_paths:
-                    continue
 
+                fp = str(audio_file)
+                sn = existing.get(fp)
                 try:
-                    waveform, sr = load_audio(str(audio_file))
-                    duration = waveform.shape[-1] / SAMPLE_RATE
-                    if duration < MIN_SNIPPET_DURATION:
-                        continue
+                    fst = audio_file.stat()
+                    mtime, size = fst.st_mtime, fst.st_size
+                except OSError:
+                    mtime, size = None, None
 
-                    audio_data = waveform.numpy().squeeze()
-                    sf.write(str(audio_file), audio_data.astype(np.float32), sr)
+                if sn is None:
+                    try:
+                        waveform, sr = load_audio(fp)
+                        duration = waveform.shape[-1] / SAMPLE_RATE
+                        if duration < MIN_SNIPPET_DURATION:
+                            continue
 
-                    self._snippets.add(
-                        speaker_name=speaker_name,
-                        file_path=str(audio_file),
-                        duration_sec=duration,
-                        user_id=user_id,
-                    )
-                    existing_paths.add(str(audio_file))
-                    added += 1
-                    _progress({
-                        "stage": f"Added snippet for {speaker_name}",
-                        "speaker": speaker_name,
-                        "scanned": scanned,
-                        "added": added,
-                        "progress": (scanned / total_files) if total_files else 0.0,
-                    })
-                except Exception as e:
-                    logger.warning("Failed to scan %s: %s", audio_file, e)
+                        audio_data = waveform.numpy().squeeze()
+                        sf.write(fp, audio_data.astype(np.float32), sr)
+                        try:
+                            fst = audio_file.stat()
+                            mtime, size = fst.st_mtime, fst.st_size
+                        except OSError:
+                            mtime, size = None, None
 
-            sn_count = self._snippets.count(speaker_name, user_id=user_id)
-            if sn_count > 0:
-                _progress({
-                    "stage": f"Refining voiceprint for {speaker_name}",
+                        self._snippets.add(
+                            speaker_name=speaker_name,
+                            file_path=fp,
+                            duration_sec=duration,
+                            user_id=user_id,
+                            file_mtime=mtime,
+                            file_size=size,
+                        )
+                        existing[fp] = {
+                            "id": None,
+                            "file_mtime": mtime,
+                            "file_size": size,
+                        }
+                        added += 1
+                        new_speakers.add(speaker_name)
+                        _progress({
+                            "stage": f"Added snippet for {speaker_name}",
+                            "speaker": speaker_name,
+                            "scanned": scanned,
+                            "added": added,
+                            "progress": (scanned / total_files) if total_files else 0.0,
+                        })
+                    except Exception as e:
+                        logger.warning("Failed to scan %s: %s", audio_file, e)
+                else:
+                    stored_mtime = sn.get("file_mtime")
+                    stored_size = sn.get("file_size")
+                    if stored_mtime is None or stored_size is None:
+                        if sn.get("id") is not None and (mtime is not None or size is not None):
+                            self._snippets.update_fingerprint(
+                                sn["id"], mtime, size, user_id=user_id
+                            )
+                    elif (stored_mtime != mtime or stored_size != size):
+                        changed_speakers.add(speaker_name)
+
+        return self._rebuild_after_rescan(
+            user_id=user_id,
+            speakers_found=speakers_found,
+            new_speakers=new_speakers,
+            changed_speakers=changed_speakers,
+            scanned=scanned,
+            added=added,
+            progress_callback=_progress,
+        )
+
+    def _rebuild_after_rescan(
+        self,
+        user_id: str,
+        speakers_found: list,
+        new_speakers: set,
+        changed_speakers: set,
+        scanned: int,
+        added: int,
+        progress_callback=None,
+    ) -> dict:
+        """Invalidate changed voiceprints and rebuild all missing ones.
+
+        Speakers rebuilt = new dirs with snippets ∪ speakers whose snippet
+        changed (voiceprint invalidated first) ∪ speakers that have snippets
+        but no voiceprint row (missing). Unchanged speakers are left alone.
+        """
+        invalidated = 0
+        rebuilt = 0
+
+        targets = set(new_speakers) | set(changed_speakers)
+        for speaker_name in speakers_found:
+            if speaker_name in targets:
+                continue
+            if self._snippets.count(speaker_name, user_id=user_id) > 0 \
+                    and self._db.get(speaker_name, user_id=user_id) is None:
+                targets.add(speaker_name)
+
+        for speaker_name in sorted(targets):
+            if speaker_name in changed_speakers:
+                if self._db.delete(speaker_name, user_id=user_id):
+                    invalidated += 1
+                progress_callback and progress_callback({
+                    "stage": f"Invalidated voiceprint for {speaker_name}",
                     "speaker": speaker_name,
                     "scanned": scanned,
                     "added": added,
-                    "progress": (scanned / total_files) if total_files else 0.0,
                 })
-                self._auto_refine(speaker_name, user_id=user_id, progress_callback=_progress)
+            if progress_callback:
+                progress_callback({
+                    "stage": f"Rebuilding voiceprint for {speaker_name}",
+                    "speaker": speaker_name,
+                    "scanned": scanned,
+                    "added": added,
+                })
+            self._auto_refine(speaker_name, user_id=user_id, progress_callback=progress_callback)
+            rebuilt += 1
 
         return {
             "scanned": scanned,
             "added": added,
+            "invalidated": invalidated,
+            "rebuilt": rebuilt,
             "speakers": speakers_found,
         }
 
