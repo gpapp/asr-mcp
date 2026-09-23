@@ -297,14 +297,11 @@ class VoiceprintService:
             return {"scanned": 0, "added": 0, "speakers": []}
 
         existing_paths = set()
-        for sn in self._snippets.all_speakers(user_id=user_id).values():
-            pass
-        all_snippets = []
         for speaker_name in self._snippets.all_speakers(user_id=user_id):
             for sn in self._snippets.list_by_speaker(speaker_name, user_id=user_id):
                 existing_paths.add(sn["file_path"])
 
-            audio_exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+        audio_exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
         added = 0
         scanned = 0
         speakers_found = []
