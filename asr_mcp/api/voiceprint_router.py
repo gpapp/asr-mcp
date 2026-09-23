@@ -1,9 +1,11 @@
+import asyncio
+import json
 import logging
 import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from asr_mcp.api.schemas import (
     SpeakerRenameRequest, SpeakerMergeRequest,
@@ -13,6 +15,7 @@ from asr_mcp.api.schemas import (
 )
 from asr_mcp.api.security import get_current_user
 from asr_mcp.config.settings import Settings, get_settings
+from asr_mcp.core import job_state
 
 logger = logging.getLogger("asr_mcp.api.voiceprint_router")
 router = APIRouter(prefix="/voiceprint", tags=["Voiceprint"])
@@ -160,3 +163,78 @@ async def rescan_voices(
 ):
     service = _get_service(settings, ensure_gpu=True)
     return service.rescan_voices_dir(user_id=user_id)
+
+
+def _safe_json(obj):
+    if hasattr(obj, 'model_dump'):
+        return obj.model_dump()
+    if isinstance(obj, dict):
+        return {k: _safe_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_safe_json(i) for i in obj]
+    return obj
+
+
+async def _sse_put(queue: asyncio.Queue, evt) -> None:
+    await queue.put(evt)
+    job_state.publish(evt)
+    await asyncio.sleep(0.01)
+
+
+@router.post("/rescan/stream")
+async def rescan_voices_stream(
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    busy = job_state.get_running()
+    if busy is not None:
+        from fastapi.responses import JSONResponse
+        content = {"detail": "Another job is already running"}
+        if busy.user_id == user_id:
+            content["job"] = busy.meta()
+        return JSONResponse(status_code=409, content=content)
+
+    service = _get_service(settings, ensure_gpu=True)
+
+    queue: asyncio.Queue = asyncio.Queue()
+    job = job_state.start_job(mode="rescan", filename="voiceprint_directory", user_id=user_id)
+    loop = asyncio.get_running_loop()
+
+    def _threadsafe_progress(evt: dict):
+        def _do():
+            queue.put_nowait(evt)
+            job_state.publish(evt)
+        loop.call_soon_threadsafe(_do)
+
+    async def run_rescan():
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: service.rescan_voices_dir(user_id=user_id, progress_callback=_threadsafe_progress),
+            )
+            await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": result})
+        except Exception as e:
+            logger.error("Rescan failed: %s", e)
+            await _sse_put(queue, {"stage": "error", "error": str(e)})
+        finally:
+            job_state.ensure_finished(job)
+            await queue.put(None)
+
+    asyncio.create_task(run_rescan())
+
+    async def event_stream():
+        while True:
+            evt = await queue.get()
+            if evt is None:
+                break
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )

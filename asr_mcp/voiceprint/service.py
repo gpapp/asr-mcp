@@ -291,10 +291,25 @@ class VoiceprintService:
             "snippets_moved": len(secondary_snippets),
         }
 
-    def rescan_voices_dir(self, user_id: str = DEFAULT_USER) -> dict:
+    def rescan_voices_dir(
+        self, user_id: str = DEFAULT_USER, progress_callback=None,
+    ) -> dict:
+        """Scan the voices directory and register new snippets.
+
+        ``progress_callback(evt: dict)`` is invoked (optionally) after each
+        file, so an SSE stream can reflect live scan/add/refine state.
+        """
         user_dir = self._voices_dir / user_id
         if not user_dir.exists():
             return {"scanned": 0, "added": 0, "speakers": []}
+
+        def _progress(evt: dict):
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(evt)
+            except Exception as e:
+                logger.warning("Progress callback error: %s", e)
 
         existing_paths = set()
         for speaker_name in self._snippets.all_speakers(user_id=user_id):
@@ -306,6 +321,14 @@ class VoiceprintService:
         scanned = 0
         speakers_found = []
 
+        total_files = 0
+        for speaker_dir in sorted(user_dir.iterdir()):
+            if not speaker_dir.is_dir():
+                continue
+            for audio_file in speaker_dir.iterdir():
+                if audio_file.is_file() and audio_file.suffix.lower() in audio_exts:
+                    total_files += 1
+
         for speaker_dir in sorted(user_dir.iterdir()):
             if not speaker_dir.is_dir():
                 continue
@@ -316,6 +339,13 @@ class VoiceprintService:
                 if not audio_file.is_file() or audio_file.suffix.lower() not in audio_exts:
                     continue
                 scanned += 1
+                _progress({
+                    "stage": "Scanning voices directory",
+                    "speaker": speaker_name,
+                    "scanned": scanned,
+                    "added": added,
+                    "progress": (scanned / total_files) if total_files else 0.0,
+                })
                 if str(audio_file) in existing_paths:
                     continue
 
@@ -336,13 +366,26 @@ class VoiceprintService:
                     )
                     existing_paths.add(str(audio_file))
                     added += 1
+                    _progress({
+                        "stage": f"Added snippet for {speaker_name}",
+                        "speaker": speaker_name,
+                        "scanned": scanned,
+                        "added": added,
+                        "progress": (scanned / total_files) if total_files else 0.0,
+                    })
                 except Exception as e:
                     logger.warning("Failed to scan %s: %s", audio_file, e)
 
-        for speaker_name in speakers_found:
             sn_count = self._snippets.count(speaker_name, user_id=user_id)
             if sn_count > 0:
-                self._auto_refine(speaker_name, user_id=user_id)
+                _progress({
+                    "stage": f"Refining voiceprint for {speaker_name}",
+                    "speaker": speaker_name,
+                    "scanned": scanned,
+                    "added": added,
+                    "progress": (scanned / total_files) if total_files else 0.0,
+                })
+                self._auto_refine(speaker_name, user_id=user_id, progress_callback=_progress)
 
         return {
             "scanned": scanned,
@@ -433,7 +476,7 @@ class VoiceprintService:
 
         return collected
 
-    def _auto_refine(self, speaker_name: str, user_id: str = DEFAULT_USER):
+    def _auto_refine(self, speaker_name: str, user_id: str = DEFAULT_USER, progress_callback=None):
         if self._emb_session() is None:
             logger.warning("No embedding session, skipping auto-refine for %s", speaker_name)
             return
@@ -458,13 +501,18 @@ class VoiceprintService:
             return
 
         embeddings = []
-        for waveform in waveforms:
+        for i, waveform in enumerate(waveforms):
             try:
                 emb = extract_embedding(waveform, SAMPLE_RATE, self._emb_session())
                 embeddings.append(emb)
             except Exception as e:
                 logger.warning("Failed to embed snippet: %s", e)
                 embeddings.append(None)
+            if progress_callback:
+                progress_callback({
+                    "stage": f"Embedding snippet {i + 1}/{len(waveforms)} for {speaker_name}",
+                    "speaker": speaker_name,
+                })
 
         valid = [(e, d) for e, d in zip(embeddings, durations) if e is not None]
         if not valid:
