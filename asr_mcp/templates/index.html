@@ -102,8 +102,8 @@
             <div class="card-body">
                 <div class="upload-area" id="uploadArea" onclick="document.getElementById('audioFile').click()">
                     <p>Drop an audio file here or click to browse</p>
-                    <input type="file" id="audioFile" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.webm,.opus" multiple onchange="fileSelected(this)">
-                    <div class="formats">WAV, MP3, FLAC, OGG, M4A, WebM, Opus</div>
+                    <input type="file" id="audioFile" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus" multiple onchange="fileSelected(this)">
+                    <div class="formats">WAV, MP3, MP4, MKV, FLAC, OGG, M4A, WebM, Opus</div>
                 </div>
                 <div id="fileName" style="margin-top:0.8rem;font-size:0.85rem;color:#555;display:none;"></div>
 
@@ -274,7 +274,15 @@
             const files = input.files;
             const el = document.getElementById('fileName');
             const btn = document.getElementById('processBtn');
-            if (files.length > 0) {
+            const ALLOWED = ['.wav','.mp3','.mp4','.mkv','.flac','.ogg','.m4a','.webm','.opus'];
+            const bad = [...files].filter(f => {
+                const dot = f.name.lastIndexOf('.');
+                return dot < 0 || !ALLOWED.includes(f.name.slice(dot).toLowerCase());
+            });
+            if (bad.length) {
+                el.textContent = 'Skipped unsupported file(s): ' + bad.map(f => f.name).join(', ');
+                el.style.display = 'block';
+            } else if (files.length > 0) {
                 if (files.length === 1) {
                     el.textContent = files[0].name;
                 } else {
@@ -282,10 +290,13 @@
                 }
                 el.style.display = 'block';
                 btn.disabled = false;
+                return;
             } else {
                 el.style.display = 'none';
                 btn.disabled = true;
+                return;
             }
+            btn.disabled = true;
         }
 
         const uploadArea = document.getElementById('uploadArea');

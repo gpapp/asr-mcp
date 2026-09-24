@@ -11,6 +11,18 @@ logger = logging.getLogger("asr_mcp.api.security")
 
 DEFAULT_USER = "default"
 
+SUPPORTED_AUDIO_EXTS = {
+    ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm", ".opus", ".mkv", ".mp4",
+}
+
+
+def validate_upload_filename(filename: str) -> str:
+    """Verify an uploaded file's extension is a supported audio/video format."""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_AUDIO_EXTS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file format: {suffix or filename}")
+    return filename
+
 
 async def verify_api_key(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
@@ -50,6 +62,6 @@ def validate_path_security(path: str, settings: Settings) -> Path:
     resolved = p.resolve()
     if not any(str(resolved).startswith(str(d.resolve())) for d in allowed_dirs if d.exists()):
         raise HTTPException(status_code=403, detail="Path not in allowed directories")
-    if p.suffix.lower() not in [".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm", ".opus"]:
+    if p.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
         raise HTTPException(status_code=400, detail="Unsupported audio format")
     return p

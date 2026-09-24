@@ -10,7 +10,7 @@ from asr_mcp.api.schemas import (
     SpeakerRegisterRequest, SpeakerIdentifyRequest,
     SpeakerIdentifyResponse, SpeakerInfoResponse, SpeakerListResponse,
 )
-from asr_mcp.api.security import verify_api_key
+from asr_mcp.api.security import verify_api_key, validate_upload_filename
 from asr_mcp.config.settings import Settings, get_settings
 
 logger = logging.getLogger("asr_mcp.api.speaker_router")
@@ -58,6 +58,8 @@ async def register_speaker_upload(
     content = await file.read()
     if len(content) > 200 * 1024 * 1024:
         return {"error": "File too large"}
+
+    validate_upload_filename(file.filename)
 
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_path = tmp_dir / file.filename

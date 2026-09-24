@@ -200,7 +200,7 @@
                 </ul>
                 <div class="form-inline">
                     <span style="font-size:0.85rem;font-weight:500;">Add snippet:</span>
-                    <input type="file" id="upload-${name}" accept="audio/*">
+                    <input type="file" id="upload-${name}" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus">
                     <button class="btn btn-primary btn-sm" onclick="uploadSnippet('${escHtml(name)}')">Upload</button>
                     <button class="btn btn-warning btn-sm" onclick="renamePrompt('${escHtml(name)}')">Rename</button>
                     <button class="btn btn-danger btn-sm" onclick="deleteSpeaker('${escHtml(name)}')">Delete Speaker</button>
@@ -222,6 +222,14 @@
     async function uploadSnippet(name) {
         const input = document.getElementById('upload-' + name);
         if (!input.files[0]) { toast('Select a file first', true); return; }
+        const f = input.files[0];
+        const dot = f.name.lastIndexOf('.');
+        const ALLOWED = ['.wav','.mp3','.mp4','.mkv','.flac','.ogg','.m4a','.webm','.opus'];
+        if (dot < 0 || !ALLOWED.includes(f.name.slice(dot).toLowerCase())) {
+            toast('Unsupported file format: ' + f.name, true);
+            input.value = '';
+            return;
+        }
         const form = new FormData();
         form.append('file', input.files[0]);
         await apiFetch('/speakers/' + encodeURIComponent(name) + '/upload', { method: 'POST', body: form });

@@ -331,7 +331,7 @@ class VoiceprintService:
             for sn in self._snippets.list_by_speaker(speaker_name, user_id=user_id):
                 existing[sn["file_path"]] = sn
 
-        audio_exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+        audio_exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".mkv", ".mp4", ".webm", ".opus"}
         added = 0
         scanned = 0
         new_speakers = set()

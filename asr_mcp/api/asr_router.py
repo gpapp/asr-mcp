@@ -13,7 +13,7 @@ from asr_mcp.api.schemas import (
     DiarizeRequest, DiarizeResponse, DiarizeResult,
     TranscribeResponse, TranscribeResult,
 )
-from asr_mcp.api.security import verify_api_key, get_current_user
+from asr_mcp.api.security import verify_api_key, get_current_user, validate_upload_filename
 from asr_mcp.api.auth import get_session_user
 from asr_mcp.config.settings import Settings, get_settings
 from asr_mcp.core import job_state
@@ -705,6 +705,8 @@ async def diarize_upload(
     if len(content) > 200 * 1024 * 1024:
         return JSONResponse(status_code=413, detail="File too large (max 200MB)")
 
+    validate_upload_filename(file.filename)
+
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_path = tmp_dir / file.filename
     tmp_path.write_bytes(content)
@@ -862,6 +864,8 @@ async def transcribe_upload(
     content = await file.read()
     if len(content) > 200 * 1024 * 1024:
         return JSONResponse(status_code=413, content={"detail": "File too large (max 200MB)"})
+
+    validate_upload_filename(file.filename)
 
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_path = tmp_dir / file.filename

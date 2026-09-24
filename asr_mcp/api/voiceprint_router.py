@@ -13,7 +13,7 @@ from asr_mcp.api.schemas import (
     VoiceprintSpeakerListResponse, VoiceprintSnippetListResponse,
     RescanResponse,
 )
-from asr_mcp.api.security import get_current_user
+from asr_mcp.api.security import get_current_user, validate_upload_filename
 from asr_mcp.config.settings import Settings, get_settings
 from asr_mcp.core import job_state
 
@@ -88,6 +88,8 @@ async def upload_snippet(
     content = await file.read()
     if len(content) > 200 * 1024 * 1024:
         return {"error": "File too large (max 200MB)"}
+
+    validate_upload_filename(file.filename)
 
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_path = tmp_dir / file.filename
