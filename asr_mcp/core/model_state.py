@@ -196,6 +196,7 @@ class ModelState:
             from asr_mcp.config.settings import get_settings
             self.settings = get_settings()
         from asr_mcp.core.model_loader import load_models, reload_encoder_session, reload_embedding_session
+        import gc
         try:
             cold = (
                 self.tokens is None
@@ -204,8 +205,25 @@ class ModelState:
                 and self.embedding_session is None
                 and self.vad_session is None
             )
+            # load_models() rebuilds the GPU sessions from scratch; if it is
+            # needed we must drop any partially-loaded sessions FIRST, otherwise
+            # the fresh encoder/embedding arenas peak together with the ones we
+            # just (re)loaded -> CUDA OOM on the residual allocation.
+            full_needed = (
+                self.decoder_session is None
+                or self.vad_session is None
+                or self.tokens is None
+            )
             if cold:
                 logger.info("Cold-loading all models...")
+                load_models(self.settings)
+            elif full_needed:
+                logger.info("Hard-reloading all models (clearing partial sessions)...")
+                self.encoder_session = None
+                self.decoder_session = None
+                self.embedding_session = None
+                self.vad_session = None
+                gc.collect()
                 load_models(self.settings)
             else:
                 if self.encoder_session is None:
@@ -214,9 +232,6 @@ class ModelState:
                 if self.embedding_session is None:
                     logger.info("Loading embedding session (partial)...")
                     reload_embedding_session(self.settings)
-                if self.decoder_session is None or self.vad_session is None or self.tokens is None:
-                    logger.info("Loading remaining models (full reload)...")
-                    load_models(self.settings)
             self.touch()
             if self.is_ready:
                 logger.info("Models ready")

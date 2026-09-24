@@ -3,7 +3,7 @@
     "default_threshold": 0.35,
     "max_clusters": 15,
     "distance_threshold": 0.65,
-    "merge_threshold": 0.40,
+    "merge_threshold": 0.25,
     "close_match_threshold": 0.17,
     "min_segment_duration": 0.5,
     "min_cluster_duration_sec": 3.0,
@@ -12,7 +12,7 @@
   "matching": {
     "accept_threshold": 0.35,
     "clear_winner_gap": 0.02,
-    "embed_only_threshold": 0.30,
+    "embed_only_threshold": 0.16,
     "confidence_threshold": 0.3,
     "embed_only_accept_threshold": 0.22
   },
@@ -57,8 +57,8 @@
     "confidence_max_distance": 0.5
   },
   "vad": {
-    "default_threshold": 0.35,
-    "min_speech_duration_ms": 300,
+    "default_threshold": 0.5,
+    "min_speech_duration_ms": 250,
     "chunk_duration": 30,
     "overlap": 5
   },
