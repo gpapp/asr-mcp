@@ -11,7 +11,7 @@ from sklearn.cluster import AgglomerativeClustering
 
 from asr_mcp.core.model_state import state, GPU_SHRINK_RUN_OPTIONS
 from asr_mcp.diarization.clustering import (
-    cap_clusters, greedy_merge_clusters, merge_similar_speakers, match_known_speakers_full,
+    cap_clusters, greedy_merge_clusters, match_known_speakers_full,
 )
 from asr_mcp.diarization.overlap import detect_overlaps, build_overlap_segments
 from asr_mcp.diarization.segment_ops import (
@@ -122,13 +122,15 @@ class Diarizer:
         # Step 5c: Detect overlaps
         overlap_cfg = cfg.get("overlap", {})
         if overlap_cfg.get("enabled", True):
+            proximity_ratio = overlap_cfg.get("proximity_ratio", 0.08)
+            min_distance = overlap_cfg.get("min_distance", 0.40)
             detect_overlaps(
-                all_segments_meta,
                 raw_embeddings,
                 cluster_centroids,
                 embeddable_indices,
-                margin_threshold=overlap_cfg.get("margin_threshold", 0.08),
-                min_energy_percentile=overlap_cfg.get("min_energy_percentile", 0.40),
+                all_segments_meta,
+                proximity_ratio=proximity_ratio,
+                min_distance=min_distance,
             )
 
         if progress_callback:
@@ -137,9 +139,14 @@ class Diarizer:
         # Step 6: Map labels -> "Speaker N" and build contiguous segments
         merged_segments, speaker_map = self._map_to_speakers(all_segments_meta, cfg)
 
-        # Step 7: Boundary refinement
-        merged_segments = self._refine_boundaries(
-            merged_segments, all_segments_meta, embeddable_indices,
+        # Step 7: Split single-speaker segments vs OVERLAP
+        ov_segments = [s for s in merged_segments if s.get("speaker") == "OVERLAP"]
+        non_ov = [s for s in merged_segments if s.get("speaker") != "OVERLAP"]
+
+        non_ov = absorb_islands(non_ov)
+
+        non_ov = self._refine_boundaries(
+            non_ov, all_segments_meta, embeddable_indices,
             raw_embeddings, waveform, sample_rate
         )
 
@@ -147,56 +154,60 @@ class Diarizer:
             await progress_callback({"stage": "Profiling speakers", "progress": 0.8})
 
         # Step 8: Speaker profiling
-        profiles = profile_speakers(waveform, merged_segments, sample_rate)
+        profiles = profile_speakers(waveform, non_ov, sample_rate)
 
-        # Step 8b: Merge similar speakers
-        merged_segments, cluster_centroids, profiles = merge_similar_speakers(
-            merged_segments, raw_embeddings, long_labels,
-            cluster_centroids, profiles, cfg,
-        )
+        # Step 8b: Relabel by pitch
+        non_ov, profiles, pitch_remap = relabel_by_pitch(non_ov, profiles)
 
-        # Step 8c: Relabel by pitch
-        merged_segments, profiles, label_map = relabel_by_pitch(merged_segments, profiles)
-
-        # Renumber cluster_centroids
-        old_to_new = {}
-        for old_name, new_name in label_map.items():
-            if old_name.startswith("Speaker ") and new_name.startswith("Speaker "):
-                try:
-                    old_num = int(old_name.split()[-1]) - 1
-                    new_num_val = int(new_name.split()[-1]) - 1
-                    old_to_new[old_num] = new_num_val
-                except (ValueError, IndexError):
-                    pass
-        renumbered_centroids = {}
-        for old_num, centroid in cluster_centroids.items():
-            if old_num in old_to_new:
-                renumbered_centroids[old_to_new[old_num]] = centroid
-        cluster_centroids = renumbered_centroids
+        # Inject cluster centroid embeddings into every speaker's profile
+        centroid_emb_map = {}
+        for raw_cluster, init_name in speaker_map.items():
+            if raw_cluster in cluster_centroids:
+                centroid_emb_map[init_name] = cluster_centroids[raw_cluster].tolist()
+        for init_name, final_name in pitch_remap.items():
+            if init_name in centroid_emb_map:
+                if final_name not in profiles:
+                    profiles[final_name] = {}
+                profiles[final_name]["embedding"] = centroid_emb_map[init_name]
 
         # Step 9: Known speaker matching (BEFORE ghost elimination so alternatives are populated)
         if known_speakers:
-            merged_segments, profiles = match_known_speakers_full(
-                merged_segments, all_segments_meta, embeddable_indices,
+            non_ov, profiles = match_known_speakers_full(
+                non_ov, all_segments_meta, embeddable_indices,
                 raw_embeddings, cluster_centroids, profiles, known_speakers, cfg,
                 renumber=True,
             )
 
         # Step 10: Ghost elimination (uses seg["alternatives"] if populated by matching)
-        merged_segments = eliminate_ghost_speakers(merged_segments, profiles, min_duration=10.0)
+        non_ov = eliminate_ghost_speakers(non_ov, profiles=profiles, min_duration=10.0)
 
         # Step 11: Absorb minority speakers (safeguards matched known voiceprints)
         known_names = set(known_speakers.keys()) if known_speakers else set()
-        merged_segments = absorb_minority_speakers(
-            merged_segments, max_utterance_sec=5.0, min_speaker_dur=8.0,
+        non_ov = absorb_minority_speakers(
+            non_ov, max_utterance_sec=5.0, min_speaker_dur=8.0,
             protected_speakers=known_names,
         )
 
         # Step 12: Exact turn boundary refinement using raw VAD sections
         if self._raw_vad_sections:
-            merged_segments = await self._refine_turn_boundaries_exact(
-                merged_segments, waveform_np, sample_rate, profiles, known_speakers or {}
-            )
+            try:
+                non_ov = await self._refine_turn_boundaries_exact(
+                    non_ov, waveform_np, sample_rate, profiles, known_speakers or {}
+                )
+            except Exception as e:
+                logger.warning("Exact turn boundary refinement failed: %s", e)
+
+        # Recombine with overlap segments
+        merged_segments = sorted(non_ov + ov_segments, key=lambda x: x["start"])
+        resolved = []
+        for seg in merged_segments:
+            if resolved and seg["start"] < resolved[-1]["end"]:
+                mid = (seg["start"] + resolved[-1]["end"]) / 2.0
+                resolved[-1]["end"] = mid
+                seg["start"] = mid
+            if seg["end"] > seg["start"]:
+                resolved.append(seg)
+        merged_segments = resolved
 
         if progress_callback:
             await progress_callback({"stage": "diarization_finished", "progress": 1.0})

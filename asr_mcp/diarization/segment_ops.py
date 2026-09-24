@@ -20,32 +20,27 @@ def collapse_same_speaker_segments(segments: list, max_gap: float = 0.5) -> list
 
 
 def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
-    if len(segments) < 3:
-        return segments
-    result = [segments[0].copy()]
-    for i in range(1, len(segments)):
-        curr = segments[i]
-        if i < len(segments) - 1:
-            prev_speaker = result[-1].get("speaker")
-            next_speaker = segments[i + 1].get("speaker")
-            curr_speaker = curr.get("speaker")
-            curr_dur = curr.get("end", 0) - curr.get("start", 0)
+    """Absorb short segments sandwiched between the same speaker on both sides.
 
-            if (curr_speaker != prev_speaker
-                    and curr_speaker != next_speaker
-                    and prev_speaker == next_speaker
-                    and curr_dur < min_island_dur):
-                curr["speaker"] = prev_speaker
-                logger.debug("Absorbed island at %.1f-%.1f (%.1fs) into %s",
-                             curr.get("start", 0), curr.get("end", 0), curr_dur, prev_speaker)
-
-        if (curr.get("speaker") == result[-1].get("speaker")
-                and curr.get("start", 0) - result[-1].get("end", 0) <= 0.5):
-            result[-1]["end"] = curr.get("end", result[-1].get("end"))
-        else:
-            result.append(curr.copy())
-
-    return result
+    OVERLAP segments are never absorbed — they represent genuine multi-speaker
+    activity even when brief.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for i in range(1, len(segments) - 1):
+            seg = segments[i]
+            if seg.get("speaker") == "OVERLAP":
+                continue
+            dur = seg.get("end", 0) - seg.get("start", 0)
+            prev_spk = segments[i - 1].get("speaker")
+            next_spk = segments[i + 1].get("speaker")
+            if dur < min_island_dur and prev_spk == next_spk and seg.get("speaker") != prev_spk:
+                seg["speaker"] = prev_spk
+                changed = True
+        if changed:
+            segments = collapse_same_speaker_segments(segments, max_gap=1.0)
+    return segments
 
 
 def absorb_minority_speakers(
