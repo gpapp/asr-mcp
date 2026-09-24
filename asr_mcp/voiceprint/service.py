@@ -313,7 +313,7 @@ class VoiceprintService:
         }
 
     def rescan_voices_dir(
-        self, user_id: str = DEFAULT_USER, progress_callback=None,
+        self, user_id: str = DEFAULT_USER, progress_callback=None, force: bool = False,
     ) -> dict:
         """Scan the voices directory; add new snippets and rebuild stale voiceprints.
 
@@ -444,6 +444,7 @@ class VoiceprintService:
             scanned=scanned,
             added=added,
             progress_callback=_progress,
+            force_rebuild=force,
         )
 
     def _rebuild_after_rescan(
@@ -455,23 +456,27 @@ class VoiceprintService:
         scanned: int,
         added: int,
         progress_callback=None,
+        force_rebuild: bool = False,
     ) -> dict:
         """Invalidate changed voiceprints and rebuild all missing ones.
 
         Speakers rebuilt = new dirs with snippets ∪ speakers whose snippet
         changed (voiceprint invalidated first) ∪ speakers that have snippets
-        but no voiceprint row (missing). Unchanged speakers are left alone.
+        but no voiceprint row (missing), or all speakers when force_rebuild=True.
         """
         invalidated = 0
         rebuilt = 0
 
-        targets = set(new_speakers) | set(changed_speakers)
-        for speaker_name in speakers_found:
-            if speaker_name in targets:
-                continue
-            if self._snippets.count(speaker_name, user_id=user_id) > 0 \
-                    and self._db.get(speaker_name, user_id=user_id) is None:
-                targets.add(speaker_name)
+        if force_rebuild:
+            targets = set(speakers_found)
+        else:
+            targets = set(new_speakers) | set(changed_speakers)
+            for speaker_name in speakers_found:
+                if speaker_name in targets:
+                    continue
+                if self._snippets.count(speaker_name, user_id=user_id) > 0 \
+                        and self._db.get(speaker_name, user_id=user_id) is None:
+                    targets.add(speaker_name)
 
         for speaker_name in sorted(targets):
             if speaker_name in changed_speakers:
@@ -632,18 +637,6 @@ class VoiceprintService:
         if norm > 0:
             new_embedding = new_embedding / norm
 
-        existing = self._db.get(speaker_name, user_id=user_id)
-        if existing and existing.get("embedding") is not None:
-            old_emb = existing["embedding"]
-            old_dur = existing.get("total_speech_sec", 0)
-            if old_dur + total_dur > 0:
-                blend_weight = old_dur / (old_dur + total_dur)
-                new_embedding = blend_weight * old_emb + (1 - blend_weight) * new_embedding
-                norm = np.linalg.norm(new_embedding)
-                if norm > 0:
-                    new_embedding = new_embedding / norm
-            total_dur += old_dur
-
         combined = torch.cat(waveforms, dim=-1)
         pitch_hz, pitch_std = compute_pitch(combined, SAMPLE_RATE)
         energy_rms = compute_energy(combined)
@@ -652,7 +645,10 @@ class VoiceprintService:
             name=speaker_name, user_id=user_id,
             embedding=new_embedding,
             pitch_hz=pitch_hz, pitch_std=pitch_std, energy_rms=energy_rms,
+            spectral_centroid=0.0,
+            spectral_rolloff=0.0,
             total_speech_sec=total_dur, sample_count=len(valid),
+            mfcc=None,
         )
         logger.info("Auto-refined voiceprint for %s (user=%s): %.1fs, %d snippets",
                      speaker_name, user_id, total_dur, len(valid))

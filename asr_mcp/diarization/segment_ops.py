@@ -214,7 +214,7 @@ def merge_profiles(profiles: dict, target: str, source: str):
     total = t_dur + s_dur
     if total <= 0:
         return
-    for field in ["pitch_hz", "pitch_std", "energy_rms", "spectral_centroid", "spectral_rolloff"]:
+    for field in ["pitch_hz", "pitch_std", "energy_rms"]:
         t_val = t.get(field, 0)
         s_val = s.get(field, 0)
         t[field] = (t_val * t_dur + s_val * s_dur) / total

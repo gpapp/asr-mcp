@@ -7,65 +7,19 @@ logger = logging.getLogger("asr_mcp.speaker.matcher")
 
 _DEFAULT_CFG = {
     "weights": {
-        "embedding": 0.6,
-        "pitch": 0.15,
-        "energy": 0.0,
-        "spectral": 0.1,
-        "mfcc": 0.1,
+        "embedding": 0.9,
+        "pitch": 0.1,
     },
     "matching": {
         "accept_threshold": 0.35,
         "clear_winner_gap": 0.02,
         "embed_only_threshold": 0.16,
-        "embed_only_accept_threshold": 0.22,
     },
     "normalization": {
         "pitch_hz_per_unit": 50,
-        "energy_rms_per_unit": 0.05,
-        "spectral_centroid_per_unit": 500,
-        "spectral_rolloff_per_unit": 1000,
+        "confidence_max_distance": 0.5,
     },
 }
-
-
-def _compute_spectral_distance(cluster: dict, voiceprint: dict, norm_cfg: dict) -> float:
-    c_centroid = cluster.get("spectral_centroid", 0.0)
-    v_centroid = voiceprint.get("spectral_centroid", 0.0)
-    c_rolloff = cluster.get("spectral_rolloff", 0.0)
-    v_rolloff = voiceprint.get("spectral_rolloff", 0.0)
-
-    centroid_per = norm_cfg.get("spectral_centroid_per_unit", 500)
-    rolloff_per = norm_cfg.get("spectral_rolloff_per_unit", 1000)
-
-    d_centroid = abs(c_centroid - v_centroid) / centroid_per if centroid_per else 0.0
-    d_rolloff = abs(c_rolloff - v_rolloff) / rolloff_per if rolloff_per else 0.0
-
-    return (d_centroid + d_rolloff) / 2.0
-
-
-def _compute_mfcc_distance(cluster: dict, voiceprint: dict, norm_cfg: dict) -> float:
-    c_mfcc = cluster.get("mfcc", {})
-    v_mfcc = voiceprint.get("mfcc", {})
-    if not c_mfcc or not v_mfcc:
-        return 0.5
-
-    total_dist = 0.0
-    count = 0
-    for i in range(13):
-        c_mean = c_mfcc.get(f"mfcc{i}_mean", 0.0)
-        v_mean = v_mfcc.get(f"mfcc{i}_mean", 0.0)
-        c_std = c_mfcc.get(f"mfcc{i}_std", 1.0)
-        v_std = v_mfcc.get(f"mfcc{i}_std", 1.0)
-
-        mean_per = norm_cfg.get(f"mfcc{i}_mean_per_unit", 5)
-        std_per = norm_cfg.get(f"mfcc{i}_std_per_unit", 3)
-
-        d_mean = abs(c_mean - v_mean) / mean_per if mean_per else 0.0
-        d_std = abs(c_std - v_std) / std_per if std_per else 0.0
-        total_dist += (d_mean + d_std) / 2.0
-        count += 1
-
-    return total_dist / max(count, 1)
 
 
 def compute_distance(
@@ -88,14 +42,8 @@ def compute_distance(
             "combined": 1.0,
             "embedding": 1.0,
             "emb_dist": 1.0,
-            "pitch": 0.5,
-            "pitch_dist": 0.5,
-            "energy": 0.5,
-            "energy_dist": 0.5,
-            "spectral": 0.5,
-            "spectral_dist": 0.5,
-            "mfcc": 0.5,
-            "mfcc_dist": 0.5,
+            "pitch": 0.0,
+            "pitch_dist": 0.0,
             "confidence": 0.0,
         }
 
@@ -103,27 +51,14 @@ def compute_distance(
                            (np.linalg.norm(cluster_emb) * np.linalg.norm(vp_emb) + 1e-8))
 
     pitch_per = norm_cfg.get("pitch_hz_per_unit", 50)
-    energy_per = norm_cfg.get("energy_rms_per_unit", 0.05)
     vp_pitch = voiceprint.get("pitch_hz", 0.0) or 0.0
-    vp_energy = voiceprint.get("energy_rms", 0.0) or 0.0
 
-    pitch_dist = abs(cluster_pitch - vp_pitch) / pitch_per if (pitch_per and cluster_pitch > 0 and vp_pitch > 0) else 0.5
-    energy_dist = abs(cluster_energy - vp_energy) / energy_per if (energy_per and cluster_energy > 0 and vp_energy > 0) else 0.5
+    pitch_dist = abs(cluster_pitch - vp_pitch) / pitch_per if (pitch_per and cluster_pitch > 0 and vp_pitch > 0) else 0.0
 
-    if cluster_features:
-        spectral_dist = _compute_spectral_distance(cluster_features, voiceprint, norm_cfg)
-        mfcc_dist = _compute_mfcc_distance(cluster_features, voiceprint, norm_cfg)
-    else:
-        spectral_dist = 0.0
-        mfcc_dist = 0.0
-
-    total = (
-        weights.get("embedding", 0.6) * emb_dist
-        + weights.get("pitch", 0.15) * min(pitch_dist, 1.0)
-        + weights.get("energy", 0.0) * min(energy_dist, 1.0)
-        + weights.get("spectral", 0.1) * min(spectral_dist, 1.0)
-        + weights.get("mfcc", 0.1) * min(mfcc_dist, 1.0)
-    )
+    w_emb = weights.get("embedding", 0.9)
+    w_pitch = weights.get("pitch", 0.1)
+    total_w = w_emb + w_pitch
+    total = (w_emb * emb_dist + w_pitch * min(pitch_dist, 1.0)) / (total_w if total_w > 0 else 1.0)
 
     if is_known_speaker:
         bias = cfg.get("matching", {}).get("known_speaker_margin_bias", 0.0)
@@ -142,12 +77,6 @@ def compute_distance(
         "emb_dist": round(float(emb_dist), 4),
         "pitch": round(float(pitch_dist), 4),
         "pitch_dist": round(float(pitch_dist), 4),
-        "energy": round(float(energy_dist), 4),
-        "energy_dist": round(float(energy_dist), 4),
-        "spectral": round(float(spectral_dist), 4),
-        "spectral_dist": round(float(spectral_dist), 4),
-        "mfcc": round(float(mfcc_dist), 4),
-        "mfcc_dist": round(float(mfcc_dist), 4),
         "confidence": round(float(confidence), 4),
     }
 
@@ -247,14 +176,10 @@ def match_clusters(
 
         clear_winner = is_clear_winner(matches, voiceprints, cfg)
 
-        if all_distances.get(best_name, {}).get("emb_dist", 1.0) < embed_only_thresh:
-            effective_threshold = embed_only_accept
-        else:
-            effective_threshold = accept_thresh
-
+        is_strong_embed = all_distances.get(best_name, {}).get("emb_dist", 1.0) < embed_only_thresh
         matched = (
             best_name is not None and
-            best_dist <= effective_threshold and
+            (is_strong_embed or best_dist <= accept_thresh) and
             clear_winner
         )
 

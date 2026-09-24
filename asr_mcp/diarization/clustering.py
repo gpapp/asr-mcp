@@ -133,9 +133,6 @@ def merge_similar_speakers(
             "embedding": cluster_centroids[label].tolist(),
             "pitch_hz": profile.get("pitch_hz", 0.0),
             "energy_rms": profile.get("energy_rms", 0.0),
-            "spectral_centroid": profile.get("spectral_centroid", 0.0),
-            "spectral_rolloff": profile.get("spectral_rolloff", 0.0),
-            "mfcc": profile.get("mfcc", {}),
             "total_speech_sec": profile.get("total_speech_sec", 0.0),
         }
 
@@ -209,12 +206,10 @@ def merge_similar_speakers(
                 p = profiles[src_name]
                 d = p.get("total_speech_sec", 0)
                 total_dur += d
-                for field in ["pitch_hz", "pitch_std", "energy_rms", "spectral_centroid", "spectral_rolloff"]:
+                for field in ["pitch_hz", "pitch_std", "energy_rms"]:
                     merged_profile[field] = merged_profile.get(field, 0) + p.get(field, 0) * d
-                if "mfcc" in p and not merged_profile.get("mfcc"):
-                    merged_profile["mfcc"] = p["mfcc"]
         if total_dur > 0:
-            for field in ["pitch_hz", "pitch_std", "energy_rms", "spectral_centroid", "spectral_rolloff"]:
+            for field in ["pitch_hz", "pitch_std", "energy_rms"]:
                 if field in merged_profile:
                     merged_profile[field] /= total_dur
             merged_profile["total_speech_sec"] = total_dur
@@ -279,9 +274,8 @@ def match_known_speakers_full(
                     if raw_id in cluster_centroids:
                         speaker_centroids[spk].append(np.array(cluster_centroids[raw_id]))
 
-    # 2. Build clusters dict with full acoustic features
+    # 2. Build clusters dict
     clusters = {}
-    all_cluster_features = {}
     for spk, emb_list in speaker_centroids.items():
         if not emb_list:
             continue
@@ -297,26 +291,9 @@ def match_known_speakers_full(
             "energy_rms": prof.get("energy_rms", 0.0) or 0.0,
         }
 
-        features = {
-            "spectral_centroid": prof.get("spectral_centroid", 0.0) or 0.0,
-            "spectral_rolloff": prof.get("spectral_rolloff", 0.0) or 0.0,
-        }
-        mfcc = prof.get("mfcc")
-        if isinstance(mfcc, dict):
-            for name, val in mfcc.items():
-                if isinstance(val, (int, float)):
-                    features[name] = float(val)
-        for i in range(13):
-            if f"mfcc{i}_mean" not in features:
-                features[f"mfcc{i}_mean"] = prof.get(f"mfcc{i}_mean", 0.0) or 0.0
-            if f"mfcc{i}_std" not in features:
-                features[f"mfcc{i}_std"] = prof.get(f"mfcc{i}_std", 0.0) or 0.0
-        all_cluster_features[spk] = features
-
     # 3. Match clusters
     match_results = match_clusters(
         clusters, known_speakers, cfg,
-        all_cluster_features=all_cluster_features,
     )
 
     # 4. Build all_matches for post-processing
@@ -521,16 +498,13 @@ def collapse_unknown_speakers_second_pass(
             prof = profiles.get(spk, {})
             pitch = prof.get("pitch_hz", 0.0) or 0.0
             energy = prof.get("energy_rms", 0.0) or 0.0
-            features = {
-                k: v for k, v in prof.items()
-                if k.startswith("mfcc") or k.startswith("spectral")
-            }
 
             best_name, best_dist, second_dist, all_dists = find_best_match(
-                emb.tolist(), pitch, energy, reference_targets, cfg, features
+                emb.tolist(), pitch, energy, reference_targets, cfg
             )
 
-            if not best_name or best_dist > accept_thresh:
+            is_strong = all_dists.get(best_name, {}).get("emb_dist", 1.0) < 0.16
+            if not best_name or (not is_strong and best_dist > accept_thresh):
                 continue
 
             matches = [(n, d["combined"], d["confidence"]) for n, d in all_dists.items()]

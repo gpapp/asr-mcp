@@ -229,7 +229,7 @@ class Diarizer:
 
         return {
             "segments": merged_segments,
-            "profiles": {k: {kk: vv for kk, vv in v.items() if kk != "mfcc"} for k, v in profiles.items()},
+            "profiles": profiles,
             "total_speakers": len(set(s.get("speaker") for s in merged_segments)),
             "total_time_sec": round(total_time, 2),
             "audio_duration_sec": round(audio_duration, 2),
