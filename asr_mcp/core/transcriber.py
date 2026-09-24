@@ -17,21 +17,25 @@ from asr_mcp.core.model_state import state, is_gpu_oom, log_gpu_memory, GPU_SHRI
 
 logger = logging.getLogger("asr_mcp.core.transcriber")
 
-_cpu_encoder_cache: dict[str, ort.InferenceSession] = {}
+_cpu_encoder_session: Optional[ort.InferenceSession] = None
 
 
 def _get_cpu_encoder_session() -> ort.InferenceSession:
-    model_path = state.encoder_session.get_modelmeta().model_path
-    sess = _cpu_encoder_cache.get(model_path)
-    if sess is None:
-        cpu_so = ort.SessionOptions()
-        cpu_so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    global _cpu_encoder_session
+    if _cpu_encoder_session is None:
+        from asr_mcp.core.model_loader import get_session_options
+        from asr_mcp.config.settings import get_settings
+        from pathlib import Path
+        settings = getattr(state, "settings", None) or get_settings()
+        model_dir = Path(settings.model_dir)
+        encoder_file = f"onnx/encoder_model{settings.encoder_model_type}.onnx"
+        model_path = str(model_dir / encoder_file)
+        cpu_so = get_session_options(settings)
         logger.warning("Loading CPU encoder fallback session: %s", model_path)
-        sess = ort.InferenceSession(
+        _cpu_encoder_session = ort.InferenceSession(
             model_path, sess_options=cpu_so, providers=["CPUExecutionProvider"],
         )
-        _cpu_encoder_cache[model_path] = sess
-    return sess
+    return _cpu_encoder_session
 
 
 def _run_encoder(feed: dict):

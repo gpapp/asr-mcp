@@ -11,7 +11,23 @@ from asr_mcp.core.model_state import is_gpu_oom, log_gpu_memory, GPU_SHRINK_RUN_
 
 logger = logging.getLogger("asr_mcp.speaker.embedding")
 
-_cpu_embedding_cache: dict[str, ort.InferenceSession] = {}
+_cpu_embedding_session: Optional[ort.InferenceSession] = None
+
+
+def _get_cpu_embedding_session() -> ort.InferenceSession:
+    global _cpu_embedding_session
+    if _cpu_embedding_session is None:
+        from asr_mcp.core.model_loader import ensure_embedding_model, get_session_options
+        from asr_mcp.config.settings import get_settings
+        from asr_mcp.core.model_state import state
+        settings = getattr(state, "settings", None) or get_settings()
+        emb_path = str(ensure_embedding_model(settings))
+        cpu_so = get_session_options(settings)
+        logger.warning("Loading CPU embedding fallback session: %s", emb_path)
+        _cpu_embedding_session = ort.InferenceSession(
+            emb_path, sess_options=cpu_so, providers=["CPUExecutionProvider"],
+        )
+    return _cpu_embedding_session
 
 
 def _run_with_cpu_fallback(session, feed, output_names):
@@ -21,14 +37,8 @@ def _run_with_cpu_fallback(session, feed, output_names):
         if is_gpu_oom(e):
             logger.warning("GPU OOM on embedding, falling back to CPU: %s", e)
             log_gpu_memory("embedding OOM fallback")
-            model_path = session.get_modelmeta().model_path
-            if model_path not in _cpu_embedding_cache:
-                cpu_so = ort.SessionOptions()
-                cpu_so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                _cpu_embedding_cache[model_path] = ort.InferenceSession(
-                    model_path, sess_options=cpu_so, providers=["CPUExecutionProvider"],
-                )
-            return _cpu_embedding_cache[model_path].run(output_names, feed)
+            cpu_sess = _get_cpu_embedding_session()
+            return cpu_sess.run(output_names, feed)
         raise
 
 
