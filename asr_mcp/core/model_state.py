@@ -118,6 +118,7 @@ class ModelState:
         self.decoder_start_token_id = 13764
         self.device = "cpu"
         self.settings = None
+        self.embedding_cache = LRUCache()
         self._last_used: float = 0.0
         self._lock = threading.Lock()
 

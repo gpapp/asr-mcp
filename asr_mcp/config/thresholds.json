@@ -2,12 +2,10 @@
   "diarization": {
     "default_threshold": 0.35,
     "max_clusters": 15,
-    "distance_threshold": 0.65,
+    "distance_threshold": 0.35,
     "merge_threshold": 0.25,
     "close_match_threshold": 0.17,
-    "min_segment_duration": 0.5,
-    "min_cluster_duration_sec": 3.0,
-    "min_cluster_coherence": 0.75
+    "min_segment_duration": 0.5
   },
   "matching": {
     "accept_threshold": 0.35,
@@ -56,11 +54,25 @@
     "mfcc12_std_per_unit": 3,
     "confidence_max_distance": 0.5
   },
+  "overlap": {
+    "proximity_ratio": 0.08,
+    "min_distance": 0.40,
+    "min_duration_sec": 0.5,
+    "max_speaker_gap": 1.0,
+    "max_clarity": 0.08
+  },
   "vad": {
     "default_threshold": 0.5,
     "min_speech_duration_ms": 250,
     "chunk_duration": 30,
     "overlap": 5
+  },
+  "boundary_refine": {
+    "enabled": true,
+    "min_gap_sec": 0.01,
+    "min_section_sec": 0.3,
+    "dip_ratio": 0.35,
+    "min_dip_sec": 0.12
   },
   "debug": false
 }

@@ -522,6 +522,15 @@ class VoiceprintService:
 
         for speaker_name, segs in by_speaker.items():
             final_name = final_names[speaker_name]
+            # Don't auto-collect for spurious/ghost unnamed speakers with <10s total speech
+            total_spk_dur = sum(s.get("end", 0) - s.get("start", 0) for s in segs)
+            is_new_unregistered = (
+                final_name != speaker_name or
+                not self._db.get(final_name, user_id=user_id)
+            )
+            if is_new_unregistered and total_spk_dur < 10.0:
+                continue
+
             if final_name != speaker_name:
                 for seg in segs:
                     seg["speaker"] = final_name

@@ -1,27 +1,31 @@
 import asyncio
+import gc
+import hashlib
 import logging
 import time
 from typing import Optional
 
 import numpy as np
 import torch
+from sklearn.cluster import AgglomerativeClustering
 
-from asr_mcp.core.model_state import state, LRUCache, GPU_SHRINK_RUN_OPTIONS, run_embedding
+from asr_mcp.core.model_state import state, GPU_SHRINK_RUN_OPTIONS
 from asr_mcp.diarization.clustering import (
     cap_clusters, greedy_merge_clusters, merge_similar_speakers, match_known_speakers_full,
 )
+from asr_mcp.diarization.overlap import detect_overlaps, build_overlap_segments
 from asr_mcp.diarization.segment_ops import (
     collapse_same_speaker_segments, absorb_islands, absorb_minority_speakers,
     eliminate_ghost_speakers,
 )
-from asr_mcp.speaker.audio import refine_speaker_boundaries
-from asr_mcp.speaker.embedding import extract_embedding
+from asr_mcp.speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
+from asr_mcp.speaker.embedding import extract_embedding, _run_with_cpu_fallback
 from asr_mcp.speaker.vad import split_at_energy_dips, run_vad_chunked, run_vad_onnx, merge_vad_sections
 from asr_mcp.speaker.profiling import profile_speakers, relabel_by_pitch
 
 logger = logging.getLogger("asr_mcp.diarization.pipeline")
 
-_embedding_cache = LRUCache(max_size=5000)
+MIN_EMBED_DURATION = 0.5
 
 
 class Diarizer:
@@ -47,8 +51,8 @@ class Diarizer:
         progress_callback=None,
     ) -> dict:
         cfg = self._load_cfg()
-        threshold = diarization_threshold or cfg.get("diarization", {}).get("default_threshold", 0.35)
-        v_threshold = vad_threshold or cfg.get("vad", {}).get("default_threshold", 0.5)
+        threshold = diarization_threshold if diarization_threshold is not None else cfg.get("diarization", {}).get("distance_threshold", 0.35)
+        v_threshold = vad_threshold if vad_threshold is not None else cfg.get("vad", {}).get("default_threshold", 0.5)
         min_speech_ms = cfg.get("vad", {}).get("min_speech_duration_ms", 250)
 
         start_time = time.time()
@@ -87,95 +91,74 @@ class Diarizer:
             min_split_piece=2.0,
         )
 
-        # Step 3: Extract one embedding per segment (seconds-based timestamps)
-        all_segments = []
-        all_embeddings = []
-        total_segs = len(speech_ts)
-        for seg_idx, ts in enumerate(speech_ts):
-            if progress_callback:
-                p = 0.15 + 0.45 * ((seg_idx + 1) / max(total_segs, 1))
-                await progress_callback({"stage": f"Extracting embeddings ({seg_idx+1}/{total_segs})", "progress": p})
-            start_sec = float(ts["start"])
-            end_sec = float(ts["end"])
-            dur_sec = end_sec - start_sec
-            if dur_sec < 0.3:
-                continue
-            start_sample = int(start_sec * sample_rate)
-            end_sample = int(end_sec * sample_rate)
-            segment_audio = waveform[..., start_sample:end_sample]
-            all_segments.append({
-                "start": round(start_sec, 3),
-                "end": round(end_sec, 3),
-                "duration": round(dur_sec, 3),
-            })
-            emb = extract_embedding(
-                segment_audio, sample_rate, self._state.embedding_session,
-            )
-            all_embeddings.append(emb)
+        if progress_callback:
+            await progress_callback({"stage": "Extracting features", "progress": 0.2})
 
-        if not all_embeddings:
+        # Step 3: Extract sliding-window fbank features across all speech segments
+        all_fbanks, all_segments_meta, embeddable_indices = self._extract_features(
+            waveform, speech_ts, sample_rate
+        )
+
+        if not all_fbanks:
             return {"segments": [], "total_time_sec": round(time.time() - start_time, 2)}
 
-        raw_embeddings = np.array(all_embeddings, dtype=np.float32)
+        if progress_callback:
+            await progress_callback({"stage": "Extracting embeddings", "progress": 0.4})
+
+        # Step 4: Batched embedding extraction with cache & CMN
+        raw_embeddings = self._extract_embeddings(all_fbanks)
 
         if progress_callback:
             await progress_callback({"stage": "Clustering speakers", "progress": 0.6})
 
         # Step 5: Clustering
-        from sklearn.cluster import AgglomerativeClustering
-        if num_speakers:
-            clustering = AgglomerativeClustering(
-                n_clusters=num_speakers, metric="cosine", linkage="average"
-            )
-        else:
-            distance_threshold = cfg.get("diarization", {}).get("distance_threshold", 0.55)
-            clustering = AgglomerativeClustering(
-                n_clusters=None, distance_threshold=distance_threshold,
-                metric="cosine", linkage="average",
-            )
-        long_labels = clustering.fit_predict(raw_embeddings)
+        long_labels, cluster_centroids = self._cluster_embeddings(
+            raw_embeddings, num_speakers, threshold, cfg
+        )
 
-        # Step 5b: Cap clusters if too many
-        max_clusters = cfg.get("diarization", {}).get("max_clusters", 15)
-        long_labels = cap_clusters(raw_embeddings, long_labels, max_clusters=max_clusters)
+        # Step 5b: Assign cluster labels to all segments (including short ones)
+        self._assign_labels_to_segments(all_segments_meta, embeddable_indices, long_labels)
 
-        # Step 6: Greedy merge
-        merge_thresh = cfg.get("diarization", {}).get("merge_threshold", 0.45)
-        long_labels, cluster_centroids = greedy_merge_clusters(raw_embeddings, long_labels, merge_thresh)
+        # Step 5c: Detect overlaps
+        overlap_cfg = cfg.get("overlap", {})
+        if overlap_cfg.get("enabled", True):
+            detect_overlaps(
+                all_segments_meta,
+                raw_embeddings,
+                cluster_centroids,
+                embeddable_indices,
+                margin_threshold=overlap_cfg.get("margin_threshold", 0.08),
+                min_energy_percentile=overlap_cfg.get("min_energy_percentile", 0.40),
+            )
 
         if progress_callback:
             await progress_callback({"stage": "Building speaker segments", "progress": 0.7})
 
-        # Step 7: Map labels to segments
-        merged_segments = []
-        for i, (seg, label) in enumerate(zip(all_segments, long_labels)):
-            merged_segments.append({
-                "start": seg["start"],
-                "end": seg["end"],
-                "speaker": f"Speaker {label + 1}",
-                "index": i,
-            })
+        # Step 6: Map labels -> "Speaker N" and build contiguous segments
+        merged_segments, speaker_map = self._map_to_speakers(all_segments_meta, cfg)
 
-        # Step 8: Collapse + absorb islands
-        merged_segments = collapse_same_speaker_segments(merged_segments, max_gap=0.5)
-        merged_segments = absorb_islands(merged_segments, min_island_dur=1.0)
+        # Step 7: Boundary refinement
+        merged_segments = self._refine_boundaries(
+            merged_segments, all_segments_meta, embeddable_indices,
+            raw_embeddings, waveform, sample_rate
+        )
 
         if progress_callback:
             await progress_callback({"stage": "Profiling speakers", "progress": 0.8})
 
-        # Step 9: Speaker profiling
+        # Step 8: Speaker profiling
         profiles = profile_speakers(waveform, merged_segments, sample_rate)
 
-        # Step 9b: Merge similar speakers (compare voiceprints, merge close ones)
+        # Step 8b: Merge similar speakers
         merged_segments, cluster_centroids, profiles = merge_similar_speakers(
             merged_segments, raw_embeddings, long_labels,
             cluster_centroids, profiles, cfg,
         )
 
-        # Step 9c: Relabel by pitch (highest pitch = Speaker 1)
+        # Step 8c: Relabel by pitch
         merged_segments, profiles, label_map = relabel_by_pitch(merged_segments, profiles)
 
-        # Renumber cluster_centroids to match relabeled segments
+        # Renumber cluster_centroids
         old_to_new = {}
         for old_name, new_name in label_map.items():
             if old_name.startswith("Speaker ") and new_name.startswith("Speaker "):
@@ -191,43 +174,25 @@ class Diarizer:
                 renumbered_centroids[old_to_new[old_num]] = centroid
         cluster_centroids = renumbered_centroids
 
-        # Build string-keyed centroids for boundary refinement and known-speaker matching
-        string_centroids = {}
-        for num, centroid in cluster_centroids.items():
-            string_centroids[f"Speaker {num + 1}"] = centroid
-
-        # Step 10: Boundary refinement (uses string-keyed centroids)
-        merged_segments = refine_speaker_boundaries(
-            merged_segments, waveform, self._state.embedding_session,
-            string_centroids, sample_rate,
-            embedding_cache=_embedding_cache,
-        )
-
-        # Step 11: Known speaker matching (BEFORE ghost elimination so alternatives are populated)
+        # Step 9: Known speaker matching (BEFORE ghost elimination so alternatives are populated)
         if known_speakers:
             merged_segments, profiles = match_known_speakers_full(
-                merged_segments, all_segments, list(range(len(all_segments))),
+                merged_segments, all_segments_meta, embeddable_indices,
                 raw_embeddings, cluster_centroids, profiles, known_speakers, cfg,
                 renumber=True,
             )
-        else:
-            # No known speakers: return match_info stub so downstream still works
-            pass
 
-        # Step 12: Ghost elimination (uses seg["alternatives"] if populated by step 11)
-        merged_segments = eliminate_ghost_speakers(merged_segments, profiles)
+        # Step 10: Ghost elimination (uses seg["alternatives"] if populated by matching)
+        merged_segments = eliminate_ghost_speakers(merged_segments, profiles, min_duration=10.0)
 
-        # Step 13: Absorb minority speakers (safeguards matched known voiceprints)
-        if known_speakers:
-            known_names = set(known_speakers.keys())
-        else:
-            known_names = set()
+        # Step 11: Absorb minority speakers (safeguards matched known voiceprints)
+        known_names = set(known_speakers.keys()) if known_speakers else set()
         merged_segments = absorb_minority_speakers(
             merged_segments, max_utterance_sec=5.0, min_speaker_dur=8.0,
             protected_speakers=known_names,
         )
 
-        # Step 14: Exact turn boundary refinement using raw VAD sections
+        # Step 12: Exact turn boundary refinement using raw VAD sections
         if self._raw_vad_sections:
             merged_segments = await self._refine_turn_boundaries_exact(
                 merged_segments, waveform_np, sample_rate, profiles, known_speakers or {}
@@ -263,12 +228,206 @@ class Diarizer:
                 min_speech_duration_ms=min_speech_ms,
                 merge_close=merge_close,
             )
-        result = run_vad_chunked(
+        return run_vad_chunked(
             waveform, sample_rate=sample_rate,
             threshold=threshold, min_speech_duration_ms=min_speech_ms,
         )
-        # run_vad_chunked already returns seconds-based; no merge_close param needed
-        return result
+
+    def _extract_features(self, waveform_tensor: torch.Tensor, speech_ts: list[dict], sample_rate: int):
+        all_fbanks = []
+        all_segments_meta = []
+        embeddable_indices = []
+
+        if waveform_tensor.dim() == 1:
+            waveform_tensor = waveform_tensor.unsqueeze(0)
+
+        for ts in speech_ts:
+            start_sample = int(ts["start"] * sample_rate)
+            end_sample = int(ts["end"] * sample_rate)
+            segment_wav = waveform_tensor[:, start_sample:end_sample]
+
+            windows, start_times = generate_sliding_windows(
+                segment_wav, sample_rate, window_sec=2.0, stride_sec=1.2
+            )
+
+            for w, rel_start in zip(windows, start_times):
+                chunk_duration = w.shape[-1] / sample_rate
+                global_start = ts["start"] + rel_start
+                global_end = global_start + chunk_duration
+                meta_idx = len(all_segments_meta)
+                all_segments_meta.append({"start": global_start, "end": global_end})
+
+                if chunk_duration >= MIN_EMBED_DURATION:
+                    if w.shape[-1] < 1600:
+                        w = torch.nn.functional.pad(w, (0, 1600 - w.shape[-1]))
+                    all_fbanks.append(extract_fbank(w, sample_rate))
+                    embeddable_indices.append(meta_idx)
+
+        return all_fbanks, all_segments_meta, embeddable_indices
+
+    def _extract_embeddings(self, all_fbanks: list[torch.Tensor]) -> np.ndarray:
+        fb_hashes = [hashlib.md5(fb.numpy().tobytes()).hexdigest() for fb in all_fbanks]
+        cached_embeddings = {}
+        miss_indices = []
+
+        for idx, h in enumerate(fb_hashes):
+            cached = getattr(self._state, "embedding_cache", None)
+            c_emb = cached.get(h) if cached else None
+            if c_emb is not None:
+                cached_embeddings[idx] = c_emb
+            else:
+                miss_indices.append(idx)
+
+        if miss_indices:
+            miss_fbanks = [all_fbanks[idx] for idx in miss_indices]
+            max_len = max(fb.shape[1] for fb in miss_fbanks)
+            padded_fbanks = []
+            for fb in miss_fbanks:
+                if fb.shape[1] < max_len:
+                    fb_padded = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+                else:
+                    fb_padded = fb
+                padded_fbanks.append(fb_padded)
+
+            batch = torch.stack(padded_fbanks, dim=0)  # [N_miss, 1, max_len, 80]
+            cmn_batch = batch - batch.mean(dim=2, keepdim=True)
+            batch_fbanks = cmn_batch.squeeze(1).numpy().astype(np.float32)  # [N_miss, max_len, 80]
+
+            computed_embeddings = []
+            batch_size = 32
+            input_name = self._state.embedding_session.get_inputs()[0].name
+            output_name = self._state.embedding_session.get_outputs()[0].name
+
+            for i in range(0, len(batch_fbanks), batch_size):
+                audio_input = batch_fbanks[i:i + batch_size]
+                out = _run_with_cpu_fallback(
+                    self._state.embedding_session, {input_name: audio_input}, [output_name]
+                )[0]
+                if out.ndim == 3:
+                    out = out.mean(axis=1)
+                computed_embeddings.append(out)
+
+            computed_embeddings = np.concatenate(computed_embeddings, axis=0)
+
+            for local_idx, idx in enumerate(miss_indices):
+                emb = computed_embeddings[local_idx]
+                h = fb_hashes[idx]
+                if getattr(self._state, "embedding_cache", None):
+                    self._state.embedding_cache.put(h, emb)
+                cached_embeddings[idx] = emb
+
+        raw_embeddings = np.array([cached_embeddings[idx] for idx in range(len(all_fbanks))], dtype=np.float32)
+        if raw_embeddings.ndim == 3:
+            raw_embeddings = raw_embeddings.mean(axis=1)
+
+        norms = np.linalg.norm(raw_embeddings, axis=1, keepdims=True)
+        raw_embeddings = raw_embeddings / np.maximum(norms, 1e-12)
+        return raw_embeddings
+
+    def _cluster_embeddings(self, raw_embeddings: np.ndarray, num_speakers: Optional[int], threshold: float, cfg: dict):
+        if num_speakers is not None:
+            clusterer = AgglomerativeClustering(
+                n_clusters=num_speakers, metric="cosine", linkage="average"
+            )
+        else:
+            clusterer = AgglomerativeClustering(
+                n_clusters=None, distance_threshold=threshold,
+                metric="cosine", linkage="average"
+            )
+
+        if len(raw_embeddings) > 1:
+            long_labels = clusterer.fit_predict(raw_embeddings)
+        else:
+            long_labels = np.array([0])
+
+        max_clusters = cfg.get("diarization", {}).get("max_clusters", 15)
+        long_labels = cap_clusters(raw_embeddings, long_labels, max_clusters=max_clusters)
+
+        n_clusters = len(set(int(l) for l in long_labels))
+        if n_clusters > 1 and num_speakers is None:
+            merge_threshold = cfg.get("diarization", {}).get("merge_threshold", 0.25)
+            long_labels, cluster_centroids = greedy_merge_clusters(
+                raw_embeddings, long_labels, merge_threshold
+            )
+        else:
+            cluster_centroids = {}
+            for cluster_id in set(long_labels):
+                mask = (long_labels == cluster_id)
+                mean_emb = raw_embeddings[mask].mean(axis=0)
+                norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                cluster_centroids[int(cluster_id)] = norm_emb
+
+        return long_labels, cluster_centroids
+
+    def _assign_labels_to_segments(self, all_segments_meta: list[dict], embeddable_indices: list[int], long_labels: np.ndarray):
+        for idx, label in zip(embeddable_indices, long_labels):
+            all_segments_meta[idx]["speaker_raw"] = int(label)
+
+        emb_mids = np.array([
+            (all_segments_meta[i]["start"] + all_segments_meta[i]["end"]) / 2.0
+            for i in embeddable_indices
+        ])
+        for seg in all_segments_meta:
+            if "speaker_raw" not in seg:
+                mid = (seg["start"] + seg["end"]) / 2.0
+                nearest = int(np.argmin(np.abs(emb_mids - mid)))
+                seg["speaker_raw"] = all_segments_meta[embeddable_indices[nearest]]["speaker_raw"]
+
+    def _map_to_speakers(self, all_segments_meta: list[dict], cfg: dict) -> tuple[list[dict], dict]:
+        speaker_map: dict[int, str] = {}
+        for seg in sorted(all_segments_meta, key=lambda x: x["start"]):
+            raw = seg["speaker_raw"]
+            if raw not in speaker_map:
+                speaker_map[raw] = f"Speaker {len(speaker_map) + 1}"
+            seg["speaker"] = speaker_map[raw]
+
+        for seg in all_segments_meta:
+            if seg.get("is_overlap", False):
+                overs_raw = seg.get("overlap_speakers_raw")
+                if overs_raw is not None and len(overs_raw) == 2:
+                    seg["overlap_speakers"] = sorted([
+                        speaker_map[overs_raw[0]],
+                        speaker_map[overs_raw[1]],
+                    ])
+
+        overlap_cfg = cfg.get("overlap", {})
+        max_gap = overlap_cfg.get("max_speaker_gap", 1.0)
+        min_dur = overlap_cfg.get("min_duration_sec", 0.3)
+        merged_segments = build_overlap_segments(all_segments_meta, max_gap, min_dur)
+        return merged_segments, speaker_map
+
+    def _refine_boundaries(
+        self,
+        merged_segments: list[dict],
+        all_segments_meta: list[dict],
+        embeddable_indices: list[int],
+        raw_embeddings: np.ndarray,
+        waveform: torch.Tensor,
+        sample_rate: int,
+    ) -> list[dict]:
+        if len(merged_segments) < 2 or not self._state.embedding_session:
+            return merged_segments
+
+        spk_emb_lists: dict[str, list] = {}
+        for k, meta_idx in enumerate(embeddable_indices):
+            spk = all_segments_meta[meta_idx].get("speaker")
+            if spk and spk != "OVERLAP":
+                spk_emb_lists.setdefault(spk, []).append(raw_embeddings[k])
+
+        named_centroids_np: dict[str, np.ndarray] = {}
+        for spk, embs in spk_emb_lists.items():
+            avg = np.mean(embs, axis=0)
+            named_centroids_np[spk] = avg / (np.linalg.norm(avg) + 1e-12)
+
+        if named_centroids_np:
+            merged_segments = refine_speaker_boundaries(
+                merged_segments,
+                waveform,
+                self._state.embedding_session,
+                named_centroids_np,
+                sample_rate=sample_rate,
+            )
+        return merged_segments
 
     def _get_speaker_ref(
         self,
@@ -279,12 +438,6 @@ class Diarizer:
         sample_rate: int,
         segments: list,
     ) -> Optional[np.ndarray]:
-        """Get a speaker reference embedding for boundary attribution.
-
-        Priority: known voiceprint DB embedding > cluster centroid from profiles.
-        Falls back to averaging up to 30s of that speaker's own segment audio.
-        """
-        # 1. Known speaker DB embedding
         clean_name = speaker_name.strip("[]")
         if clean_name in known_speakers:
             emb = known_speakers[clean_name].get("embedding")
@@ -293,7 +446,6 @@ class Diarizer:
                 norm = np.linalg.norm(arr)
                 return arr / norm if norm > 1e-8 else arr
 
-        # 2. Profile centroid embedding
         profile = profiles.get(speaker_name, {})
         centroid = profile.get("centroid")
         if centroid is not None:
@@ -301,7 +453,6 @@ class Diarizer:
             norm = np.linalg.norm(arr)
             return arr / norm if norm > 1e-8 else arr
 
-        # 3. Average embedding from up to 30s of own segments
         own_segs = [s for s in segments if s.get("speaker") == speaker_name]
         total_dur = 0.0
         audio_chunks = []
@@ -340,27 +491,6 @@ class Diarizer:
         profiles: dict,
         known_speakers: dict,
     ) -> list:
-        """Refine every speaker-change boundary using VAD-level granular speaker attribution.
-
-        Processes ALL consecutive transitions where the speaker changes — both actual
-        gaps (left.end < right.start) and contiguous boundaries (left.end == right.start).
-        For contiguous boundaries the search region is expanded ±margin into both segments
-        so raw VAD sections straddling the nominal cut point are embedded and attributed.
-
-        Algorithm per transition:
-          1. Determine search region: [gap_start - margin, gap_end + margin]
-             (for contiguous boundaries gap_start == gap_end, so region is [cut - margin, cut + margin])
-          2. Gather raw uncollapsed VAD sections overlapping the region (min 0.1s each)
-          3. Batch-embed all sections across ALL transitions in one ONNX pass (with LRU cache)
-          4. Attribute each section to left or right speaker via cosine dot product
-          5. _best_split: find the split index k that minimises total cost
-             (left sections right of k + right sections left of k, weighted by confidence margin)
-          6. cut = start of first right-owned section past the nominal boundary,
-             clamped to [left.start+eps, right.end-eps]
-          7. left["end"] = cut; right["start"] = cut  (contiguous, no overlap/gap)
-
-        Fallback chain: energy-dip centre → geometric midpoint.
-        """
         if len(segments) < 2 or not self._raw_vad_sections:
             return segments
 
@@ -369,12 +499,11 @@ class Diarizer:
         if emb_session is None:
             return refined
 
-        margin = 0.5          # expand region into both segments around contiguous boundary
-        min_sec_dur = 0.1     # minimum VAD section duration (seconds) to embed
+        margin = 0.5
+        min_sec_dur = 0.1
         audio_dur = len(waveform_np) / sample_rate
         raw = sorted(self._raw_vad_sections, key=lambda s: s["start"])
 
-        # --- Pre-compute speaker reference embeddings (cached per speaker name) ---
         ref_cache: dict[str, Optional[np.ndarray]] = {}
 
         def _ref(name: str) -> Optional[np.ndarray]:
@@ -384,8 +513,6 @@ class Diarizer:
                 )
             return ref_cache[name]
 
-        # --- Collect transitions and their candidate VAD sections ---
-        # transitions[i] = (left_idx, nominal_cut_start, nominal_cut_end, [vad_section, ...])
         transitions = []
         for i in range(len(refined) - 1):
             left = refined[i]
@@ -396,7 +523,6 @@ class Diarizer:
             gap_start = float(left["end"])
             gap_end = float(right["start"])
 
-            # Search region: expand into adjacent segments for contiguous boundaries
             region_start = max(0.0, gap_start - margin)
             region_end = min(audio_dur, gap_end + margin)
 
@@ -410,8 +536,6 @@ class Diarizer:
         if not transitions:
             return refined
 
-        # --- Batch-embed all distinct VAD sections across all transitions ---
-        # Use identity (start, end tuple) as cache key within this call.
         sec_key_to_emb: dict[tuple, Optional[np.ndarray]] = {}
         all_secs_to_embed: list[dict] = []
         seen_keys: set[tuple] = set()
@@ -423,9 +547,7 @@ class Diarizer:
                     all_secs_to_embed.append(s)
 
         if all_secs_to_embed:
-            import hashlib
             fbanks, valid_keys = [], []
-            from asr_mcp.speaker.audio import extract_fbank
             for s in all_secs_to_embed:
                 a = int(s["start"] * sample_rate)
                 b = int(s["end"] * sample_rate)
@@ -435,8 +557,8 @@ class Diarizer:
                     sec_key_to_emb[(s["start"], s["end"])] = None
                     continue
                 t = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)
-                fb = extract_fbank(t, sample_rate)  # [T, 80]
-                fb = fb - fb.mean(dim=0, keepdim=True)  # CMN along time dimension
+                fb = extract_fbank(t, sample_rate)  # [1, T, 80]
+                fb = fb - fb.mean(dim=2, keepdim=True)  # CMN
                 fbanks.append(fb)
                 valid_keys.append((s["start"], s["end"]))
 
@@ -445,27 +567,30 @@ class Diarizer:
                 cached_embs: dict[int, np.ndarray] = {}
                 misses: list[int] = []
                 for idx, h in enumerate(hashes):
-                    hit = _embedding_cache.get(h)
-                    if hit is not None:
-                        cached_embs[idx] = hit
+                    hit = getattr(self._state, "embedding_cache", None)
+                    c_hit = hit.get(h) if hit else None
+                    if c_hit is not None:
+                        cached_embs[idx] = c_hit
                     else:
                         misses.append(idx)
 
                 if misses:
                     miss_fbs = [fbanks[idx] for idx in misses]
-                    max_len = max(fb.shape[0] for fb in miss_fbs)
+                    max_len = max(fb.shape[1] for fb in miss_fbs)
                     padded = []
                     for fb in miss_fbs:
-                        if fb.shape[0] < max_len:
-                            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[0]))
-                        padded.append(fb)
-                    batch = torch.stack(padded, dim=0).numpy().astype(np.float32)
+                        if fb.shape[1] < max_len:
+                            padded.append(torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1])))
+                        else:
+                            padded.append(fb)
+                    batch = torch.stack(padded, dim=0).squeeze(1).numpy().astype(np.float32)  # [N_miss, max_len, 80]
                     input_name = emb_session.get_inputs()[0].name
                     output_names = [o.name for o in emb_session.get_outputs()]
                     try:
-                        from asr_mcp.speaker.embedding import _run_with_cpu_fallback
                         out_list = _run_with_cpu_fallback(emb_session, {input_name: batch}, output_names)
                         out = out_list[0]
+                        if out.ndim == 3:
+                            out = out.mean(axis=1)
                     except Exception as e:
                         logger.warning("Boundary batch embed failed, skipping: %s", e)
                         out = None
@@ -475,13 +600,13 @@ class Diarizer:
                             nrm = np.linalg.norm(e_vec)
                             if nrm > 1e-8:
                                 e_vec = e_vec / nrm
-                            _embedding_cache.put(hashes[idx], e_vec)
+                            if getattr(self._state, "embedding_cache", None):
+                                self._state.embedding_cache.put(hashes[idx], e_vec)
                             cached_embs[idx] = e_vec
 
                 for idx, key in enumerate(valid_keys):
                     sec_key_to_emb[key] = cached_embs.get(idx)
 
-        # --- Apply cuts ---
         n_refined = 0
         for i, gap_start, gap_end, secs in transitions:
             left = refined[i]
@@ -490,7 +615,7 @@ class Diarizer:
             left_ref = _ref(left["speaker"])
             right_ref = _ref(right["speaker"])
 
-            owners_int: list[int] = []   # 0=left, 1=right
+            owners_int: list[int] = []
             weights: list[float] = []
             valid_secs: list[dict] = []
 
@@ -506,17 +631,15 @@ class Diarizer:
                     valid_secs.append(s)
 
             if valid_secs:
-                # _best_split: minimise weighted cost (left sections right of k
-                # that are owned by right, plus right sections left of k owned by left)
                 n = len(owners_int)
                 best_k, best_cost = 0, float("inf")
                 for k in range(n + 1):
                     cost = 0.0
                     for j in range(k):
-                        if owners_int[j] == 1:   # right section before cut → misclassified
+                        if owners_int[j] == 1:
                             cost += weights[j]
                     for j in range(k, n):
-                        if owners_int[j] == 0:   # left section after cut → misclassified
+                        if owners_int[j] == 0:
                             cost += weights[j]
                     if cost < best_cost:
                         best_cost = cost
@@ -525,19 +648,15 @@ class Diarizer:
                 if best_k < n:
                     cut = float(valid_secs[best_k]["start"])
                 else:
-                    cut = gap_end  # all sections belong to left speaker
+                    cut = gap_end
 
-                # Clamp: must stay within [left.start+eps, right.end-eps]
                 cut = max(float(left["start"]) + 0.001, min(cut, float(right["end"]) - 0.001))
-                # Also respect original gap bounds for gap-type transitions
                 if gap_end > gap_start:
                     cut = max(gap_start, min(cut, gap_end))
             else:
-                # No embeddable sections — fallback chain
                 if gap_end > gap_start:
                     cut = self._gap_energy_cut(waveform_np, gap_start, gap_end, sample_rate)
                 else:
-                    # Contiguous boundary: expand to find energy dip
                     search_s = max(0.0, gap_start - margin)
                     search_e = min(audio_dur, gap_end + margin)
                     mid = self._gap_energy_cut(waveform_np, search_s, search_e, sample_rate)
@@ -547,10 +666,6 @@ class Diarizer:
             left["end"] = round(cut, 4)
             right["start"] = round(cut, 4)
             n_refined += 1
-            logger.debug(
-                "Boundary refinement %d: %s->%s cut at %.3fs (sections=%d)",
-                i, left.get("speaker"), right.get("speaker"), cut, len(valid_secs)
-            )
 
         logger.info("exact_boundary_refinement_done: %d/%d transitions refined",
                     n_refined, len(transitions))
@@ -564,7 +679,6 @@ class Diarizer:
         sample_rate: int,
         frame_ms: float = 20.0,
     ) -> float:
-        """Return the quietest energy-dip midpoint in a gap, or its geometric midpoint."""
         s = int(gap_start * sample_rate)
         e = int(gap_end * sample_rate)
         chunk = waveform_np[s:e].astype(np.float32)

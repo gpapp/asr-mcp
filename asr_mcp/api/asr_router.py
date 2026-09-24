@@ -328,6 +328,7 @@ def _raw_vad_sections(audio, sample_rate):
             wf, state.vad_session,
             sample_rate=sample_rate, threshold=threshold,
             min_speech_duration_ms=min_ms,
+            merge_close=False,
         )
     return run_vad_chunked(
         wf, sample_rate=sample_rate,
@@ -335,7 +336,7 @@ def _raw_vad_sections(audio, sample_rate):
     )
 
 
-def _embed_section(audio, start_sample, end_sample, sample_rate):
+def _embed_section(audio, start_sec, end_sec, sample_rate):
     """Voiceprint embedding for one VAD section, or None if unusable."""
     import numpy as np
     import torch
@@ -344,6 +345,8 @@ def _embed_section(audio, start_sample, end_sample, sample_rate):
 
     if state.embedding_session is None:
         return None
+    start_sample = int(start_sec * sample_rate)
+    end_sample = min(len(audio), int(end_sec * sample_rate))
     chunk = audio[start_sample:end_sample]
     if len(chunk) < int(0.3 * sample_rate):
         return None
@@ -491,8 +494,7 @@ def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None):
             continue
         gap_secs = [
             s for s in sections
-            if s["end"] > int(gap_start * sample_rate)
-            and s["start"] < int(gap_end * sample_rate)
+            if s["end"] > gap_start and s["start"] < gap_end
         ]
         owners, weights, valid = [], [], []
         for s in gap_secs:
@@ -508,7 +510,7 @@ def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None):
             continue
         k = _best_split(owners, weights)
         if k < len(valid):
-            cut = valid[k]["start"] / sample_rate
+            cut = float(valid[k]["start"])
             cut = min(max(cut, gap_start), gap_end)
         else:
             cut = gap_end

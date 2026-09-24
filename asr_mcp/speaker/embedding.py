@@ -51,48 +51,57 @@ def extract_embedding(
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
 
-    from asr_mcp.speaker.audio import extract_fbank
-    fbank = extract_fbank(waveform, sample_rate)
+    from asr_mcp.speaker.audio import extract_fbank, generate_sliding_windows
+    windows, _ = generate_sliding_windows(waveform, sample_rate, window_sec=3.0, stride_sec=1.5)
 
-    # CMN (Cepstral Mean Normalization)
-    fbank = fbank - fbank.mean(dim=0, keepdim=True)
+    if not windows:
+        return np.zeros(192, dtype=np.float32)
 
-    max_frames = int(max_chunk_sec * 100)  # ~100 frames/sec with default hop
-    if fbank.shape[0] > max_frames:
-        embeddings = []
-        for start in range(0, fbank.shape[0], max_frames):
-            chunk = fbank[start:start + max_frames]
-            chunk_np = chunk.numpy().astype(np.float32)[np.newaxis]
-            input_name = embedding_session.get_inputs()[0].name
-            output_name = embedding_session.get_outputs()[0].name
-            emb = _run_with_cpu_fallback(
-                embedding_session, {input_name: chunk_np}, [output_name]
-            )[0]
-            if emb.ndim == 3:
-                emb = emb.mean(axis=1)
-            embeddings.append(emb)
-        embedding = np.mean(embeddings, axis=0)
-    else:
-        fbank_np = fbank.numpy().astype(np.float32)
-        if fbank_np.ndim == 2:
-            fbank_np = fbank_np[np.newaxis]
+    all_fbanks = []
+    target_length = 4800
 
-        input_name = embedding_session.get_inputs()[0].name
-        output_name = embedding_session.get_outputs()[0].name
+    for w in windows:
+        chunk_duration = w.shape[-1] / sample_rate
+        if chunk_duration >= 0.5:
+            if w.shape[-1] < target_length:
+                w = torch.nn.functional.pad(w, (0, target_length - w.shape[-1]))
+            fb = extract_fbank(w, sample_rate)  # [1, T, 80]
+            all_fbanks.append(fb)
 
-        embedding = _run_with_cpu_fallback(
-            embedding_session, {input_name: fbank_np}, [output_name]
-        )[0]
+    if not all_fbanks:
+        # Fallback to direct fbank if audio was too short for 0.5s windows
+        if waveform.shape[-1] < target_length:
+            w = torch.nn.functional.pad(waveform, (0, target_length - waveform.shape[-1]))
+        else:
+            w = waveform
+        all_fbanks.append(extract_fbank(w, sample_rate))
 
-        # Mean pool and L2 normalize
-        if embedding.ndim == 3:
-            embedding = embedding.mean(axis=1)
+    max_len = max(fb.shape[1] for fb in all_fbanks)
+    padded_fbanks = []
+    for fb in all_fbanks:
+        if fb.shape[1] < max_len:
+            padded_fbanks.append(torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1])))
+        else:
+            padded_fbanks.append(fb)
 
-    embedding = embedding.reshape(1, -1) if embedding.ndim == 1 else embedding
-    norm = np.linalg.norm(embedding, axis=1, keepdims=True)
-    embedding = embedding / (norm + 1e-8)
+    batch = torch.stack(padded_fbanks, dim=0)  # [N, 1, max_len, 80]
+    cmn_batch = batch - batch.mean(dim=2, keepdim=True)
+    batch_np = cmn_batch.squeeze(1).numpy().astype(np.float32)  # [N, max_len, 80]
 
-    return embedding.squeeze().astype(np.float32)
+    input_name = embedding_session.get_inputs()[0].name
+    output_name = embedding_session.get_outputs()[0].name
+
+    embeddings = _run_with_cpu_fallback(
+        embedding_session, {input_name: batch_np}, [output_name]
+    )[0]
+    if embeddings.ndim == 3:
+        embeddings = embeddings.mean(axis=1)
+
+    mean_emb = np.mean(embeddings, axis=0)
+    norm = np.linalg.norm(mean_emb)
+    if norm > 0:
+        mean_emb = mean_emb / norm
+    return mean_emb.astype(np.float32)
 
 
 def batch_embed_files(
@@ -102,52 +111,78 @@ def batch_embed_files(
     embedding_session,
     block_sec: float = 60.0,
 ) -> list[Optional[np.ndarray]]:
-    from asr_mcp.speaker.audio import extract_fbank
+    from asr_mcp.speaker.audio import extract_fbank, generate_sliding_windows
 
-    results = [None] * len(waveforms)
-    block_samples = int(block_sec * 16000)
+    target_length = 4800
+    min_chunk_sec = 0.5
+    input_name = embedding_session.get_inputs()[0].name
+    output_name = embedding_session.get_outputs()[0].name
 
-    batch_fbanks = []
-    batch_indices = []
+    all_fbanks: list[torch.Tensor] = []
+    slot_map: list[int] = []
 
-    for i, (wf, sr, dur) in enumerate(zip(waveforms, sample_rates, durations)):
-        if wf is None or dur < 0.5:
-            results[i] = np.zeros(192, dtype=np.float32)
+    for file_idx, (wf, sr, dur) in enumerate(zip(waveforms, sample_rates, durations)):
+        if wf is None or dur < 0.3:
             continue
-
         if wf.dim() == 1:
             wf = wf.unsqueeze(0)
-        fbank = extract_fbank(wf, sr)
-        fbank = fbank - fbank.mean(dim=0, keepdim=True)
+        windows, _ = generate_sliding_windows(wf, sr, window_sec=3.0, stride_sec=1.5)
+        for w in windows:
+            if w.shape[-1] / sr < min_chunk_sec:
+                continue
+            if w.shape[-1] < target_length:
+                w = torch.nn.functional.pad(w, (0, target_length - w.shape[-1]))
+            fb = extract_fbank(w, sr)  # [1, T, 80]
+            all_fbanks.append(fb)
+            slot_map.append(file_idx)
 
-        batch_fbanks.append(fbank)
-        batch_indices.append(i)
+    if not all_fbanks:
+        return [np.zeros(192, dtype=np.float32)] * len(waveforms)
 
-        total_samples = sum(f.shape[0] for f in batch_fbanks)
-        if total_samples >= block_samples or i == len(waveforms) - 1:
-            if batch_fbanks:
-                combined = torch.cat(batch_fbanks, dim=0)
-                fbank_np = combined.numpy().astype(np.float32)[np.newaxis]
+    window_sec = 3.0
+    block_size = max(1, int(block_sec / window_sec))
+    raw_embs_all = []
 
-                input_name = embedding_session.get_inputs()[0].name
-                output_name = embedding_session.get_outputs()[0].name
-                embedding = _run_with_cpu_fallback(
-                    embedding_session, {input_name: fbank_np}, [output_name]
-                )[0]
+    for block_start in range(0, len(all_fbanks), block_size):
+        block_fbanks = all_fbanks[block_start: block_start + block_size]
+        max_len = max(fb.shape[1] for fb in block_fbanks)
+        padded = []
+        for fb in block_fbanks:
+            if fb.shape[1] < max_len:
+                padded.append(torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1])))
+            else:
+                padded.append(fb)
+        batch = torch.stack(padded, dim=0)  # [N, 1, max_len, 80]
+        cmn_batch = batch - batch.mean(dim=2, keepdim=True)
+        batch_np = cmn_batch.squeeze(1).numpy().astype(np.float32)
 
-                if embedding.ndim == 3:
-                    emb_mean = embedding.mean(axis=1)
-                else:
-                    emb_mean = embedding
-                emb_mean = emb_mean.reshape(1, -1) if emb_mean.ndim == 1 else emb_mean
-                norm = np.linalg.norm(emb_mean, axis=1, keepdims=True)
-                emb_mean = emb_mean / (norm + 1e-8)
+        block_result = _run_with_cpu_fallback(
+            embedding_session, {input_name: batch_np}, [output_name]
+        )[0]
+        if block_result.ndim == 3:
+            block_result = block_result.mean(axis=1)
+        raw_embs_all.append(block_result)
 
-                for j, idx in enumerate(batch_indices):
-                    results[idx] = emb_mean[j].astype(np.float32)
+    all_embs = np.concatenate(raw_embs_all, axis=0)
+    norms = np.linalg.norm(all_embs, axis=1, keepdims=True)
+    all_embs = all_embs / np.maximum(norms, 1e-12)
 
-                batch_fbanks.clear()
-                batch_indices.clear()
+    n_files = len(waveforms)
+    file_embs: list[list[np.ndarray]] = [[] for _ in range(n_files)]
+    for k, file_idx in enumerate(slot_map):
+        file_embs[file_idx].append(all_embs[k])
+
+    results: list[Optional[np.ndarray]] = []
+    for file_idx in range(n_files):
+        group = file_embs[file_idx]
+        if not group:
+            results.append(np.zeros(192, dtype=np.float32))
+            continue
+        mean_emb = np.mean(np.stack(group), axis=0)
+        norm = np.linalg.norm(mean_emb)
+        if norm > 0:
+            mean_emb = mean_emb / norm
+        results.append(mean_emb.astype(np.float32))
 
     return results
 
