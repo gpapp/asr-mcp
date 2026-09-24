@@ -74,5 +74,12 @@
     "dip_ratio": 0.35,
     "min_dip_sec": 0.12
   },
+  "second_pass": {
+    "enabled": true,
+    "known_speaker_margin_bias": 0.05,
+    "accept_threshold": 0.38,
+    "unknown_merge_threshold": 0.25,
+    "min_speaker_duration_sec": 3.0
+  },
   "debug": false
 }

@@ -75,6 +75,7 @@ def compute_distance(
     voiceprint: Dict,
     cfg: Dict = None,
     cluster_features: Dict = None,
+    is_known_speaker: bool = False,
 ) -> Dict[str, float]:
     cfg = cfg or _DEFAULT_CFG
     weights = cfg.get("weights", _DEFAULT_CFG["weights"])
@@ -124,6 +125,13 @@ def compute_distance(
         + weights.get("mfcc", 0.1) * min(mfcc_dist, 1.0)
     )
 
+    if is_known_speaker:
+        bias = cfg.get("matching", {}).get("known_speaker_margin_bias", 0.0)
+        if not bias:
+            bias = cfg.get("second_pass", {}).get("known_speaker_margin_bias", 0.0)
+        if bias > 0:
+            total = max(0.0, total - bias)
+
     conf_max_dist = norm_cfg.get("confidence_max_distance", 0.5)
     confidence = max(0.0, 1.0 - (total / conf_max_dist)) if conf_max_dist else 0.5
 
@@ -154,7 +162,10 @@ def find_best_match(
 ) -> Tuple[Optional[str], float, float, Dict[str, Dict]]:
     distances = {}
     for name, vp in voiceprints.items():
-        dist = compute_distance(cluster_emb, cluster_pitch, cluster_energy, vp, cfg, cluster_features)
+        is_known = not (name.startswith("Speaker ") or name.startswith("SPEAKER ") or name == "OVERLAP")
+        dist = compute_distance(
+            cluster_emb, cluster_pitch, cluster_energy, vp, cfg, cluster_features, is_known_speaker=is_known
+        )
         distances[name] = dist
 
     matches = [(name, d["combined"], d["confidence"]) for name, d in distances.items()]

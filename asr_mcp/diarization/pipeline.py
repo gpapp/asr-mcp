@@ -12,6 +12,7 @@ from sklearn.cluster import AgglomerativeClustering
 from asr_mcp.core.model_state import state, GPU_SHRINK_RUN_OPTIONS
 from asr_mcp.diarization.clustering import (
     cap_clusters, greedy_merge_clusters, match_known_speakers_full,
+    collapse_unknown_speakers_second_pass,
 )
 from asr_mcp.diarization.overlap import detect_overlaps, build_overlap_segments
 from asr_mcp.diarization.segment_ops import (
@@ -188,7 +189,19 @@ class Diarizer:
             protected_speakers=known_names,
         )
 
-        # Step 12: Exact turn boundary refinement using raw VAD sections
+        # Step 12: Second-pass re-identification and consolidation of unknown speakers
+        try:
+            non_ov, profiles = collapse_unknown_speakers_second_pass(
+                non_ov, waveform_np, sample_rate,
+                known_speakers=known_speakers or {},
+                profiles=profiles,
+                state=self._state,
+                cfg=cfg,
+            )
+        except Exception as e:
+            logger.warning("Second pass unknown collapse failed: %s", e)
+
+        # Step 13: Exact turn boundary refinement using raw VAD sections
         if self._raw_vad_sections:
             try:
                 non_ov = await self._refine_turn_boundaries_exact(

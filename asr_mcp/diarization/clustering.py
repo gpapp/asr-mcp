@@ -419,3 +419,164 @@ def match_known_speakers_full(
                     merged_already.add(source_spk)
 
     return merged_segments, profiles
+
+
+def collapse_unknown_speakers_second_pass(
+    segments: list[dict],
+    audio_np: np.ndarray,
+    sample_rate: int,
+    known_speakers: dict[str, dict],
+    profiles: dict,
+    state=None,
+    cfg: dict = None,
+) -> Tuple[list[dict], dict]:
+    """Second-pass re-identification and consolidation of unknown speakers.
+
+    1. Gathers all audio across the entire call for each speaker.
+    2. Computes aggregated high-SNR embeddings.
+    3. Blends in-call references with DB voiceprints for confirmed known speakers.
+    4. Matches remaining unknown 'Speaker N' clusters against known targets with larger fit margin.
+    5. Cross-matches and merges duplicate unknown speakers.
+    6. Fuses adjacent same-speaker segments.
+    """
+    from asr_mcp.speaker.embedding import extract_embedding
+    from asr_mcp.speaker.matcher import find_best_match, is_clear_winner
+    from asr_mcp.diarization.segment_ops import merge_profiles, collapse_same_speaker_segments
+
+    if not segments or audio_np is None or len(audio_np) == 0:
+        return segments, profiles
+
+    cfg = cfg or {}
+    sec_cfg = cfg.get("second_pass", {})
+    if not sec_cfg.get("enabled", True):
+        return segments, profiles
+
+    accept_thresh = sec_cfg.get("accept_threshold", 0.38)
+    unknown_merge_thresh = sec_cfg.get("unknown_merge_threshold", 0.25)
+    min_speaker_dur = sec_cfg.get("min_speaker_duration_sec", 1.0)
+
+    all_speakers = set(seg.get("speaker") for seg in segments if seg.get("speaker"))
+    unknown_speakers = [
+        s for s in all_speakers
+        if (s.startswith("Speaker ") or s.startswith("SPEAKER ")) and s != "OVERLAP"
+    ]
+    if not unknown_speakers:
+        return segments, profiles
+
+    # 1. Gather audio and compute aggregated embeddings for each speaker
+    spk_embeddings: dict[str, np.ndarray] = {}
+    for spk in all_speakers:
+        if spk == "OVERLAP":
+            continue
+        audio_chunks = []
+        for seg in segments:
+            if seg.get("speaker") != spk:
+                continue
+            s_sec = seg.get("start", 0.0)
+            e_sec = seg.get("end", 0.0)
+            if e_sec - s_sec < 0.2:
+                continue
+            s_idx = max(0, int(s_sec * sample_rate))
+            e_idx = min(len(audio_np), int(e_sec * sample_rate))
+            if e_idx > s_idx:
+                audio_chunks.append(audio_np[s_idx:e_idx])
+
+        if not audio_chunks:
+            continue
+
+        spk_audio = np.concatenate(audio_chunks)
+        dur = len(spk_audio) / sample_rate
+        if dur >= min_speaker_dur:
+            try:
+                emb = extract_embedding(spk_audio, sample_rate, state=state)
+                if emb is not None and len(emb) > 0:
+                    norm = np.linalg.norm(emb)
+                    if norm > 0:
+                        spk_embeddings[spk] = emb / norm
+            except Exception as e:
+                logger.warning("Second pass embedding failed for %s: %s", spk, e)
+
+    # 2. Build reference voiceprints (blending DB voiceprints + in-call centroids)
+    reference_targets = {}
+    if known_speakers:
+        for name, vp in known_speakers.items():
+            ref_vp = dict(vp)
+            db_emb = np.array(vp.get("embedding", []), dtype=np.float32)
+            if name in spk_embeddings and len(db_emb) > 0:
+                in_call_emb = spk_embeddings[name]
+                blended = 0.5 * db_emb + 0.5 * in_call_emb
+                norm = np.linalg.norm(blended)
+                if norm > 0:
+                    blended = blended / norm
+                ref_vp["embedding"] = blended.tolist()
+            reference_targets[name] = ref_vp
+
+    # 3. Match unknown clusters against reference targets
+    resolved_unknowns: set[str] = set()
+    if reference_targets:
+        for spk in list(unknown_speakers):
+            if spk not in spk_embeddings:
+                continue
+            emb = spk_embeddings[spk]
+            prof = profiles.get(spk, {})
+            pitch = prof.get("pitch_hz", 0.0) or 0.0
+            energy = prof.get("energy_rms", 0.0) or 0.0
+            features = {
+                k: v for k, v in prof.items()
+                if k.startswith("mfcc") or k.startswith("spectral")
+            }
+
+            best_name, best_dist, second_dist, all_dists = find_best_match(
+                emb.tolist(), pitch, energy, reference_targets, cfg, features
+            )
+
+            if not best_name or best_dist > accept_thresh:
+                continue
+
+            matches = [(n, d["combined"], d["confidence"]) for n, d in all_dists.items()]
+            matches.sort(key=lambda x: x[1])
+            if not is_clear_winner(matches, reference_targets, cfg):
+                continue
+
+            # Remap segments
+            for seg in segments:
+                if seg.get("speaker") == spk:
+                    seg["speaker"] = best_name
+            merge_profiles(profiles, best_name, spk)
+            resolved_unknowns.add(spk)
+            logger.info(
+                "Second pass: collapsed unknown %s -> %s (dist=%.3f, conf=%.2f)",
+                spk, best_name, best_dist, all_dists[best_name].get("confidence", 0.0)
+            )
+
+    # 4. Cross-match and merge duplicate unknown speakers
+    remaining_unknowns = [s for s in unknown_speakers if s not in resolved_unknowns]
+    merged_unknowns: set[str] = set()
+    for i in range(len(remaining_unknowns)):
+        u1 = remaining_unknowns[i]
+        if u1 in merged_unknowns or u1 not in spk_embeddings:
+            continue
+        for j in range(i + 1, len(remaining_unknowns)):
+            u2 = remaining_unknowns[j]
+            if u2 in merged_unknowns or u2 not in spk_embeddings:
+                continue
+
+            cos_dist = 1.0 - float(np.dot(spk_embeddings[u1], spk_embeddings[u2]))
+            if cos_dist < unknown_merge_thresh:
+                # Keep the one with longer total speech duration as primary
+                dur1 = profiles.get(u1, {}).get("total_speech_sec", 0.0)
+                dur2 = profiles.get(u2, {}).get("total_speech_sec", 0.0)
+                primary, secondary = (u1, u2) if dur1 >= dur2 else (u2, u1)
+
+                for seg in segments:
+                    if seg.get("speaker") == secondary:
+                        seg["speaker"] = primary
+                merge_profiles(profiles, primary, secondary)
+                merged_unknowns.add(secondary)
+                logger.info(
+                    "Second pass: merged duplicate unknowns %s -> %s (dist=%.3f)",
+                    secondary, primary, cos_dist
+                )
+
+    segments = collapse_same_speaker_segments(segments, max_gap=0.5)
+    return segments, profiles
