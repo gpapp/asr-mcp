@@ -435,8 +435,8 @@ class Diarizer:
                     sec_key_to_emb[(s["start"], s["end"])] = None
                     continue
                 t = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)
-                fb = extract_fbank(t, sample_rate)  # [1, T, 80]
-                fb = fb - fb.mean(dim=1, keepdim=True)  # CMN
+                fb = extract_fbank(t, sample_rate)  # [T, 80]
+                fb = fb - fb.mean(dim=0, keepdim=True)  # CMN along time dimension
                 fbanks.append(fb)
                 valid_keys.append((s["start"], s["end"]))
 
@@ -453,13 +453,13 @@ class Diarizer:
 
                 if misses:
                     miss_fbs = [fbanks[idx] for idx in misses]
-                    max_len = max(fb.shape[1] for fb in miss_fbs)
+                    max_len = max(fb.shape[0] for fb in miss_fbs)
                     padded = []
                     for fb in miss_fbs:
-                        if fb.shape[1] < max_len:
-                            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-                        padded.append(fb.squeeze(0))
-                    batch = torch.stack(padded).numpy().astype(np.float32)
+                        if fb.shape[0] < max_len:
+                            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[0]))
+                        padded.append(fb)
+                    batch = torch.stack(padded, dim=0).numpy().astype(np.float32)
                     input_name = emb_session.get_inputs()[0].name
                     output_names = [o.name for o in emb_session.get_outputs()]
                     try:
