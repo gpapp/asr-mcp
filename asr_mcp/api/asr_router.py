@@ -23,12 +23,12 @@ logger = logging.getLogger("asr_mcp.api.asr_router")
 router = APIRouter(prefix="/asr", tags=["ASR"])
 
 MIN_CHUNK_SAMPLES = 1600
-MAX_TURN_SEC = 30.0
-PARAGRAPH_PAUSE_SEC = 1.5
+MAX_TURN_SEC = 120.0
+PARAGRAPH_PAUSE_SEC = 2.5
 _SENT_END_RE = re.compile(r'[.!?…]["”’)\]]?(?=\s|$)')
 
 
-def _merge_into_turns(segments, max_gap_sec=1.5):
+def _merge_into_turns(segments, max_gap_sec=3.0):
     """Merge consecutive same-speaker segments into full speaker turns.
 
     A turn is a continuous span attributed to one speaker.  Segments from the
@@ -566,6 +566,59 @@ def _prepare_turns(segments, audio_duration_sec=None, audio=None,
     return split
 
 
+def _merge_consecutive_same_speaker_results(results, max_gap_sec=3.0):
+    """Merge consecutive same-speaker TranscribeResult entries into coherent turns."""
+    if not results:
+        return []
+    merged = []
+    for r in results:
+        if not merged:
+            merged.append(r)
+            continue
+        prev = merged[-1]
+        prev_spk = getattr(prev, "speaker", None) if hasattr(prev, "speaker") else prev.get("speaker")
+        curr_spk = getattr(r, "speaker", None) if hasattr(r, "speaker") else r.get("speaker")
+        prev_end = getattr(prev, "end", 0.0) if hasattr(prev, "end") else prev.get("end", 0.0)
+        curr_start = getattr(r, "start", 0.0) if hasattr(r, "start") else r.get("start", 0.0)
+
+        if prev_spk == curr_spk and (curr_start - prev_end) <= max_gap_sec:
+            prev_text = (getattr(prev, "text", "") if hasattr(prev, "text") else prev.get("text", "")) or ""
+            curr_text = (getattr(r, "text", "") if hasattr(r, "text") else r.get("text", "")) or ""
+
+            if prev_text and curr_text:
+                if prev_text.endswith(("\n", "\n\n")):
+                    combined_text = prev_text + curr_text
+                elif prev_text[-1] in ".!?…" and (curr_start - prev_end) >= 2.0:
+                    combined_text = prev_text + "\n\n" + curr_text
+                else:
+                    combined_text = prev_text + " " + curr_text
+            else:
+                combined_text = prev_text or curr_text
+
+            prev_segs = getattr(prev, "segments", []) if hasattr(prev, "segments") else prev.get("segments", [])
+            curr_segs = getattr(r, "segments", []) if hasattr(r, "segments") else r.get("segments", [])
+            combined_segs = list(prev_segs or []) + list(curr_segs or [])
+            curr_end = getattr(r, "end", 0.0) if hasattr(r, "end") else r.get("end", 0.0)
+
+            if hasattr(prev, "end"):
+                prev.end = max(prev.end, curr_end)
+                prev.text = combined_text
+                prev.segments = combined_segs
+                if hasattr(r, "tokens_generated") and hasattr(prev, "tokens_generated"):
+                    prev.tokens_generated += r.tokens_generated
+                if hasattr(r, "inference_time_sec") and hasattr(prev, "inference_time_sec"):
+                    prev.inference_time_sec += r.inference_time_sec
+            else:
+                prev["end"] = max(prev.get("end", 0.0), curr_end)
+                prev["text"] = combined_text
+                prev["segments"] = combined_segs
+                prev["tokens_generated"] = prev.get("tokens_generated", 0) + (r.get("tokens_generated", 0) if isinstance(r, dict) else 0)
+                prev["inference_time_sec"] = prev.get("inference_time_sec", 0.0) + (r.get("inference_time_sec", 0.0) if isinstance(r, dict) else 0.0)
+        else:
+            merged.append(r)
+    return merged
+
+
 def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=None):
     turns = _prepare_turns(
         segments,
@@ -577,7 +630,7 @@ def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=N
     all_results = []
     for turn in turns:
         all_results.extend(_transcribe_turn(audio_np, turn, sample_rate))
-    return all_results
+    return _merge_consecutive_same_speaker_results(all_results)
 
 
 def _result_to_dict(r):
@@ -1026,6 +1079,7 @@ async def transcribe_upload(
                 )
                 results.extend(turn_results)
 
+            results = _merge_consecutive_same_speaker_results(results)
             diarization["results"] = [_result_to_dict(r) for r in results]
             diarization["total_time_sec"] = sum(
                 (r.inference_time_sec if hasattr(r, 'inference_time_sec') else 0) for r in results

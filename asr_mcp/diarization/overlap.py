@@ -86,7 +86,7 @@ def detect_overlaps(
 
 def build_overlap_segments(
     all_segments_meta: list[dict],
-    max_gap: float = 1.0,
+    max_gap: float = 1.5,
     min_overlap_dur: float = 0.3,
 ) -> list[dict]:
     """Merge contiguous windows into speaker segments with overlap awareness.

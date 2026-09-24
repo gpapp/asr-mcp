@@ -4,7 +4,7 @@ from typing import Optional
 logger = logging.getLogger("asr_mcp.diarization.segment_ops")
 
 
-def collapse_same_speaker_segments(segments: list, max_gap: float = 0.5) -> list:
+def collapse_same_speaker_segments(segments: list, max_gap: float = 1.5) -> list:
     if not segments:
         return []
     segments = sorted(segments, key=lambda x: x["start"])

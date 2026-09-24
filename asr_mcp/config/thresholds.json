@@ -26,7 +26,7 @@
     "proximity_ratio": 0.08,
     "min_distance": 0.40,
     "min_duration_sec": 0.5,
-    "max_speaker_gap": 1.0,
+    "max_speaker_gap": 1.5,
     "max_clarity": 0.08
   },
   "vad": {

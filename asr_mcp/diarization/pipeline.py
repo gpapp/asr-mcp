@@ -79,8 +79,8 @@ class Diarizer:
         if not self._raw_vad_sections:
             return {"segments": [], "total_time_sec": round(time.time() - start_time, 2)}
 
-        # Step 1b: Merge nearby speech regions separated by <0.1s silence for clustering
-        speech_ts = merge_vad_sections(self._raw_vad_sections, max_gap_sec=0.1)
+        # Step 1b: Merge nearby speech regions separated by <0.5s silence for clustering
+        speech_ts = merge_vad_sections(self._raw_vad_sections, max_gap_sec=0.5)
 
         if progress_callback:
             await progress_callback({"stage": "Splitting audio at silence boundaries", "progress": 0.15})
