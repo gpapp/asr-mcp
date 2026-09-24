@@ -91,11 +91,18 @@ def extract_embedding(
     input_name = embedding_session.get_inputs()[0].name
     output_name = embedding_session.get_outputs()[0].name
 
-    embeddings = _run_with_cpu_fallback(
-        embedding_session, {input_name: batch_np}, [output_name]
-    )[0]
-    if embeddings.ndim == 3:
-        embeddings = embeddings.mean(axis=1)
+    computed_chunks = []
+    batch_size = 16
+    for b_start in range(0, len(batch_np), batch_size):
+        b_inp = batch_np[b_start:b_start + batch_size]
+        out_c = _run_with_cpu_fallback(
+            embedding_session, {input_name: b_inp}, [output_name]
+        )[0]
+        if out_c.ndim == 3:
+            out_c = out_c.mean(axis=1)
+        computed_chunks.append(out_c)
+
+    embeddings = np.concatenate(computed_chunks, axis=0) if computed_chunks else np.empty((0, 192), dtype=np.float32)
 
     mean_emb = np.mean(embeddings, axis=0)
     norm = np.linalg.norm(mean_emb)
@@ -140,7 +147,7 @@ def batch_embed_files(
         return [np.zeros(192, dtype=np.float32)] * len(waveforms)
 
     window_sec = 3.0
-    block_size = max(1, int(block_sec / window_sec))
+    block_size = min(16, max(1, int(block_sec / window_sec)))
     raw_embs_all = []
 
     for block_start in range(0, len(all_fbanks), block_size):

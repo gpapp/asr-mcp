@@ -179,7 +179,7 @@ class Diarizer:
             )
 
         # Step 10: Ghost elimination (uses seg["alternatives"] if populated by matching)
-        non_ov = eliminate_ghost_speakers(non_ov, profiles=profiles, min_duration=10.0)
+        non_ov = eliminate_ghost_speakers(non_ov, profiles=profiles, ghost_threshold_sec=10.0)
 
         # Step 11: Absorb minority speakers (safeguards matched known voiceprints)
         known_names = set(known_speakers.keys()) if known_speakers else set()
@@ -305,7 +305,7 @@ class Diarizer:
             batch_fbanks = cmn_batch.squeeze(1).numpy().astype(np.float32)  # [N_miss, max_len, 80]
 
             computed_embeddings = []
-            batch_size = 32
+            batch_size = 16
             input_name = self._state.embedding_session.get_inputs()[0].name
             output_name = self._state.embedding_session.get_outputs()[0].name
 
@@ -598,10 +598,15 @@ class Diarizer:
                     input_name = emb_session.get_inputs()[0].name
                     output_names = [o.name for o in emb_session.get_outputs()]
                     try:
-                        out_list = _run_with_cpu_fallback(emb_session, {input_name: batch}, output_names)
-                        out = out_list[0]
-                        if out.ndim == 3:
-                            out = out.mean(axis=1)
+                        computed_outs = []
+                        batch_size = 16
+                        for b_start in range(0, len(batch), batch_size):
+                            b_inp = batch[b_start:b_start + batch_size]
+                            out_chunk = _run_with_cpu_fallback(emb_session, {input_name: b_inp}, output_names)[0]
+                            if out_chunk.ndim == 3:
+                                out_chunk = out_chunk.mean(axis=1)
+                            computed_outs.append(out_chunk)
+                        out = np.concatenate(computed_outs, axis=0) if computed_outs else None
                     except Exception as e:
                         logger.warning("Boundary batch embed failed, skipping: %s", e)
                         out = None

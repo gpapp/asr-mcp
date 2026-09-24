@@ -110,6 +110,7 @@ def eliminate_ghost_speakers(
     segments: list,
     profiles: Optional[dict] = None,
     ghost_threshold_sec: float = 10.0,
+    min_duration: Optional[float] = None,
 ) -> list:
     """Remove ghost speakers (< ghost_threshold_sec total speech).
 
@@ -119,6 +120,8 @@ def eliminate_ghost_speakers(
 
     After reassignment, ghost entries are removed from profiles.
     """
+    if min_duration is not None:
+        ghost_threshold_sec = min_duration
     if not segments:
         return []
 
