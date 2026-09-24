@@ -269,7 +269,11 @@ def match_known_speakers_full(
             if feat in profile:
                 features[feat] = profile[feat]
         mfcc = profile.get("mfcc")
-        if mfcc is not None:
+        if isinstance(mfcc, dict):
+            for name, val in mfcc.items():
+                if isinstance(val, (int, float)):
+                    features[name] = float(val)
+        elif mfcc is not None:
             for j, val in enumerate(mfcc):
                 features[f"mfcc{j}_mean"] = float(val)
             # std not stored in profile but contribute if available
