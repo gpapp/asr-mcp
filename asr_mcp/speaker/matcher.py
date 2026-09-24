@@ -146,6 +146,7 @@ def find_best_match(
 def is_clear_winner(matches: List[Tuple], voiceprints: Dict, cfg: Dict = None) -> bool:
     cfg = cfg or _DEFAULT_CFG
     gap_threshold = cfg.get("matching", {}).get("clear_winner_gap", 0.02)
+    embed_only_thresh = cfg.get("matching", {}).get("embed_only_threshold", 0.16)
 
     if len(matches) < 2:
         return True
@@ -154,7 +155,26 @@ def is_clear_winner(matches: List[Tuple], voiceprints: Dict, cfg: Dict = None) -
     second = matches[1][1]
     best_val = best["total"] if isinstance(best, dict) else best
     second_val = second["total"] if isinstance(second, dict) else second
-    return (second_val - best_val) > gap_threshold
+    gap = second_val - best_val
+
+    if gap >= gap_threshold:
+        return True
+
+    # Tie-breaking: prefer the candidate with significantly more training data
+    best_name = matches[0][0]
+    second_name = matches[1][0]
+    first_dur = (
+        voiceprints.get(best_name, {}).get("segments_sec") or
+        voiceprints.get(best_name, {}).get("total_speech_sec", 0)
+    )
+    second_dur = (
+        voiceprints.get(second_name, {}).get("segments_sec") or
+        voiceprints.get(second_name, {}).get("total_speech_sec", 0)
+    )
+    if first_dur > second_dur * 2 and best_val < embed_only_thresh:
+        return True
+
+    return False
 
 
 def match_clusters(

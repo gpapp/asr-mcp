@@ -229,9 +229,32 @@ def match_known_speakers_full(
     cfg: dict = None,
     renumber: bool = False,
 ) -> Tuple[list[dict], dict]:
+    """Match cluster centroids against known speaker voiceprints.
+
+    Improvements over the original:
+    - Extracts full acoustic features (spectral, MFCCs) from profiles and passes
+      them to match_clusters so the complete 20% spectral+MFCC weight is used.
+    - Stores top-3 alternatives in each segment for ghost-elimination fallback.
+    - Updates profiles keys from "Speaker N" to the matched voiceprint name.
+    - Merges duplicate clusters that matched to the same known speaker.
+    - Merges clusters with near-identical distance profiles (max_diff < 0.05).
+    """
     from asr_mcp.speaker.matcher import match_clusters, merge_matched_clusters
 
+    if not known_speakers:
+        return merged_segments, profiles
+
+    cfg = cfg or {}
+    matching_cfg = cfg.get("matching", {})
+    accept_thresh = matching_cfg.get("accept_threshold", 0.35)
+    embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
+    conf_thresh = matching_cfg.get("confidence_threshold", 0.3)
+    conf_max_dist = cfg.get("normalization", {}).get("confidence_max_distance", 0.5)
+    gap_threshold = matching_cfg.get("clear_winner_gap", 0.02)
+
+    # Build clusters_data with full acoustic features from profiles
     clusters_data = {}
+    all_cluster_features = {}
     for cluster_id, centroid in cluster_centroids.items():
         label = f"Speaker {cluster_id + 1}"
         profile = profiles.get(label, {})
@@ -240,13 +263,105 @@ def match_known_speakers_full(
             "pitch_hz": profile.get("pitch_hz", 0.0),
             "energy_rms": profile.get("energy_rms", 0.0),
         }
+        # Extract spectral + MFCC features for the full distance model
+        features: dict = {}
+        for feat in ("spectral_centroid", "spectral_rolloff"):
+            if feat in profile:
+                features[feat] = profile[feat]
+        mfcc = profile.get("mfcc")
+        if mfcc is not None:
+            for j, val in enumerate(mfcc):
+                features[f"mfcc{j}_mean"] = float(val)
+            # std not stored in profile but contribute if available
+        if features:
+            all_cluster_features[label] = features
 
-    match_results = match_clusters(clusters_data, known_speakers, cfg)
+    # Run full multi-feature matching
+    match_results = match_clusters(
+        clusters_data, known_speakers, cfg,
+        all_cluster_features=all_cluster_features if all_cluster_features else None,
+    )
+
+    # Collect all_matches for alternatives and post-match merging
+    all_matches: dict[str, list] = {}
+    for spk, result in match_results.items():
+        distances = result.get("all_distances", {})
+        matches_list = []
+        for name, dist in distances.items():
+            conf = max(0.0, 1.0 - dist / conf_max_dist)
+            matches_list.append((name, dist, conf))
+        matches_list.sort(key=lambda x: x[1])
+        all_matches[spk] = matches_list
+
+    # Apply best match: remap segments, store alternatives, update profiles
     label_map = merge_matched_clusters(match_results, clusters_data)
+
+    # Track which original "Speaker N" mapped to which known name
+    matched_known: dict[str, str] = {}  # old_label -> new_name
+    for spk, result in match_results.items():
+        if result.get("matched") and result.get("label") != spk:
+            matched_known[spk] = result["label"]
 
     for seg in merged_segments:
         old_speaker = seg.get("speaker", "")
         if old_speaker in label_map:
             seg["speaker"] = label_map[old_speaker]
+        # Store top-3 alternatives for ghost elimination fallback
+        matches = all_matches.get(old_speaker, [])
+        alternatives = []
+        best_dist = match_results.get(old_speaker, {}).get("distance", 1.0)
+        for name, dist, conf in matches[:4]:
+            # skip the winner itself if already applied
+            if name == seg.get("speaker"):
+                continue
+            if conf >= conf_thresh:
+                alternatives.append({"speaker": name, "confidence": round(conf, 2)})
+            if len(alternatives) >= 3:
+                break
+        if alternatives:
+            seg["alternatives"] = alternatives
 
-    return merged_segments, match_results
+    # Update profiles: remap keys from "Speaker N" to matched voiceprint name
+    for old_label, new_name in matched_known.items():
+        if old_label in profiles and new_name not in profiles:
+            profiles[new_name] = profiles.pop(old_label)
+            profiles[new_name]["matched_from"] = old_label
+
+    # Post-match merging: combine segments of clusters that both matched same speaker
+    speaker_to_clusters: dict[str, list] = {}
+    for spk, result in match_results.items():
+        if result.get("matched"):
+            best_name = result.get("label", spk)
+            speaker_to_clusters.setdefault(best_name, []).append(spk)
+
+    for speaker, cluster_list in speaker_to_clusters.items():
+        if len(cluster_list) > 1:
+            for extra in cluster_list[1:]:
+                for seg in merged_segments:
+                    if seg["speaker"] == extra:
+                        seg["speaker"] = speaker
+
+    # Additional merge: clusters with near-identical distance profiles
+    cluster_ids = list(all_matches.keys())
+    merged_already: set = set()
+    for i in range(len(cluster_ids)):
+        if cluster_ids[i] in merged_already:
+            continue
+        for j in range(i + 1, len(cluster_ids)):
+            if cluster_ids[j] in merged_already:
+                continue
+            matches_i = all_matches[cluster_ids[i]]
+            matches_j = all_matches[cluster_ids[j]]
+            dist_vec_i = {m[0]: m[1] for m in matches_i}
+            dist_vec_j = {m[0]: m[1] for m in matches_j}
+            common = set(dist_vec_i.keys()) & set(dist_vec_j.keys())
+            if len(common) >= 3:
+                max_diff = max(abs(dist_vec_i[s] - dist_vec_j[s]) for s in common)
+                if max_diff < 0.05:
+                    target = cluster_ids[i]
+                    for seg in merged_segments:
+                        if seg.get("speaker") == cluster_ids[j]:
+                            seg["speaker"] = target
+                    merged_already.add(cluster_ids[j])
+
+    return merged_segments, profiles
