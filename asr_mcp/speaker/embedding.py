@@ -43,11 +43,24 @@ def _run_with_cpu_fallback(session, feed, output_names):
 
 
 def extract_embedding(
-    waveform: torch.Tensor,
+    waveform: torch.Tensor | np.ndarray,
     sample_rate: int,
-    embedding_session,
+    embedding_session=None,
     max_chunk_sec: float = 60.0,
+    state=None,
 ) -> np.ndarray:
+    if embedding_session is None and state is not None:
+        embedding_session = state
+
+    if embedding_session is not None and hasattr(embedding_session, "embedding_session"):
+        embedding_session = embedding_session.embedding_session
+
+    if embedding_session is None:
+        embedding_session = _get_cpu_embedding_session()
+
+    if isinstance(waveform, np.ndarray):
+        waveform = torch.from_numpy(waveform).float()
+
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
 

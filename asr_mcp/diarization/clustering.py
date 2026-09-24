@@ -461,11 +461,12 @@ def collapse_unknown_speakers_second_pass(
         if not audio_chunks:
             continue
 
+        emb_session = getattr(state, "embedding_session", state)
         spk_audio = np.concatenate(audio_chunks)
         dur = len(spk_audio) / sample_rate
         if dur >= min_speaker_dur:
             try:
-                emb = extract_embedding(spk_audio, sample_rate, state=state)
+                emb = extract_embedding(spk_audio, sample_rate, embedding_session=emb_session)
                 if emb is not None and len(emb) > 0:
                     norm = np.linalg.norm(emb)
                     if norm > 0:
