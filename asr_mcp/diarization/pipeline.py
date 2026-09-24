@@ -340,17 +340,28 @@ class Diarizer:
         profiles: dict,
         known_speakers: dict,
     ) -> list:
-        """Refine every speaker-change boundary using raw uncollapsed VAD sections.
+        """Refine every speaker-change boundary using VAD-level granular speaker attribution.
 
-        For each gap/transition between consecutive segments:
-          1. Gather raw VAD speech sections spanning the gap.
-          2. Embed each section (batched ONNX, CMN).
-          3. Attribute each section to left or right speaker via cosine similarity.
-          4. Set a shared cut point = start of first right-speaker section.
-          5. left["end"] = cut; right["start"] = cut  (contiguous, no overlap/gap).
-        Fallback: energy-dip midpoint, then geometric midpoint.
+        Processes ALL consecutive transitions where the speaker changes — both actual
+        gaps (left.end < right.start) and contiguous boundaries (left.end == right.start).
+        For contiguous boundaries the search region is expanded ±margin into both segments
+        so raw VAD sections straddling the nominal cut point are embedded and attributed.
+
+        Algorithm per transition:
+          1. Determine search region: [gap_start - margin, gap_end + margin]
+             (for contiguous boundaries gap_start == gap_end, so region is [cut - margin, cut + margin])
+          2. Gather raw uncollapsed VAD sections overlapping the region (min 0.1s each)
+          3. Batch-embed all sections across ALL transitions in one ONNX pass (with LRU cache)
+          4. Attribute each section to left or right speaker via cosine dot product
+          5. _best_split: find the split index k that minimises total cost
+             (left sections right of k + right sections left of k, weighted by confidence margin)
+          6. cut = start of first right-owned section past the nominal boundary,
+             clamped to [left.start+eps, right.end-eps]
+          7. left["end"] = cut; right["start"] = cut  (contiguous, no overlap/gap)
+
+        Fallback chain: energy-dip centre → geometric midpoint.
         """
-        if len(segments) < 2:
+        if len(segments) < 2 or not self._raw_vad_sections:
             return segments
 
         refined = [dict(s) for s in segments]
@@ -358,103 +369,191 @@ class Diarizer:
         if emb_session is None:
             return refined
 
+        margin = 0.5          # expand region into both segments around contiguous boundary
+        min_sec_dur = 0.1     # minimum VAD section duration (seconds) to embed
+        audio_dur = len(waveform_np) / sample_rate
+        raw = sorted(self._raw_vad_sections, key=lambda s: s["start"])
+
+        # --- Pre-compute speaker reference embeddings (cached per speaker name) ---
+        ref_cache: dict[str, Optional[np.ndarray]] = {}
+
+        def _ref(name: str) -> Optional[np.ndarray]:
+            if name not in ref_cache:
+                ref_cache[name] = self._get_speaker_ref(
+                    name, profiles, known_speakers, waveform_np, sample_rate, refined
+                )
+            return ref_cache[name]
+
+        # --- Collect transitions and their candidate VAD sections ---
+        # transitions[i] = (left_idx, nominal_cut_start, nominal_cut_end, [vad_section, ...])
+        transitions = []
         for i in range(len(refined) - 1):
             left = refined[i]
             right = refined[i + 1]
-
             if left.get("speaker") == right.get("speaker"):
                 continue
 
-            gap_start = left["end"]
-            gap_end = right["start"]
+            gap_start = float(left["end"])
+            gap_end = float(right["start"])
 
-            # Collect raw VAD sections that overlap the gap region
-            # (span from gap_start - small buffer to gap_end + small buffer)
-            margin = 0.5
+            # Search region: expand into adjacent segments for contiguous boundaries
             region_start = max(0.0, gap_start - margin)
-            region_end = gap_end + margin
+            region_end = min(audio_dur, gap_end + margin)
 
-            valid = [
-                s for s in self._raw_vad_sections
+            secs = [
+                s for s in raw
                 if s["end"] > region_start and s["start"] < region_end
+                and (s["end"] - s["start"]) >= min_sec_dur
             ]
+            transitions.append((i, gap_start, gap_end, secs))
 
-            if not valid:
-                # Fallback: midpoint
-                cut = (gap_start + gap_end) / 2.0
-                left["end"] = cut
-                right["start"] = cut
-                continue
+        if not transitions:
+            return refined
 
-            # Embed each VAD section
-            section_embs = []
-            for sec in valid:
-                s_samp = int(max(sec["start"], region_start) * sample_rate)
-                e_samp = int(min(sec["end"], region_end) * sample_rate)
-                chunk = waveform_np[s_samp:e_samp]
-                if len(chunk) < int(0.1 * sample_rate):
-                    section_embs.append(None)
+        # --- Batch-embed all distinct VAD sections across all transitions ---
+        # Use identity (start, end tuple) as cache key within this call.
+        sec_key_to_emb: dict[tuple, Optional[np.ndarray]] = {}
+        all_secs_to_embed: list[dict] = []
+        seen_keys: set[tuple] = set()
+        for _, _, _, secs in transitions:
+            for s in secs:
+                key = (s["start"], s["end"])
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_secs_to_embed.append(s)
+
+        if all_secs_to_embed:
+            import hashlib
+            fbanks, valid_keys = [], []
+            from asr_mcp.speaker.audio import extract_fbank
+            for s in all_secs_to_embed:
+                a = int(s["start"] * sample_rate)
+                b = int(s["end"] * sample_rate)
+                b = min(b, len(waveform_np))
+                chunk = waveform_np[a:b]
+                if len(chunk) < int(min_sec_dur * sample_rate):
+                    sec_key_to_emb[(s["start"], s["end"])] = None
                     continue
-                tensor = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)
-                try:
-                    emb = extract_embedding(tensor, sample_rate, emb_session)
-                    arr = np.array(emb, dtype=np.float32)
-                    norm = np.linalg.norm(arr)
-                    section_embs.append(arr / norm if norm > 1e-8 else arr)
-                except Exception as exc:
-                    logger.debug("Boundary embed failed: %s", exc)
-                    section_embs.append(None)
+                t = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)
+                fb = extract_fbank(t, sample_rate)  # [1, T, 80]
+                fb = fb - fb.mean(dim=1, keepdim=True)  # CMN
+                fbanks.append(fb)
+                valid_keys.append((s["start"], s["end"]))
 
-            # Get speaker reference embeddings
-            left_ref = self._get_speaker_ref(
-                left["speaker"], profiles, known_speakers, waveform_np, sample_rate, refined
-            )
-            right_ref = self._get_speaker_ref(
-                right["speaker"], profiles, known_speakers, waveform_np, sample_rate, refined
-            )
+            if fbanks:
+                hashes = [hashlib.md5(fb.numpy().tobytes()).hexdigest() for fb in fbanks]
+                cached_embs: dict[int, np.ndarray] = {}
+                misses: list[int] = []
+                for idx, h in enumerate(hashes):
+                    hit = _embedding_cache.get(h)
+                    if hit is not None:
+                        cached_embs[idx] = hit
+                    else:
+                        misses.append(idx)
 
-            if left_ref is None or right_ref is None:
-                # Fallback: midpoint
-                cut = (gap_start + gap_end) / 2.0
-                left["end"] = cut
-                right["start"] = cut
-                continue
+                if misses:
+                    miss_fbs = [fbanks[idx] for idx in misses]
+                    max_len = max(fb.shape[1] for fb in miss_fbs)
+                    padded = []
+                    for fb in miss_fbs:
+                        if fb.shape[1] < max_len:
+                            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+                        padded.append(fb.squeeze(0))
+                    batch = torch.stack(padded).numpy().astype(np.float32)
+                    input_name = emb_session.get_inputs()[0].name
+                    output_names = [o.name for o in emb_session.get_outputs()]
+                    try:
+                        from asr_mcp.speaker.embedding import _run_with_cpu_fallback
+                        out_list = _run_with_cpu_fallback(emb_session, {input_name: batch}, output_names)
+                        out = out_list[0]
+                    except Exception as e:
+                        logger.warning("Boundary batch embed failed, skipping: %s", e)
+                        out = None
+                    if out is not None:
+                        for li, idx in enumerate(misses):
+                            e_vec = out[li].astype(np.float64)
+                            nrm = np.linalg.norm(e_vec)
+                            if nrm > 1e-8:
+                                e_vec = e_vec / nrm
+                            _embedding_cache.put(hashes[idx], e_vec)
+                            cached_embs[idx] = e_vec
 
-            # Attribute each section
-            owners = []
-            weights = []
-            for sec, emb in zip(valid, section_embs):
-                if emb is None:
-                    owners.append("left")
-                    weights.append(0.0)
-                    continue
-                d_left = 1.0 - float(np.dot(emb, left_ref))
-                d_right = 1.0 - float(np.dot(emb, right_ref))
-                margin_w = abs(d_left - d_right)
-                owners.append("right" if d_right < d_left else "left")
-                weights.append(margin_w)
+                for idx, key in enumerate(valid_keys):
+                    sec_key_to_emb[key] = cached_embs.get(idx)
 
-            # Find cut: start of first right-owned section that is past gap_start
-            cut = None
-            for k, (sec, owner) in enumerate(zip(valid, owners)):
-                if owner == "right" and sec["start"] >= gap_start - 0.05:
-                    cut = sec["start"]
-                    break
+        # --- Apply cuts ---
+        n_refined = 0
+        for i, gap_start, gap_end, secs in transitions:
+            left = refined[i]
+            right = refined[i + 1]
 
-            if cut is None:
-                # All sections attributed to left speaker — energy-dip fallback
-                cut = self._gap_energy_cut(waveform_np, gap_start, gap_end, sample_rate)
+            left_ref = _ref(left["speaker"])
+            right_ref = _ref(right["speaker"])
 
-            # Clamp within gap bounds
-            cut = max(gap_start, min(cut, gap_end))
+            owners_int: list[int] = []   # 0=left, 1=right
+            weights: list[float] = []
+            valid_secs: list[dict] = []
+
+            if left_ref is not None and right_ref is not None:
+                for s in secs:
+                    emb = sec_key_to_emb.get((s["start"], s["end"]))
+                    if emb is None:
+                        continue
+                    sa = float(np.dot(emb, left_ref))
+                    sb = float(np.dot(emb, right_ref))
+                    owners_int.append(0 if sa >= sb else 1)
+                    weights.append(abs(sa - sb) + 1e-3)
+                    valid_secs.append(s)
+
+            if valid_secs:
+                # _best_split: minimise weighted cost (left sections right of k
+                # that are owned by right, plus right sections left of k owned by left)
+                n = len(owners_int)
+                best_k, best_cost = 0, float("inf")
+                for k in range(n + 1):
+                    cost = 0.0
+                    for j in range(k):
+                        if owners_int[j] == 1:   # right section before cut → misclassified
+                            cost += weights[j]
+                    for j in range(k, n):
+                        if owners_int[j] == 0:   # left section after cut → misclassified
+                            cost += weights[j]
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_k = k
+
+                if best_k < n:
+                    cut = float(valid_secs[best_k]["start"])
+                else:
+                    cut = gap_end  # all sections belong to left speaker
+
+                # Clamp: must stay within [left.start+eps, right.end-eps]
+                cut = max(float(left["start"]) + 0.001, min(cut, float(right["end"]) - 0.001))
+                # Also respect original gap bounds for gap-type transitions
+                if gap_end > gap_start:
+                    cut = max(gap_start, min(cut, gap_end))
+            else:
+                # No embeddable sections — fallback chain
+                if gap_end > gap_start:
+                    cut = self._gap_energy_cut(waveform_np, gap_start, gap_end, sample_rate)
+                else:
+                    # Contiguous boundary: expand to find energy dip
+                    search_s = max(0.0, gap_start - margin)
+                    search_e = min(audio_dur, gap_end + margin)
+                    mid = self._gap_energy_cut(waveform_np, search_s, search_e, sample_rate)
+                    cut = max(float(left["start"]) + 0.001,
+                              min(mid, float(right["end"]) - 0.001))
 
             left["end"] = round(cut, 4)
             right["start"] = round(cut, 4)
+            n_refined += 1
             logger.debug(
-                "Boundary refinement %d: %s->%s cut at %.3fs",
-                i, left.get("speaker"), right.get("speaker"), cut
+                "Boundary refinement %d: %s->%s cut at %.3fs (sections=%d)",
+                i, left.get("speaker"), right.get("speaker"), cut, len(valid_secs)
             )
 
+        logger.info("exact_boundary_refinement_done: %d/%d transitions refined",
+                    n_refined, len(transitions))
         return refined
 
     @staticmethod
