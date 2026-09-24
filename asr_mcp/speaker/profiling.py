@@ -82,7 +82,7 @@ def profile_speakers(
         spectral = _extract_spectral_features(audio_np, sample_rate)
         mfcc_stats = _extract_mfcc_stats(audio_np, sample_rate)
 
-        profiles[speaker] = {
+        profile = {
             "pitch_hz": pitch_hz,
             "pitch_std": pitch_std,
             "energy_rms": energy_rms,
@@ -91,6 +91,9 @@ def profile_speakers(
             "total_speech_sec": total_duration,
             "mfcc": mfcc_stats,
         }
+        profile.update(spectral)
+        profile.update(mfcc_stats)
+        profiles[speaker] = profile
 
     return profiles
 
@@ -104,7 +107,7 @@ def relabel_by_pitch(
 
     sorted_speakers = sorted(
         profiles.keys(),
-        key=lambda s: profiles[s].get("pitch_hz", 0),
+        key=lambda s: profiles[s].get("pitch_hz", 0) if profiles[s].get("pitch_hz", 0) > 0 else 9999,
     )
 
     label_map = {}

@@ -12,16 +12,17 @@ def cap_clusters(
     long_labels: np.ndarray,
     max_clusters: int = 15,
 ) -> np.ndarray:
-    unique_labels = np.unique(long_labels)
-    if len(unique_labels) <= max_clusters:
-        return long_labels
-
-    logger.info("Capping clusters: %d -> %d", len(unique_labels), max_clusters)
-    from sklearn.cluster import KMeans
-    n_clusters = min(max_clusters, len(raw_embeddings))
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    new_labels = kmeans.fit_predict(raw_embeddings)
-    return new_labels
+    n_clusters = len(set(int(l) for l in long_labels))
+    if n_clusters > max_clusters:
+        logger.info("Capping clusters: %d -> %d", n_clusters, max_clusters)
+        clusterer = AgglomerativeClustering(
+            n_clusters=max_clusters,
+            metric="cosine",
+            linkage="average",
+        )
+        if len(raw_embeddings) > 1:
+            long_labels = clusterer.fit_predict(raw_embeddings)
+    return long_labels
 
 
 def greedy_merge_clusters(
@@ -29,38 +30,46 @@ def greedy_merge_clusters(
     long_labels: np.ndarray,
     merge_threshold: float = 0.25,
 ) -> Tuple[np.ndarray, dict[int, np.ndarray]]:
-    unique_labels = np.unique(long_labels)
-    centroids = {}
-    for label in unique_labels:
-        mask = long_labels == label
-        centroids[int(label)] = raw_embeddings[mask].mean(axis=0)
+    cluster_ids = sorted(set(int(l) for l in long_labels))
+    cluster_avgs = {}
+    for cid in cluster_ids:
+        mask = long_labels == cid
+        cluster_avgs[cid] = np.mean(raw_embeddings[mask], axis=0)
 
     changed = True
     while changed:
         changed = False
-        labels_list = sorted(centroids.keys())
-        if len(labels_list) < 2:
-            break
+        ids = sorted(cluster_avgs.keys())
+        for i_idx in range(len(ids)):
+            for j_idx in range(i_idx + 1, len(ids)):
+                id_i, id_j = ids[i_idx], ids[j_idx]
+                if id_i not in cluster_avgs or id_j not in cluster_avgs:
+                    continue
+                vi = cluster_avgs[id_i]
+                vj = cluster_avgs[id_j]
+                norm_i = np.linalg.norm(vi)
+                norm_j = np.linalg.norm(vj)
+                if norm_i < 1e-8 or norm_j < 1e-8:
+                    continue
+                dist = 1.0 - float(np.dot(vi, vj) / (norm_i * norm_j))
+                if dist < merge_threshold:
+                    long_labels[long_labels == id_j] = id_i
+                    mask_i = long_labels == id_i
+                    cluster_avgs[id_i] = np.mean(raw_embeddings[mask_i], axis=0)
+                    del cluster_avgs[id_j]
+                    changed = True
+                    break
+            if changed:
+                break
 
-        best_i, best_j, best_dist = -1, -1, float("inf")
-        for i in range(len(labels_list)):
-            for j in range(i + 1, len(labels_list)):
-                li, lj = labels_list[i], labels_list[j]
-                dist = 1.0 - float(np.dot(centroids[li], centroids[lj]) /
-                                   (np.linalg.norm(centroids[li]) * np.linalg.norm(centroids[lj]) + 1e-8))
-                if dist < best_dist:
-                    best_dist = dist
-                    best_i, best_j = li, lj
+    cluster_centroids = {}
+    for cluster_id in set(long_labels):
+        mask = (long_labels == cluster_id)
+        mean_emb = raw_embeddings[mask].mean(axis=0)
+        norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+        cluster_centroids[int(cluster_id)] = norm_emb
 
-        if best_dist < merge_threshold:
-            long_labels[long_labels == best_j] = best_i
-            mask = long_labels == best_i
-            centroids[best_i] = raw_embeddings[mask].mean(axis=0)
-            del centroids[best_j]
-            changed = True
-            logger.debug("Merged cluster %d -> %d (dist=%.3f)", best_j, best_i, best_dist)
-
-    return long_labels, centroids
+    return long_labels, cluster_centroids
 
 
 def match_known_speakers_simple(

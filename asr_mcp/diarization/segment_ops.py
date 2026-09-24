@@ -7,13 +7,15 @@ logger = logging.getLogger("asr_mcp.diarization.segment_ops")
 def collapse_same_speaker_segments(segments: list, max_gap: float = 0.5) -> list:
     if not segments:
         return []
+    segments = sorted(segments, key=lambda x: x["start"])
     result = [segments[0].copy()]
     for seg in segments[1:]:
-        if (seg.get("speaker") == result[-1].get("speaker")
-                and seg.get("start", 0) - result[-1].get("end", 0) <= max_gap):
-            result[-1]["end"] = seg.get("end", result[-1].get("end"))
-            if "text" in seg and "text" in result[-1]:
-                result[-1]["text"] = result[-1]["text"] + " " + seg["text"]
+        prev = result[-1]
+        if (seg.get("speaker") == prev.get("speaker")
+                and seg.get("start", 0) - prev.get("end", 0) <= max_gap):
+            prev["end"] = max(prev.get("end", 0), seg.get("end", 0))
+            if "text" in seg and "text" in prev:
+                prev["text"] = prev["text"] + " " + seg["text"]
         else:
             result.append(seg.copy())
     return result
@@ -155,11 +157,13 @@ def eliminate_ghost_speakers(
             if best_alt is None and non_ghost:
                 seg_mid = (seg.get("start", 0) + seg.get("end", 0)) / 2.0
                 best_dist = float("inf")
-                for other_spk in non_ghost:
-                    dist = _nearest_midpoint_distance(segments, seg_mid, other_spk)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_alt = other_spk
+                for other in segments:
+                    if other is seg or other.get("speaker") in ghost_speakers:
+                        continue
+                    d = abs((other.get("start", 0) + other.get("end", 0)) / 2.0 - seg_mid)
+                    if d < best_dist:
+                        best_dist = d
+                        best_alt = other.get("speaker")
 
             if best_alt:
                 seg = dict(seg)
