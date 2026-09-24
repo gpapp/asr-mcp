@@ -625,12 +625,23 @@ def _load_known_speakers(settings, user_id: str) -> dict:
     """Load all stored voiceprints from DB for speaker matching."""
     try:
         from asr_mcp.db.manager import DatabaseManager, VoiceprintDB
+        from asr_mcp.voiceprint.service import is_spurious_speaker_name
         db = DatabaseManager(settings.db_path)
         vp_db = VoiceprintDB(db)
         all_vps = vp_db.list_all(user_id=user_id)
-        if all_vps:
-            logger.info("Loaded %d known voiceprints for user %s", len(all_vps), user_id)
-        return all_vps
+        valid_vps = {}
+        for name, vp in all_vps.items():
+            if is_spurious_speaker_name(name):
+                try:
+                    vp_db.delete(name, user_id=user_id)
+                    logger.info("Purged spurious voiceprint %r from DB", name)
+                except Exception:
+                    pass
+            else:
+                valid_vps[name] = vp
+        if valid_vps:
+            logger.info("Loaded %d known voiceprints for user %s", len(valid_vps), user_id)
+        return valid_vps
     except Exception as e:
         logger.warning("Failed to load known voiceprints: %s", e)
         return {}

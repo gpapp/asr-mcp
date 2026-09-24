@@ -82,18 +82,32 @@ def compute_distance(
 
     vp_emb = np.array(voiceprint.get("embedding", []), dtype=np.float32)
     if len(vp_emb) == 0 or len(cluster_emb) == 0:
-        return {"total": 1.0, "embedding": 1.0, "pitch": 0.5, "energy": 0.5, "spectral": 0.5, "mfcc": 0.5}
+        return {
+            "total": 1.0,
+            "combined": 1.0,
+            "embedding": 1.0,
+            "emb_dist": 1.0,
+            "pitch": 0.5,
+            "pitch_dist": 0.5,
+            "energy": 0.5,
+            "energy_dist": 0.5,
+            "spectral": 0.5,
+            "spectral_dist": 0.5,
+            "mfcc": 0.5,
+            "mfcc_dist": 0.5,
+            "confidence": 0.0,
+        }
 
     emb_dist = 1.0 - float(np.dot(cluster_emb, vp_emb) /
                            (np.linalg.norm(cluster_emb) * np.linalg.norm(vp_emb) + 1e-8))
 
     pitch_per = norm_cfg.get("pitch_hz_per_unit", 50)
     energy_per = norm_cfg.get("energy_rms_per_unit", 0.05)
-    vp_pitch = voiceprint.get("pitch_hz", 0.0)
-    vp_energy = voiceprint.get("energy_rms", 0.0)
+    vp_pitch = voiceprint.get("pitch_hz", 0.0) or 0.0
+    vp_energy = voiceprint.get("energy_rms", 0.0) or 0.0
 
-    pitch_dist = abs(cluster_pitch - vp_pitch) / pitch_per if pitch_per else 0.0
-    energy_dist = abs(cluster_energy - vp_energy) / energy_per if energy_per else 0.0
+    pitch_dist = abs(cluster_pitch - vp_pitch) / pitch_per if (pitch_per and cluster_pitch > 0 and vp_pitch > 0) else 0.5
+    energy_dist = abs(cluster_energy - vp_energy) / energy_per if (energy_per and cluster_energy > 0 and vp_energy > 0) else 0.5
 
     if cluster_features:
         spectral_dist = _compute_spectral_distance(cluster_features, voiceprint, norm_cfg)
@@ -104,19 +118,29 @@ def compute_distance(
 
     total = (
         weights.get("embedding", 0.6) * emb_dist
-        + weights.get("pitch", 0.15) * pitch_dist
-        + weights.get("energy", 0.0) * energy_dist
-        + weights.get("spectral", 0.1) * spectral_dist
-        + weights.get("mfcc", 0.1) * mfcc_dist
+        + weights.get("pitch", 0.15) * min(pitch_dist, 1.0)
+        + weights.get("energy", 0.0) * min(energy_dist, 1.0)
+        + weights.get("spectral", 0.1) * min(spectral_dist, 1.0)
+        + weights.get("mfcc", 0.1) * min(mfcc_dist, 1.0)
     )
 
+    conf_max_dist = norm_cfg.get("confidence_max_distance", 0.5)
+    confidence = max(0.0, 1.0 - (total / conf_max_dist)) if conf_max_dist else 0.5
+
     return {
-        "total": total,
-        "embedding": emb_dist,
-        "pitch": pitch_dist,
-        "energy": energy_dist,
-        "spectral": spectral_dist,
-        "mfcc": mfcc_dist,
+        "total": round(float(total), 4),
+        "combined": round(float(total), 4),
+        "embedding": round(float(emb_dist), 4),
+        "emb_dist": round(float(emb_dist), 4),
+        "pitch": round(float(pitch_dist), 4),
+        "pitch_dist": round(float(pitch_dist), 4),
+        "energy": round(float(energy_dist), 4),
+        "energy_dist": round(float(energy_dist), 4),
+        "spectral": round(float(spectral_dist), 4),
+        "spectral_dist": round(float(spectral_dist), 4),
+        "mfcc": round(float(mfcc_dist), 4),
+        "mfcc_dist": round(float(mfcc_dist), 4),
+        "confidence": round(float(confidence), 4),
     }
 
 
@@ -128,19 +152,21 @@ def find_best_match(
     cfg: Dict = None,
     cluster_features: Dict = None,
 ) -> Tuple[Optional[str], float, float, Dict[str, Dict]]:
-    matches = {}
+    distances = {}
     for name, vp in voiceprints.items():
         dist = compute_distance(cluster_emb, cluster_pitch, cluster_energy, vp, cfg, cluster_features)
-        matches[name] = dist
+        distances[name] = dist
+
+    matches = [(name, d["combined"], d["confidence"]) for name, d in distances.items()]
+    matches.sort(key=lambda x: x[1])
 
     if not matches:
-        return None, 1.0, 1.0, matches
+        return None, float("inf"), 0.0, {}
 
-    sorted_matches = sorted(matches.items(), key=lambda x: x[1]["total"])
-    best_name, best_dist = sorted_matches[0]
-    second_dist = sorted_matches[1][1]["total"] if len(sorted_matches) > 1 else 1.0
+    best_name, best_dist, best_conf = matches[0]
+    second_dist = matches[1][1] if len(matches) > 1 else 1.0
 
-    return best_name, best_dist["total"], second_dist, matches
+    return best_name, best_dist, second_dist, distances
 
 
 def is_clear_winner(matches: List[Tuple], voiceprints: Dict, cfg: Dict = None) -> bool:
@@ -153,8 +179,8 @@ def is_clear_winner(matches: List[Tuple], voiceprints: Dict, cfg: Dict = None) -
 
     best = matches[0][1]
     second = matches[1][1]
-    best_val = best["total"] if isinstance(best, dict) else best
-    second_val = second["total"] if isinstance(second, dict) else second
+    best_val = best["combined"] if isinstance(best, dict) else best
+    second_val = second["combined"] if isinstance(second, dict) else second
     gap = second_val - best_val
 
     if gap >= gap_threshold:
@@ -189,37 +215,48 @@ def match_clusters(
     embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
     embed_only_accept = matching_cfg.get("embed_only_accept_threshold", 0.22)
 
+    all_cluster_features = all_cluster_features or {}
     results = {}
+
     for cluster_id, cluster_data in clusters.items():
         emb = cluster_data.get("embedding", [])
-        pitch = cluster_data.get("pitch_hz", 0.0)
-        energy = cluster_data.get("energy_rms", 0.0)
-        features = (all_cluster_features or {}).get(cluster_id)
+        pitch = cluster_data.get("pitch_hz", 0.0) or 0.0
+        energy = cluster_data.get("energy_rms", 0.0) or 0.0
+        features = all_cluster_features.get(cluster_id, {})
 
-        best_name, best_dist, second_dist, all_matches = find_best_match(
+        if not emb:
+            continue
+
+        best_name, best_dist, second_dist, all_distances = find_best_match(
             emb, pitch, energy, voiceprints, cfg, features
         )
 
-        matched = False
-        label = cluster_id
+        matches = [(name, d["combined"], d["confidence"]) for name, d in all_distances.items()]
+        matches.sort(key=lambda x: x[1])
 
-        if best_name and best_dist < accept_thresh:
-            if best_dist < embed_only_thresh:
-                matched = True
-                label = best_name
-            elif is_clear_winner(
-                sorted(all_matches.items(), key=lambda x: x[1]["total"]),
-                voiceprints, cfg,
-            ):
-                matched = True
-                label = best_name
+        clear_winner = is_clear_winner(matches, voiceprints, cfg)
+
+        if all_distances.get(best_name, {}).get("emb_dist", 1.0) < embed_only_thresh:
+            effective_threshold = embed_only_accept
+        else:
+            effective_threshold = accept_thresh
+
+        matched = (
+            best_name is not None and
+            best_dist <= effective_threshold and
+            clear_winner
+        )
 
         results[cluster_id] = {
             "matched": matched,
-            "label": label,
+            "label": best_name if matched else cluster_id,
+            "name": best_name if matched else None,
             "distance": best_dist,
             "best_match": best_name,
-            "all_distances": {k: v["total"] for k, v in all_matches.items()},
+            "confidence": all_distances.get(best_name, {}).get("confidence", 0.0) if matched else 0.0,
+            "distances": all_distances,
+            "all_distances": {k: v["combined"] for k, v in all_distances.items()},
+            "clear_winner": clear_winner,
         }
 
     return results

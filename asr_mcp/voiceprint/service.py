@@ -33,6 +33,20 @@ def _origin_prefix(audio_path: str) -> str:
     return (stem or "audio")[:64]
 
 
+def is_spurious_speaker_name(name: str) -> bool:
+    """Check if a speaker name is generic or auto-generated."""
+    import re
+    if not name or name == "OVERLAP":
+        return True
+    if re.match(r"^(SPEAKER|Speaker\s*)\d+$", name, re.IGNORECASE):
+        return True
+    if re.search(r"_\d{2}-\d{2}-\d{2}_(SPEAKER|Speaker\s*)\d+$", name, re.IGNORECASE):
+        return True
+    if re.match(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_.*$", name):
+        return True
+    return False
+
+
 class VoiceprintService:
     def __init__(self, data_dir: Path, db_manager: DatabaseManager, embedding_session=None):
         self._data_dir = data_dir
@@ -511,32 +525,17 @@ class VoiceprintService:
                 continue
             by_speaker.setdefault(sp, []).append(seg)
 
-        origin = _origin_prefix(audio_path)
-        final_names: dict[str, str] = {}
-        for speaker_name in by_speaker:
-            if self._db.get(speaker_name, user_id=user_id) or \
-                    self._snippets.count(speaker_name, user_id=user_id) > 0:
-                final_names[speaker_name] = speaker_name
-            else:
-                final_names[speaker_name] = f"{origin}_{speaker_name}"
-
         for speaker_name, segs in by_speaker.items():
-            final_name = final_names[speaker_name]
-            # Don't auto-collect for spurious/ghost unnamed speakers with <10s total speech
-            total_spk_dur = sum(s.get("end", 0) - s.get("start", 0) for s in segs)
-            is_new_unregistered = (
-                final_name != speaker_name or
-                not self._db.get(final_name, user_id=user_id)
-            )
-            if is_new_unregistered and total_spk_dur < 10.0:
+            # ONLY auto-collect for genuinely registered known speakers (e.g. "Gergely Papp", "Ismael Capel")
+            # NEVER create auto-collected voiceprints for generic/unregistered "Speaker N" or timestamped clusters.
+            if is_spurious_speaker_name(speaker_name):
+                continue
+            if not self._db.get(speaker_name, user_id=user_id):
                 continue
 
-            if final_name != speaker_name:
-                for seg in segs:
-                    seg["speaker"] = final_name
             if len(segs) < AUTO_COLLECT_MIN_SPEAKER_SEGMENTS:
                 continue
-            current_total = speaker_totals.get(final_name, 0.0)
+            current_total = speaker_totals.get(speaker_name, 0.0)
             if current_total >= AUTO_COLLECT_MAX_TOTAL_SEC:
                 continue
 
@@ -560,7 +559,7 @@ class VoiceprintService:
                         current_total -= existing["duration_sec"]
 
                     result = self.add_snippet_from_segment(
-                        speaker_name=final_name,
+                        speaker_name=speaker_name,
                         wav_path=audio_path,
                         start_sec=seg_start,
                         end_sec=chunk_end,
@@ -568,14 +567,13 @@ class VoiceprintService:
                         source_audio=source_id,
                     )
                     if "error" not in result:
-                        speaker_totals[final_name] = current_total + dur
+                        speaker_totals[speaker_name] = current_total + dur
                         current_total += dur
                         collected.append(result)
 
                     seg_start = chunk_end
 
-        for final_name in final_names.values():
-            self._auto_refine(final_name, user_id=user_id)
+            self._auto_refine(speaker_name, user_id=user_id)
 
         return collected
 
