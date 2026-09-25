@@ -24,6 +24,15 @@ scikit-learn
 # ONNX Runtime (GPU — CUDA 12)
 onnxruntime-gpu>=1.22.0
 
+# Qwen3-ASR backend (transformers, optional)
+# sox==1.4.1 pinned: latest sox sdist lacks a wheel and fails to build under
+# pip build isolation (its setup imports numpy, which isn't in the build env)
+sox==1.4.1
+qwen-asr
+transformers>=4.45.0
+accelerate
+bitsandbytes
+
 # Tokenizer & model download
 tokenizers
 huggingface-hub

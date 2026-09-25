@@ -126,15 +126,14 @@ async def mcp_call(
         return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
 
     elif tool_name == "transcribe_audio":
-        from asr_mcp.core.transcriber import transcribe_audio_sync, _compute_mel_spectrogram_fast
+        from asr_mcp.core.transcriber import transcribe_audio_sync
         from asr_mcp.voiceprint.utils import load_audio
         import numpy as np
 
         wav_path = arguments.get("wav_path")
         waveform, sr = load_audio(wav_path)
         audio_np = waveform.numpy().squeeze().astype(np.float32)
-        mel = _compute_mel_spectrogram_fast(audio_np)
-        result = transcribe_audio_sync(mel_spectrogram=mel)
+        result = transcribe_audio_sync(audio=audio_np)
         return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
 
     elif tool_name == "identify_speaker":

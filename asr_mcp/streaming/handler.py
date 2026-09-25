@@ -6,7 +6,6 @@ import time
 from typing import Optional
 
 import numpy as np
-import torch
 from fastapi import WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger("asr_mcp.streaming.handler")
@@ -35,7 +34,7 @@ async def handle_ws_stream(websocket: WebSocket):
     from asr_mcp.config.settings import get_settings
     from asr_mcp.speaker.embedding import extract_embedding
     from asr_mcp.speaker.matcher import find_best_match
-    from asr_mcp.core.transcriber import transcribe_audio_sync, _compute_mel_spectrogram_fast
+    from asr_mcp.core.transcriber import transcribe_audio_sync
 
     settings = get_settings()
     state.ensure_ready()
@@ -111,11 +110,7 @@ async def _process_utterance(
         return
 
     try:
-        waveform = torch.from_numpy(audio_np).unsqueeze(0)
-
-        from asr_mcp.core.transcriber import _compute_mel_spectrogram_fast
-        mel = _compute_mel_spectrogram_fast(audio_np)
-        result = transcribe_audio_sync(mel_spectrogram=mel)
+        result = transcribe_audio_sync(audio=audio_np)
 
         text = result.get("text", "")
         if not text.strip():

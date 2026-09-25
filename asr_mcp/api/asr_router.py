@@ -872,7 +872,7 @@ async def transcribe_endpoint(
     _: str = Depends(verify_api_key),
 ):
     from asr_mcp.core.model_state import state
-    from asr_mcp.core.transcriber import transcribe_audio_sync, _compute_mel_spectrogram_fast
+    from asr_mcp.core.transcriber import transcribe_audio_sync
     from asr_mcp.diarization.pipeline import Diarizer
     from asr_mcp.voiceprint.utils import load_audio
     import numpy as np
@@ -897,8 +897,7 @@ async def transcribe_endpoint(
 
     segments = diarization.get("segments", [])
     if not segments:
-        mel = _compute_mel_spectrogram_fast(audio_np)
-        result = transcribe_audio_sync(mel_spectrogram=mel)
+        result = transcribe_audio_sync(audio=audio_np)
         return TranscribeResponse(
             results=[TranscribeResult(**result)],
             total_time_sec=result.get("inference_time_sec", 0),
@@ -939,7 +938,7 @@ async def transcribe_upload(
     wav_path = convert_to_wav(str(tmp_path), tmp_dir)
 
     from asr_mcp.core.model_state import state
-    from asr_mcp.core.transcriber import transcribe_audio_sync, _compute_mel_spectrogram_fast
+    from asr_mcp.core.transcriber import transcribe_audio_sync
     from asr_mcp.diarization.pipeline import Diarizer
     from asr_mcp.voiceprint.utils import load_audio
     import numpy as np
@@ -1024,8 +1023,7 @@ async def transcribe_upload(
 
             if not segments:
                 await _sse_put(queue, {"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
-                mel = _compute_mel_spectrogram_fast(audio_np)
-                result = transcribe_audio_sync(mel_spectrogram=mel)
+                result = transcribe_audio_sync(audio=audio_np)
                 diarization["results"] = [_result_to_dict(TranscribeResult(**result))]
                 await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
                 return

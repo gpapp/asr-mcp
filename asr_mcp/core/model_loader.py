@@ -3,13 +3,39 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger("asr_mcp.core.model_loader")
+
+# Preload CUDA libraries BEFORE any ORT CUDA session is created: importing torch
+# dlopens libcudnn/libcublas into the global namespace (RTLD_GLOBAL), which ORT's
+# CUDAExecutionProvider needs at runtime. On the nvidia/cuda:12.2.0 runtime base
+# image cuDNN exists only inside the pip nvidia-cudnn-cu12 wheel, and ORT cannot
+# locate it on its own, so without this preload CUDA sessions silently fall back
+# to CPU and the per-run arena-shrink options then crash with "no arena allocator
+# for gpu:0".
+def _preload_cuda_libs() -> bool:
+    try:
+        import torch  # noqa: F401
+        # Ensure cuDNN/cuBLAS are in the global namespace exactly when torch
+        # bundles them (pip nvidia-cudnn-cu12 / nvidia-cublas-cu12 wheels).
+        for lib in ("libcudnn.so.9", "libcublas.so.12", "libcublasLt.so.12"):
+            try:
+                import ctypes
+                ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+        return True
+    except Exception:
+        logger.warning("torch/cuDNN preload failed: CUDAExecutionProvider may fail", exc_info=True)
+        return False
+
+
+_PRELOADED = _preload_cuda_libs()
+
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from asr_mcp.core.model_state import ModelState, state
 from asr_mcp.config.settings import Settings
-
-logger = logging.getLogger("asr_mcp.core.model_loader")
 
 
 def get_session_options(settings: Settings = None) -> ort.SessionOptions:
@@ -138,110 +164,28 @@ def ensure_embedding_model(settings: Settings) -> Path:
     )
 
 
-def _load_tokenizer(model_dir: Path):
-    tokenizer_path = model_dir / "tokenizer.json"
-    if not tokenizer_path.exists():
-        logger.warning("tokenizer.json not found at %s", tokenizer_path)
-        return None
-    try:
-        from tokenizers import Tokenizer
-        tokenizer = Tokenizer.from_file(str(tokenizer_path))
-        logger.info("Loaded tokenizer from %s (vocab_size=%d)", tokenizer_path, tokenizer.get_vocab_size())
-        return tokenizer
-    except Exception as e:
-        logger.error("Failed to load tokenizer: %s", e)
-        return None
-
-
-def _build_prompt_ids(tokenizer, language: str = "en") -> list[int]:
-    token_to_id = tokenizer.get_vocab()
-    lang_token = f"<|{language}|>"
-    prompt_tokens = [
-        "<|startofcontext|>",
-        "<|startoftranscript|>",
-        "<|emo:undefined|>",
-        lang_token,
-        lang_token,
-        "<|pnc|>",
-        "<|noitn|>",
-        "<|timestamp|>",
-        "<|nodiarize|>",
-    ]
-    return [token_to_id[t] for t in prompt_tokens if t in token_to_id]
-
-
-def load_models(settings: Settings) -> None:
-    so = get_session_options(settings)
-
-    model_dir = ensure_model(settings)
-    encoder_file = f"onnx/encoder_model{settings.encoder_model_type}.onnx"
-    decoder_file = f"onnx/decoder_model_merged{settings.decoder_model_type}.onnx"
-
-    enc_providers = _get_providers(settings, "encoder")
-    logger.info("Loading encoder session (providers=%s)", enc_providers)
-    state.encoder_session = ort.InferenceSession(
-        str(model_dir / encoder_file), sess_options=so, providers=enc_providers
-    )
-
-    enc_inputs = [inp.name for inp in state.encoder_session.get_inputs()]
-    enc_outputs = [out.name for out in state.encoder_session.get_outputs()]
-    logger.info("Encoder inputs: %s", enc_inputs)
-    logger.info("Encoder outputs: %s", enc_outputs)
-
-    logger.info("Loading decoder session (CPU only)")
-    cpu_so = get_session_options(settings)
-    state.decoder_session = ort.InferenceSession(
-        str(model_dir / decoder_file), sess_options=cpu_so, providers=["CPUExecutionProvider"]
-    )
-
-    dec_inputs = [inp.name for inp in state.decoder_session.get_inputs()]
-    dec_outputs = [out.name for out in state.decoder_session.get_outputs()]
-    logger.info("Decoder inputs: %s", dec_inputs)
-    logger.info("Decoder outputs: %s", dec_outputs)
-
-    state.tokenizer = _load_tokenizer(model_dir)
-    if state.tokenizer:
-        state.prompt_ids = _build_prompt_ids(state.tokenizer)
-        token_to_id = state.tokenizer.get_vocab()
-        state.tokens = {v: k for k, v in token_to_id.items()}
-        state.eos_token_id = token_to_id.get("endoftext", 3)
-        state.decoder_start_token_id = 13764
-        logger.info("Decoder prompt token IDs: %s", state.prompt_ids)
-        logger.info("EOS token ID: %d", state.eos_token_id)
-    else:
-        state.prompt_ids = [13764, 13902, 14190, 14021, 14074, 14254, 13912]
-        state.eos_token_id = 3
-        state.decoder_start_token_id = 13764
-        logger.warning("Tokenizer not loaded, using hardcoded prompt IDs: %s", state.prompt_ids)
-
+def load_vad_session(settings: Settings = None) -> ort.InferenceSession:
+    if not settings:
+        from asr_mcp.config.settings import get_settings
+        settings = get_settings()
     vad_path = ensure_vad_model(settings)
+    so = get_session_options(settings)
     logger.info("Loading VAD session (CPU)")
-    state.vad_session = ort.InferenceSession(
+    return ort.InferenceSession(
         str(vad_path), sess_options=so, providers=["CPUExecutionProvider"]
     )
 
+
+def load_embedding_session(settings: Settings = None):
+    if not settings:
+        from asr_mcp.config.settings import get_settings
+        settings = get_settings()
     emb_path = ensure_embedding_model(settings)
     emb_providers = _get_providers(settings, "embedding")
-    logger.info("Loading embedding session (providers=%s)", emb_providers)
-    state.embedding_session = ort.InferenceSession(
-        str(emb_path), sess_options=so, providers=emb_providers
-    )
-
-    state.settings = settings
-
-    logger.info("All models loaded successfully")
-
-
-def reload_encoder_session(settings: Settings, force_cpu: bool = False) -> None:
-    import gc
     so = get_session_options(settings)
-    model_dir = Path(settings.model_dir)
-    encoder_file = f"onnx/encoder_model{settings.encoder_model_type}.onnx"
-    providers = ["CPUExecutionProvider"] if force_cpu else _get_providers(settings, "encoder")
-    state.encoder_session = None
-    gc.collect()
-    state.encoder_session = ort.InferenceSession(
-        str(model_dir / encoder_file), sess_options=so, providers=providers
+    logger.info("Loading embedding session (providers=%s)", emb_providers)
+    return ort.InferenceSession(
+        str(emb_path), sess_options=so, providers=emb_providers
     )
 
 

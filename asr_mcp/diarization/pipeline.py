@@ -58,7 +58,7 @@ class Diarizer:
 
         start_time = time.time()
 
-        if not self._state.is_ready:
+        if self._state.vad_session is None or self._state.embedding_session is None:
             return {"error": "Models not loaded. CUDA GPU required.", "segments": [], "total_time_sec": 0}
 
         # Load audio

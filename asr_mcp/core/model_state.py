@@ -107,15 +107,9 @@ class LRUCache:
 
 class ModelState:
     def __init__(self):
-        self.encoder_session = None
-        self.decoder_session = None
+        self.backend = None  # ASRBackend instance (encoder/decoder/model owned by it)
         self.embedding_session = None
         self.vad_session = None
-        self.tokens = None
-        self.tokenizer = None
-        self.prompt_ids = None
-        self.eos_token_id = 3
-        self.decoder_start_token_id = 13764
         self.device = "cpu"
         self.settings = None
         self.embedding_cache = LRUCache()
@@ -124,21 +118,20 @@ class ModelState:
 
     @property
     def is_ready(self) -> bool:
-        return all([
-            self.encoder_session is not None,
-            self.decoder_session is not None,
-            self.embedding_session is not None,
-            self.vad_session is not None,
-        ])
+        return bool(
+            self.backend is not None
+            and self.backend.is_loaded
+            and self.embedding_session is not None
+            and self.vad_session is not None
+        )
 
     @property
     def any_loaded(self) -> bool:
-        return any([
-            self.encoder_session is not None,
-            self.decoder_session is not None,
-            self.embedding_session is not None,
-            self.vad_session is not None,
-        ])
+        return bool(
+            (self.backend is not None and self.backend.is_loaded)
+            or self.embedding_session is not None
+            or self.vad_session is not None
+        )
 
     def touch(self):
         """Record last usage time."""
@@ -154,28 +147,28 @@ class ModelState:
         """Unload all loaded models to free VRAM."""
         import gc
         with self._lock:
-            loaded = [n for n in ("encoder_session", "decoder_session", "embedding_session", "vad_session") if getattr(self, n) is not None]
+            loaded = []
+            if self.backend is not None:
+                if self.backend.is_loaded:
+                    loaded.append("asr_backend")
+                self.backend.unload()
+            if self.embedding_session is not None:
+                self.embedding_session = None
+                loaded.append("embedding_session")
+            if self.vad_session is not None:
+                self.vad_session = None
+                loaded.append("vad_session")
             if not loaded:
                 return
             logger.info("Unloading models (idle %.0fs): %s", self.idle_seconds(), ", ".join(loaded))
-            self.encoder_session = None
-            self.decoder_session = None
-            self.embedding_session = None
-            self.vad_session = None
             self._last_used = 0.0
         gc.collect()
         log_gpu_memory("models unloaded")
         logger.info("Models unloaded")
 
     def unload_encoder(self):
-        import gc
-        with self._lock:
-            if self.encoder_session is None:
-                return
-            logger.info("Unloading encoder session (VRAM)")
-            self.encoder_session = None
-        gc.collect()
-        log_gpu_memory("encoder unloaded")
+        if self.backend is not None:
+            self.backend.unload_encoder()
 
     def unload_embedding(self):
         import gc
@@ -196,43 +189,27 @@ class ModelState:
         if not self.settings:
             from asr_mcp.config.settings import get_settings
             self.settings = get_settings()
-        from asr_mcp.core.model_loader import load_models, reload_encoder_session, reload_embedding_session
+        from asr_mcp.core.model_loader import (
+            load_vad_session,
+            load_embedding_session,
+        )
+        from asr_mcp.transcribers import get_backend
         import gc
         try:
-            cold = (
-                self.tokens is None
-                and self.encoder_session is None
-                and self.decoder_session is None
-                and self.embedding_session is None
-                and self.vad_session is None
-            )
-            # load_models() rebuilds the GPU sessions from scratch; if it is
-            # needed we must drop any partially-loaded sessions FIRST, otherwise
-            # the fresh encoder/embedding arenas peak together with the ones we
-            # just (re)loaded -> CUDA OOM on the residual allocation.
-            full_needed = (
-                self.decoder_session is None
-                or self.vad_session is None
-                or self.tokens is None
-            )
-            if cold:
-                logger.info("Cold-loading all models...")
-                load_models(self.settings)
-            elif full_needed:
-                logger.info("Hard-reloading all models (clearing partial sessions)...")
-                self.encoder_session = None
-                self.decoder_session = None
-                self.embedding_session = None
-                self.vad_session = None
-                gc.collect()
-                load_models(self.settings)
-            else:
-                if self.encoder_session is None:
-                    logger.info("Loading encoder session (partial)...")
-                    reload_encoder_session(self.settings)
-                if self.embedding_session is None:
-                    logger.info("Loading embedding session (partial)...")
-                    reload_embedding_session(self.settings)
+            if self.backend is None or self.backend.name != self.settings.asr_model:
+                if self.backend is not None:
+                    self.backend.unload()
+                    gc.collect()
+                self.backend = get_backend(self.settings)
+            if not self.backend.is_loaded:
+                logger.info("Loading ASR backend '%s'...", self.backend.name)
+                self.backend.load(self.settings)
+            if self.vad_session is None:
+                logger.info("Loading VAD session (CPU)...")
+                self.vad_session = load_vad_session(self.settings)
+            if self.embedding_session is None:
+                logger.info("Loading embedding session...")
+                self.embedding_session = load_embedding_session(self.settings)
             self.touch()
             if self.is_ready:
                 logger.info("Models ready")
@@ -250,8 +227,8 @@ class ModelState:
 
     def clear_gpu_memory(self):
         import gc
-        self.encoder_session = None
-        self.decoder_session = None
+        if self.backend is not None:
+            self.backend.unload()
         self.embedding_session = None
         self.vad_session = None
         gc.collect()

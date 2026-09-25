@@ -20,11 +20,24 @@ class Settings(BaseSettings):
     gpu_memory_limit_gb: float = Field(default=4.0, description="Max GPU memory limit")
     cpu_threads: int = Field(default=max(1, os.cpu_count() - 1))
 
+    # ASR backend selection: "cohere" (ONNX, default) or "qwen3-asr" (transformers)
+    asr_model: str = Field(default="cohere", description="ASR backend: cohere | qwen3-asr")
+
     # ASR Model (Cohere Transcribe ONNX)
     model_repo: str = Field(default="onnx-community/cohere-transcribe-03-2026-ONNX")
     model_dir: Path = Path("./models/cohere-transcribe")
     encoder_model_type: str = "_q4"
     decoder_model_type: str = "_q4"
+
+    # ASR Model (Qwen3-ASR + ForcedAligner, transformers backend)
+    qwen_model_name: str = Field(default="Qwen/Qwen3-ASR-1.7B")
+    qwen_model_dir: Path = Path("./models/qwen3-asr")
+    qwen_forced_aligner_name: str = Field(default="Qwen/Qwen3-ForcedAligner-0.6B")
+    qwen_forced_aligner_dir: Path = Path("./models/qwen3-forced-aligner")
+    qwen_torch_dtype: str = Field(default="float16", description="dtype for Qwen3 model/aligner")
+    qwen_max_new_tokens: int = Field(default=256)
+    qwen_max_inference_batch_size: int = Field(default=8)
+    qwen_quantize_4bit: bool = Field(default=True, description="Load quantized Qwen3-ASR via load_in_4bit")
 
     # Embedding Model (ECAPA-TDNN)
     embedding_model_repo: str = Field(default="Wespeaker/wespeaker-ecapa-tdnn512-LM")
@@ -87,7 +100,8 @@ class Settings(BaseSettings):
 
     @field_validator(
         "data_dir", "log_dir", "model_dir", "embedding_model_dir",
-        "vad_model_dir", "model_cache_dir", "voices_dir", mode="before"
+        "vad_model_dir", "model_cache_dir", "voices_dir",
+        "qwen_model_dir", "qwen_forced_aligner_dir", mode="before"
     )
     @classmethod
     def ensure_paths(cls, v):
