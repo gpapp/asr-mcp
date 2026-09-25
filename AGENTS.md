@@ -37,7 +37,8 @@ After completing any code changes:
 - `TRANSCRIBE_PREFIX` sets URL prefix for redirects behind reverse proxy
 
 ### GPU Backend
-- **ASR Encoder**: ONNX Runtime CUDA EP — chunked input for long audio (>30s). Arena cap `gpu_memory_limit_gb×0.625` (2560 MiB @ 4GB) + `cudnn_conv_algo_search: HEURISTIC`. OOM escalation (`_run_encoder`): reload fresh arena → retry GPU → cached CPU session (success = no error field).
+- **CUDA library preload**: `model_loader.py` runs `_preload_cuda_libs()` at module import — `import torch` then `ctypes.CDLL(libcudnn.so.9/libcublas.so.12/libcublasLt.so.12, RTLD_GLOBAL)`. The base image has no cuDNN in system paths (only the pip `nvidia-cudnn-cu12` wheel); ORT cannot find it alone and would silently fall back to CPU, then crash on `GPU_SHRINK_RUN_OPTIONS` (`Did not find an arena based allocator ... gpu:0`). Any refactor that removes a module-level `import torch` (e.g. from `streaming/handler.py`) can regress this — keep the preload or re-add torch import.
+- **ASR Encoder** (CohereBackend): ONNX Runtime CUDA EP — chunked input for long audio (>30s). Arena cap `gpu_memory_limit_gb×0.625` (2560 MiB @ 4GB) + `cudnn_conv_algo_search: HEURISTIC`. OOM escalation (`_run_encoder`): reload fresh arena → retry GPU → cached CPU session (success = no error field).
 - **ASR Decoder**: ONNX Runtime CPU — receives `encoder_hidden_states` + KV caches (8 layers)
 - **ECAPA-TDNN512 Embedding**: ONNX Runtime CUDA EP (192-dim) — fbank chunking (60s max); arena cap `min(gpu_memory_limit_gb/4, 768 MiB)`; OOM → cached CPU session (`_run_with_cpu_fallback`)
 - **Silero VAD**: ONNX Runtime CPU — with state/sr inputs, h/c hidden state updates
@@ -46,9 +47,10 @@ After completing any code changes:
 
 ### Model Lifecycle (lazy load + TTL + phase unloads)
 - **No auto-load at server start** — `server.py` lifespan does NOT load models; first GPU request calls `state.ensure_ready()`. Endpoint rule: any endpoint that embeds/transcribes/diarizes must call `ensure_ready()` (or be behind a handler that does).
+- **Backend-driven state** — `ModelState.backend` holds the active ASR backend instance (`cohere` | `qwen3-asr`, chosen by `TRANSCRIBE_ASR_MODEL`). `state.is_ready` = backend loaded **and** `embedding_session` **and** `vad_session`; `reload_models()` picks/loads the backend via `transcribers.get_backend()`, then fills vad+embedding. `unload_models()` delegates to `backend.unload()` + drops embedding/vad. Transcriber is a thin facade: `core/transcriber.py` forwards `transcribe_audio_sync(audio=...)` to `state.backend`.
 - **TTL**: `model_ttl_minutes` (default **5**) — monitor in `server.py` unloads idle models only when `state.any_loaded and idle > ttl` AND `job_state.get_running() is None`. Never unload mid-job.
 - **Phase unloads** (models not needed in a phase get freed for the next):
-  - `/diarize` + `/diarize/upload`: `unload_encoder()` at job start (diarize never uses the encoder)
+  - `/diarize` + `/diarize/upload`: `unload_encoder()` at job start (diarize never uses the encoder; `Diarizer.run()` gates on `vad_session`+`embedding_session` only, NOT `is_ready` — the encoder is intentionally unloaded)
   - `/transcribe/upload`: `unload_embedding()` right after the `diarization_complete` SSE emit (auto-collect + boundary refinement already done; embedding never used again)
 - **Live session resolution**: NEVER pin a copy of `state.*_session` into other objects. `VoiceprintService._emb_session()` resolves `state.embedding_session` at call time (`set_embedding_session` has zero callers — pins caused `'NoneType' has no attribute get_inputs` after lazy unload).
 
@@ -62,12 +64,12 @@ After completing any code changes:
 5. Edges extended to 0.0 / audio_duration
 6. `_transcribe_turn` slices the waveform per turn → one `transcribe_audio_sync()` call
 
-**Decode windowing** (`transcriber.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
+**Decode windowing** (`transcribers/cohere.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
 - Plans ≤30s windows (`_plan_window_bounds`), each cut snapped to the minimum frame-energy point inside a ±100-frame band (never mid-word); tails <300 frames merge into the previous window
 - Each window decoded separately (`_no_window=True` avoids recursion); segment times offset by window start; texts joined
 - Window errors are ALWAYS surfaced in `result["error"]`, even when earlier windows produced text (otherwise failures look like silent truncation)
 
-**Encoder-level chunking** (`transcriber.py`) — safety fallback inside a single decode when a window still exceeds the encoder limit:
+**Encoder-level chunking** (`transcribers/cohere.py`) — safety fallback inside a single decode when a window still exceeds the encoder limit:
 - Mel split into overlapping windows (MAX_ENCODER_SEC=30s, 25% overlap), encoded independently, concatenated along sequence dimension
 - Overlap trim must happen in OUTPUT space: `trim = min(round(overlap_frames * out_seq/in_len), out_seq)` (subsample-safe — input-frame counts don't match output-frame counts)
 
@@ -118,9 +120,14 @@ asr-mcp/
 │   │   └── middleware.py      # Request logging
 │   ├── core/
 │   │   ├── model_state.py     # ModelState, is_gpu_oom, log_gpu_memory, GPU_SHRINK_RUN_OPTIONS, run_embedding
-│   │   ├── model_loader.py    # HuggingFace download + ORT session init (CUDA EP, arena caps)
+│   │   ├── model_loader.py    # HuggingFace download + ORT session init (CUDA EP, arena caps, _preload_cuda_libs)
 │   │   ├── job_state.py       # Active job tracking: start/publish/finish/attach (import the MODULE)
-│   │   └── transcriber.py     # Cohere ASR: mel-spec → encoder → decoder → text
+│   │   └── transcriber.py     # Thin facade: forwards transcribe_audio_sync/mel to state.backend
+│   ├── transcribers/
+│   │   ├── base.py            # ASRBackend ABC (load/unload/is_loaded/transcribe_audio_sync)
+│   │   ├── __init__.py        # BACKENDS_BY_NAME + get_backend(settings) factory
+│   │   ├── cohere.py          # CohereBackend: ONNX encoder/decoder (windowed decode, chunking)
+│   │   └── qwen3.py           # Qwen3Backend: Qwen3-ASR via qwen_asr.Qwen3ASRModel (transformers)
 │   ├── diarization/
 │   │   ├── pipeline.py        # Diarizer: 13-step pipeline
 │   │   ├── clustering.py      # AgglomerativeClustering, greedy merge, voiceprint matching
@@ -227,6 +234,15 @@ asr-mcp/
 | `TRANSCRIBE_VAD_THRESHOLD` | `0.5` | VAD speech probability cutoff |
 | `TRANSCRIBE_MODEL_TTL_MINUTES` | `5` | Idle minutes before GPU models unload (0 = disabled); skipped while a job is active |
 | `TRANSCRIBE_GPU_MEMORY_LIMIT_GB` | `4.0` | GPU size hint for CUDA arena caps (encoder = ×0.625, embedding = ÷4 capped at 768 MiB) |
+| `TRANSCRIBE_ASR_MODEL` | `cohere` | ASR backend: `cohere` (ONNX, default) or `qwen3-asr` (transformers/Qwen3-ASR) |
+| `TRANSCRIBE_QWEN_MODEL_NAME` | `Qwen/Qwen3-ASR-1.7B` | Qwen3-ASR model name (HF) |
+| `TRANSCRIBE_QWEN_MODEL_DIR` | `./models/qwen3-asr` | Qwen3-ASR local cache dir |
+| `TRANSCRIBE_QWEN_FORCED_ALIGNER_NAME` | `Qwen/Qwen3-ForcedAligner-0.6B` | Forced aligner model name (HF) |
+| `TRANSCRIBE_QWEN_FORCED_ALIGNER_DIR` | `./models/qwen3-forced-aligner` | Forced aligner local cache dir |
+| `TRANSCRIBE_QWEN_TORCH_DTYPE` | `float16` | Torch dtype for Qwen3 model/aligner |
+| `TRANSCRIBE_QWEN_MAX_NEW_TOKENS` | `256` | Max decode tokens for Qwen3-ASR |
+| `TRANSCRIBE_QWEN_MAX_INFERENCE_BATCH_SIZE` | `8` | Qwen3-ASR inference batch size |
+| `TRANSCRIBE_QWEN_QUANTIZE_4BIT` | `true` | Load Qwen3-ASR via BitsAndBytes load_in_4bit |
 | `TRANSCRIBE_HF_TOKEN` | - | HuggingFace token for gated models |
 | `API_KEYS` | - | Comma-separated API keys |
 
@@ -379,5 +395,5 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 ### 27. GPU Arena Discipline: Cap → Shrink Per Run → Reload Clears First
 - Caps set at session creation (`_cuda_provider_options`): encoder `gpu_memory_limit_gb×0.625`, embedding `min(÷4, 768 MiB)`, `cudnn_conv_algo_search: HEURISTIC` (EXHAUSTIVE allocates huge workspaces).
 - Every GPU run passes `GPU_SHRINK_RUN_OPTIONS` (`memory.enable_memory_arena_shrinkage=gpu:0`) — without it the arena only releases on full session reload.
-- `reload_encoder_session`/`reload_embedding_session`: set the field to `None` + `gc.collect()` BEFORE constructing the replacement — otherwise old arena (alive) + new session (allocating) peak together.
+- Cohere encoder reload (`reload_encoder` in `transcribers/cohere.py`) / embedding reload (`reload_embedding_session` in `model_loader.py`): set the field to `None` + `gc.collect()` BEFORE constructing the replacement — otherwise old arena (alive) + new session (allocating) peak together.
 - Encoder OOM escalation: reload fresh arena → retry GPU once → CPU fallback. Embedding OOM: straight to cached CPU session.
