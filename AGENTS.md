@@ -158,11 +158,9 @@ asr-mcp/
 │   │   └── thresholds.json    # All tunable diarization/matching/VAD params
 │   ├── static/
 │   └── templates/
-│       ├── _nav.html          # Shared top menu snippet (__NAV__ + __ACT_*__ markers)
+│       ├── _nav.html          # SPA tab bar snippet (__NAV__ + __ACT_*__ markers)
 │       ├── login.html          # Dark-themed login form
-│       ├── index.html          # Audio processing dashboard (upload + results)
-│       ├── transcripts.html    # Transcription history (card grid)
-│       └── voices.html         # Voiceprint management dashboard
+│       └── app.html            # Unified SPA: Transcribe / Voiceprints / History / Settings tabs
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt output, voiceprints
 │   ├── transcribe.bat          # Drop-target wrapper (py/python launcher)
@@ -193,8 +191,10 @@ asr-mcp/
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Health check + model status |
-| `/gui` | GET | Session | Audio processing dashboard |
-| `/voices` | GET | Session | Voiceprint management dashboard |
+| `/gui` | GET | Session | SPA — Transcribe tab (also serves /voices, /transcriptions, /settings with different active tab) |
+| `/voices` | GET | Session | SPA — Voiceprints tab |
+| `/transcriptions` | GET | Session | SPA — History tab |
+| `/settings` | GET | Session | SPA — Settings tab (status, client token, session) |
 | `/login` | GET | No | Login page |
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
@@ -390,7 +390,7 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - Window-progress events for one long turn all carried the same `segment_start`/`segment_end` → the caret never moved despite events arriving.
 - Interpolate per window in `_make_window_cb`: `win_start = turn.start + span * (i-1)/n`.
 - Elements shown under a bar whose container has `overflow:hidden` must live in a sibling wrapper or they are clipped (caret moved into `position:relative; padding-bottom` wrapper).
-- UI chrome shared across pages (top nav) lives in `templates/_nav.html`, injected by `_render(name, active=...)` via `__NAV__` + `__ACT_*__` markers — edit the snippet, not each page.
+- UI chrome (SPA tab bar) lives in `templates/_nav.html`, injected by `_render(name, active=...)` via `__NAV__` + `__ACT_*__` markers — edit the snippet, not `app.html`. All four page routes (`/gui`, `/voices`, `/transcriptions`, `/settings`) render `app.html`; tab switching is client-side (pushState + `activateTab`).
 
 ### 24. Paragraph Breaks at Pauses Must Snap to Sentence Ends
 - `_apply_paragraph_breaks()` (asr_router.py): RMS interior pauses ≥ `PARAGRAPH_PAUSE_SEC` (1.5s), map each to the nearest decoder split-token segment boundary, then snap to `[.!?…]` within **40 chars**.

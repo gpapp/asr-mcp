@@ -1,9 +1,10 @@
-<div class="header">
-    <h1>ASR-MCP</h1>
-    <nav>
-        <a href="__PREFIX__/gui"__ACT_GUI__>Process Transcription</a>
-        <a href="__PREFIX__/voices"__ACT_VOICES__>Manage Voiceprints</a>
-        <a href="__PREFIX__/transcriptions"__ACT_TRANSCRIPTS__>Transcriptions</a>
-        <span class="user-info" id="userDisplay">...</span>
+<header class="topbar">
+    <div class="brand"><span class="brand-mark"></span>ASR-MCP</div>
+    <nav class="tabs">
+        <a href="__PREFIX__/gui"__ACT_GUI__ data-tab="transcribe">Transcribe</a>
+        <a href="__PREFIX__/voices"__ACT_VOICES__ data-tab="voiceprints">Voiceprints</a>
+        <a href="__PREFIX__/transcriptions"__ACT_TRANSCRIPTS__ data-tab="history">History</a>
+        <a href="__PREFIX__/settings"__ACT_SETTINGS__ data-tab="settings">Settings</a>
     </nav>
-</div>
+    <div class="user-info" id="userDisplay">...</div>
+</header>

@@ -14,7 +14,7 @@ GPU-accelerated ASR MCP server with speaker diarization, voiceprint recognition,
 - **Reverse Proxy Support**: Configurable URL prefix (`TRANSCRIBE_PREFIX`) for nginx/Caddy.
 - **Multi-Format Input**: Accepts mp3, mp4, mkv, flac, ogg, m4a — auto-converts via ffmpeg.
 - **Compressed Snippets**: Voiceprint snippets stored as FLAC for efficient storage.
-- **Web Dashboard**: Upload audio, view results, manage voiceprints at `/gui` and `/voices`.
+- **Web Dashboard**: Single-page app at `/gui` with Transcribe, Voiceprints, History and Settings tabs.
 
 ## Quick Start
 
@@ -81,8 +81,10 @@ by the client ARE kept (they feed refinement).
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Health check + model status |
-| `/gui` | GET | Session | Dashboard — upload & process audio |
-| `/voices` | GET | Session | Voiceprint management dashboard |
+| `/gui` | GET | Session | SPA — Transcribe tab (same app.html serves all tabs) |
+| `/voices` | GET | Session | SPA — Voiceprints tab |
+| `/transcriptions` | GET | Session | SPA — History tab |
+| `/settings` | GET | Session | SPA — Settings tab (status, client token, session) |
 | `/login` | GET | No | Login page |
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
@@ -212,11 +214,9 @@ asr-mcp/
 │   │   └── thresholds.json    # All tunable params
 │   ├── static/
 │   └── templates/
-│       ├── _nav.html          # Shared top menu snippet
+│       ├── _nav.html          # SPA tab bar
 │       ├── login.html          # Login form
-│       ├── index.html          # Audio upload dashboard
-│       ├── transcripts.html    # Transcription history
-│       └── voices.html         # Voiceprint management dashboard
+│       └── app.html            # Unified SPA (Transcribe / Voiceprints / History / Settings)
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt, voiceprints
 │   ├── transcribe.bat          # Drop-target wrapper (py/python launcher)

@@ -162,7 +162,7 @@ def _render(template_name: str, active: str = "") -> HTMLResponse:
         nav_path = templates_dir / "_nav.html"
         if "__NAV__" in content and nav_path.exists():
             nav = nav_path.read_text(encoding="utf-8")
-            for key in ("GUI", "VOICES", "TRANSCRIPTS"):
+            for key in ("GUI", "VOICES", "TRANSCRIPTS", "SETTINGS"):
                 nav = nav.replace(f"__ACT_{key}__",
                                   ' class="active"' if key.lower() == active else "")
             content = content.replace("__NAV__", nav)
@@ -180,15 +180,92 @@ async def root():
 
 @app.get("/health")
 async def health():
+    import shutil
     from asr_mcp.core.model_state import state
+    from asr_mcp.core import job_state
     from asr_mcp.config.settings import get_settings
     settings = get_settings()
+
+    ram = None
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = v.strip()
+        total_kb = int(info["MemTotal"].split()[0])
+        avail_kb = int(info["MemAvailable"].split()[0])
+        total = total_kb * 1024
+        used = (total_kb - avail_kb) * 1024
+        ram = {"total": total, "used": used, "percent": round(used / total * 100, 1)}
+    except Exception:
+        ram = None
+
+    def _gpu_query():
+        import subprocess
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode != 0 or not out.stdout.strip():
+                return None
+            parts = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")]
+            if len(parts) < 5:
+                return None
+            name, util, mem_used, mem_total, temp = parts[:5]
+            mem_used_i, mem_total_i = int(mem_used), int(mem_total)
+            return {
+                "name": name,
+                "util": int(util),
+                "mem_used": mem_used_i,
+                "mem_total": mem_total_i,
+                "mem_percent": round(mem_used_i / max(mem_total_i, 1) * 100, 1),
+                "temperature": int(temp),
+            }
+        except Exception:
+            return None
+
+    gpu = await asyncio.to_thread(_gpu_query)
+
+    disk = None
+    try:
+        d = shutil.disk_usage(settings.data_dir)
+        disk = {"total": d.total, "used": d.used, "percent": round(d.used / d.total * 100, 1)}
+    except Exception:
+        disk = None
+
+    asr_loaded = bool(state.backend is not None and state.backend.is_loaded)
+    job = job_state.get_running()
+
     return {
         "status": "healthy" if state.is_ready else "loading",
         "model_status": "ready" if state.is_ready else "not_ready",
         "cuda_device": settings.cuda_device,
         "voiceprint_count": app.state.speaker_service._db.count() if hasattr(app.state, "speaker_service") else 0,
         "version": "2.0.0",
+        "ram": ram,
+        "gpu": gpu,
+        "disk": disk,
+        "models": {
+            "asr": {
+                "name": settings.asr_model,
+                "backend": state.backend.name if state.backend else None,
+                "loaded": asr_loaded,
+            },
+            "vad": state.vad_session is not None,
+            "embedding": state.embedding_session is not None,
+            "idle_seconds": round(state.idle_seconds(), 1) if state.any_loaded else None,
+            "ttl_minutes": settings.model_ttl_minutes,
+        },
+        "active_job": (
+            {"mode": job.mode, "filename": job.filename, "stage": job.stage}
+            if job is not None else None
+        ),
     }
 
 
@@ -254,17 +331,22 @@ async def logout_post(request: Request):
 
 @app.get("/gui", response_class=HTMLResponse)
 async def gui(request: Request):
-    return _render("index.html", active="gui")
+    return _render("app.html", active="gui")
 
 
 @app.get("/voices", response_class=HTMLResponse)
 async def voices(request: Request):
-    return _render("voices.html", active="voices")
+    return _render("app.html", active="voices")
 
 
 @app.get("/transcriptions", response_class=HTMLResponse)
 async def transcriptions_page(request: Request):
-    return _render("transcripts.html", active="transcripts")
+    return _render("app.html", active="transcripts")
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    return _render("app.html", active="settings")
 
 
 @app.get("/api/user")

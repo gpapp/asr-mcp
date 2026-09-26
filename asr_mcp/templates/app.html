@@ -1,0 +1,1672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASR-MCP</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg: #eef1f7;
+            --surface: #ffffff;
+            --ink: #1b2233;
+            --muted: #66708a;
+            --line: #e3e8f2;
+            --brand: #4f6ef7;
+            --brand-2: #7c5cff;
+            --grad: linear-gradient(135deg, #4f6ef7, #7c5cff);
+            --ok: #16a34a;
+            --bad: #dc2626;
+            --radius: 14px;
+            --shadow: 0 1px 2px rgba(16,24,40,.05), 0 10px 28px -16px rgba(16,24,40,.25);
+        }
+        html { -webkit-text-size-adjust: 100%; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background:
+                radial-gradient(1200px 500px at 15% -10%, rgba(79,110,247,.10), transparent 60%),
+                radial-gradient(900px 400px at 100% 0%, rgba(124,92,255,.10), transparent 55%),
+                var(--bg);
+            color: var(--ink);
+            min-height: 100vh;
+        }
+
+        .topbar {
+            position: sticky; top: 0; z-index: 60;
+            display: flex; align-items: center; gap: 1rem;
+            padding: .65rem 1.4rem;
+            background: linear-gradient(135deg, #171a2e 0%, #232850 100%);
+            color: #fff;
+            box-shadow: 0 8px 28px -14px rgba(10,12,30,.75);
+        }
+        .brand { font-weight: 800; letter-spacing: .04em; font-size: 1.02rem; display: flex; align-items: center; gap: .55rem; white-space: nowrap; }
+        .brand-mark { width: 13px; height: 13px; border-radius: 4px; background: var(--grad); box-shadow: 0 0 12px rgba(124,92,255,.85); }
+        .tabs { display: flex; gap: .3rem; flex: 1; flex-wrap: wrap; }
+        .tabs a {
+            color: #aab4d4; text-decoration: none; font-size: .87rem; font-weight: 600;
+            padding: .42rem .95rem; border-radius: 999px; transition: background .16s, color .16s;
+        }
+        .tabs a:hover { color: #fff; background: rgba(255,255,255,.09); }
+        .tabs a.active { color: #171a2e; background: #fff; box-shadow: 0 6px 16px -8px rgba(0,0,0,.6); }
+        .hdr-status {
+            display: flex; align-items: center; gap: .45rem; font-size: .78rem; color: #c9d1ee;
+            background: rgba(255,255,255,.07); padding: .35rem .75rem; border-radius: 999px; white-space: nowrap;
+        }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #98a2bd; flex-shrink: 0; }
+        .dot.ok { background: #3ddc84; box-shadow: 0 0 8px rgba(61,220,132,.85); }
+        .dot.bad { background: #ff6b6b; box-shadow: 0 0 8px rgba(255,107,107,.7); }
+        .user-info { color: #7ee2a8; font-size: .84rem; display: flex; align-items: center; gap: .9rem; white-space: nowrap; }
+        .user-info a { color: #ff8b8b; text-decoration: none; font-size: .8rem; }
+        .user-info a:hover { text-decoration: underline; }
+
+        .tab-pane { display: none; }
+        .tab-pane.active { display: block; animation: paneIn .25s ease; }
+        @keyframes paneIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+        .pane-inner { margin: 0 auto; padding: 1.6rem 1rem 3rem; }
+        .pane-narrow { max-width: 960px; }
+        .pane-wide { max-width: 1100px; }
+        .pane-full { max-width: 1440px; }
+
+        .card {
+            background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+            box-shadow: var(--shadow); margin-bottom: 1.4rem; overflow: hidden;
+        }
+        .card-title {
+            padding: .95rem 1.4rem; font-size: .95rem; font-weight: 700; letter-spacing: .01em;
+            border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: .6rem;
+        }
+        .card-title::before { content: ""; width: 4px; height: 16px; border-radius: 2px; background: var(--grad); flex-shrink: 0; }
+        .card-body { padding: 1.4rem; }
+
+        .btn {
+            padding: .6rem 1.25rem; border: none; border-radius: 10px; cursor: pointer;
+            font-size: .87rem; font-weight: 600; transition: transform .14s, box-shadow .14s, background .14s, opacity .14s;
+            font-family: inherit;
+        }
+        .btn:hover { transform: translateY(-1px); }
+        .btn:active { transform: translateY(0); }
+        .btn-primary { background: var(--grad); color: #fff; box-shadow: 0 8px 18px -10px rgba(79,110,247,.95); }
+        .btn-primary:hover { box-shadow: 0 12px 22px -10px rgba(79,110,247,1); }
+        .btn-primary:disabled { background: #c3cadb; box-shadow: none; cursor: not-allowed; transform: none; }
+        .btn-success { background: linear-gradient(135deg, #16a34a, #0d9463); color: #fff; box-shadow: 0 8px 18px -10px rgba(22,163,74,.9); }
+        .btn-warning { background: linear-gradient(135deg, #f59e0b, #ea9200); color: #2b1a00; }
+        .btn-danger { background: linear-gradient(135deg, #ef4444, #dc2626); color: #fff; box-shadow: 0 8px 18px -10px rgba(220,38,38,.85); }
+        .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+        .btn-ghost:hover { background: #f2f5fb; color: var(--ink); }
+        .btn-sm { padding: .32rem .65rem; font-size: .77rem; border-radius: 8px; }
+
+        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .9rem; }
+        .status-item { padding: .85rem .95rem; border-radius: 10px; background: #f6f8fd; border: 1px solid var(--line); }
+        .status-item .label { font-size: .72rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: .3rem; font-weight: 600; }
+        .status-item .value { font-size: 1.05rem; font-weight: 700; }
+        .status-item .sub { font-size: .72rem; color: var(--muted); margin-top: .25rem; line-height: 1.35; word-break: break-word; }
+        .status-idle { color: var(--muted); font-weight: 600; }
+        .mini-bar { height: 5px; background: #e7ebf5; border-radius: 999px; overflow: hidden; margin-top: .5rem; }
+        .mini-bar > div { height: 100%; width: 0%; background: var(--grad); border-radius: 999px; transition: width .35s; }
+        .mini-bar.warn > div { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+        .status-ok { color: var(--ok); }
+        .status-fail { color: var(--bad); }
+
+        .upload-area {
+            border: 2px dashed #c3cbe0; border-radius: 16px; padding: 2.4rem 1.5rem; text-align: center;
+            cursor: pointer; transition: border-color .18s, background .18s, box-shadow .18s;
+            background: linear-gradient(180deg, #fbfcff, #f4f6fd);
+        }
+        .upload-area:hover, .upload-area.dragover {
+            border-color: var(--brand); background: #eef2ff;
+            box-shadow: inset 0 0 0 4px rgba(79,110,247,.08);
+        }
+        .upload-area .upload-glyph {
+            width: 46px; height: 46px; margin: 0 auto .8rem; border-radius: 12px; background: var(--grad);
+            display: flex; align-items: center; justify-content: center; color: #fff; font-size: 1.3rem; font-weight: 700;
+            box-shadow: 0 10px 22px -12px rgba(79,110,247,1);
+        }
+        .upload-area p { color: var(--ink); font-weight: 600; margin-bottom: .7rem; }
+        .upload-area input[type="file"] { margin-bottom: .5rem; max-width: 100%; }
+        .upload-area .formats { font-size: .73rem; color: var(--muted); margin-top: .5rem; letter-spacing: .03em; }
+        #fileName { margin-top: .8rem; font-size: .86rem; color: var(--muted); font-weight: 600; }
+
+        .options { margin: 1.1rem 0; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+        .options label { font-size: .85rem; font-weight: 600; color: var(--muted); display: flex; align-items: center; gap: .5rem; }
+        .options input, .options select {
+            padding: .45rem .65rem; border: 1px solid var(--line); border-radius: 9px; font-size: .85rem;
+            background: #fff; color: var(--ink); font-family: inherit; outline: none; transition: border-color .15s, box-shadow .15s;
+        }
+        .options input:focus, .options select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(79,110,247,.15); }
+
+        .progress-area { margin-top: 1.1rem; }
+        .prog-block { margin-bottom: .85rem; }
+        .prog-label { font-size: .74rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: .3rem; }
+        .prog-stage { font-size: .8rem; color: var(--muted); margin-top: .3rem; min-height: 1.1em; }
+        .pbar { background: #e7ebf5; border-radius: 999px; overflow: hidden; height: 24px; }
+        .pbar > div {
+            background: var(--grad); height: 100%; width: 0%; transition: width .35s;
+            display: flex; align-items: center; justify-content: center;
+            color: #fff; font-size: .73rem; font-weight: 700; min-width: 2.4em;
+        }
+        .prog-actions { margin-top: .9rem; }
+        .btn-cancel {
+            padding: .38rem 1.1rem; border: 1px solid #f0a3a3; background: #fff; color: var(--bad);
+            border-radius: 9px; cursor: pointer; font-size: .84rem; font-weight: 600; transition: background .15s;
+        }
+        .btn-cancel:hover:not(:disabled) { background: #fff1f1; }
+        .btn-cancel:disabled { opacity: .55; cursor: default; }
+
+        .tt-area { position: relative; padding-right: 96px; margin-top: 4px; }
+        .tt-caret-layer { position: absolute; top: 0; bottom: 0; left: 0; right: 96px; pointer-events: none; }
+        .tt-pointer { display: none; position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #ff4444; transition: left .15s ease; z-index: 10; }
+        .tt-pointer-label { position: relative; height: 18px; font-size: .7rem; color: var(--muted); margin-top: .25rem; overflow: hidden; white-space: nowrap; }
+
+        .results-area { margin-top: 1.2rem; }
+        .results-area h3 { font-size: .95rem; margin-bottom: .6rem; }
+        .results-area pre { background: #171a2e; color: #f8f8f2; padding: 1rem; border-radius: 10px; overflow-x: auto; font-size: .84rem; max-height: 500px; overflow-y: auto; white-space: pre-wrap; }
+
+        .speaker-timeline { margin: 1rem 0; }
+        .bar-container { position: relative; height: 42px; background: #e7ebf5; border-radius: 10px; overflow: hidden; margin-bottom: .5rem; }
+        .bar-seg { position: absolute; top: 0; height: 100%; opacity: .88; border-right: 1px solid rgba(255,255,255,.35); display: flex; align-items: center; justify-content: center; font-size: .68rem; font-weight: 700; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.45); overflow: hidden; white-space: nowrap; min-width: 1px; transition: opacity .12s; }
+        .bar-seg:hover { opacity: 1; }
+        .legend-table { border-collapse: collapse; margin-top: .35rem; }
+        .legend-table td { padding: 2px 10px 2px 0; font-size: .77rem; vertical-align: middle; }
+        .legend-swatch { display: inline-block; width: 18px; height: 18px; border-radius: 4px; vertical-align: middle; box-shadow: inset 0 0 0 1px rgba(0,0,0,.08); }
+        .time-axis { display: flex; justify-content: space-between; font-size: .68rem; color: var(--muted); margin-top: .2rem; }
+        .file-label { font-size: .85rem; font-weight: 700; margin-bottom: .35rem; color: var(--ink); }
+
+        .bar-row { position: relative; height: 24px; margin-bottom: 3px; background: #e7ebf5; border-radius: 5px; }
+        .bar-row:last-child { margin-bottom: 0; }
+        .bar-act { position: absolute; top: 0; height: 100%; border-radius: 4px; min-width: 1px; transition: filter .12s; }
+        .bar-act:hover { filter: brightness(1.1); }
+        .bar-name { position: absolute; left: calc(100% + 8px); top: 50%; transform: translateY(-50%); font-size: .7rem; color: var(--muted); white-space: nowrap; }
+        .tv-viewer { display: flex; gap: 14px; align-items: stretch; margin-top: .5rem; }
+        .tv-bars { flex: 0 0 48%; box-sizing: border-box; position: relative; padding-right: 96px; min-width: 0; }
+        .tv-text { flex: 1; position: relative; max-height: 56vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fbfcfe; min-width: 0; }
+        .tp-block { margin-bottom: 14px; }
+        .tp-head { font-size: .7rem; color: var(--muted); font-weight: 700; letter-spacing: .05em; margin-bottom: 3px; }
+        .tp-text { font-size: .86rem; color: var(--ink); white-space: pre-wrap; line-height: 1.55; }
+
+        .spinner {
+            display: inline-block; width: 15px; height: 15px; border: 2px solid rgba(255,255,255,.4);
+            border-top-color: #fff; border-radius: 50%; animation: spin .6s linear infinite;
+            margin-right: .5rem; vertical-align: middle;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .toast {
+            position: fixed; bottom: 1.4rem; right: 1.4rem; background: #171a2e; color: #fff;
+            padding: .85rem 1.2rem; border-radius: 12px; font-size: .85rem; font-weight: 500;
+            opacity: 0; transform: translateX(16px); transition: opacity .25s, transform .25s;
+            z-index: 1000; box-shadow: 0 18px 40px -18px rgba(0,0,0,.75);
+            pointer-events: none; max-width: 420px;
+        }
+        .toast.show { opacity: 1; transform: none; }
+        .toast.error { background: #b4232a; }
+
+        .toolbar { display: flex; gap: .6rem; margin-bottom: 1.3rem; flex-wrap: wrap; }
+        #rescanStatus {
+            display: none; margin-bottom: 1rem; background: #fff; border: 1px solid var(--line);
+            border-radius: 12px; padding: .8rem 1.1rem; font-size: .85rem; align-items: center; gap: .8rem;
+            box-shadow: var(--shadow);
+        }
+        #rescanStatus.visible { display: flex; }
+        #rescanStatus .spinner { width: 16px; height: 16px; border: 2px solid #d7ddf0; border-top-color: var(--brand); flex-shrink: 0; }
+        #rescanStatus .status-stage { font-weight: 700; color: var(--ink); }
+        #rescanStatus .status-count { color: var(--muted); margin-left: auto; white-space: nowrap; }
+
+        .card-header {
+            padding: .85rem 1.2rem; display: flex; justify-content: space-between; align-items: center;
+            cursor: pointer; user-select: none; border-bottom: 1px solid var(--line); transition: background .14s;
+        }
+        .card-header:hover { background: #f6f8fd; }
+        .card-header h3 { font-size: .97rem; display: flex; align-items: center; gap: .55rem; flex-wrap: wrap; }
+        .card-header .meta { font-size: .78rem; color: var(--muted); display: flex; gap: 1rem; }
+        .card-header .meta span { display: flex; align-items: center; gap: .25rem; }
+        .card-body-fold { padding: 0; display: none; }
+        .card-body-fold.open { display: block; }
+
+        .speaker-list { list-style: none; }
+        .speaker-list li { padding: .55rem 1.2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #f1f3fa; font-size: .85rem; gap: 1rem; }
+        .speaker-list li:last-child { border-bottom: none; }
+        .speaker-list li:hover { background: #f8fafd; }
+        .speaker-list .actions { display: flex; gap: .3rem; flex-shrink: 0; }
+        .form-inline { display: flex; gap: .55rem; align-items: center; padding: .8rem 1.2rem; border-top: 1px solid var(--line); flex-wrap: wrap; background: #fbfcfe; }
+        .form-inline input[type="text"] { padding: .4rem .6rem; border: 1px solid var(--line); border-radius: 8px; font-size: .85rem; }
+        .form-inline input[type="file"] { font-size: .82rem; max-width: 100%; }
+        .form-inline .form-label { font-size: .84rem; font-weight: 600; color: var(--muted); }
+
+        .empty { padding: 2.6rem 1.5rem; text-align: center; color: #98a2bd; font-size: .88rem; line-height: 1.6; }
+        .empty .icon { font-size: 2.4rem; margin-bottom: .5rem; opacity: .8; }
+        .badge { display: inline-block; padding: .16rem .55rem; border-radius: 999px; font-size: .71rem; font-weight: 700; letter-spacing: .02em; }
+        .badge-green { background: #e7f8ee; color: #0f8a47; }
+        .badge-gray { background: #eef1f7; color: #66708a; }
+
+        .btn-play {
+            background: var(--grad); color: #fff; border: none; border-radius: 50%; width: 28px; height: 28px;
+            cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 11px;
+            transition: transform .14s, box-shadow .14s; box-shadow: 0 6px 14px -8px rgba(79,110,247,1);
+        }
+        .btn-play:hover { transform: scale(1.08); }
+        .btn-play.playing { background: linear-gradient(135deg, #ef4444, #dc2626); box-shadow: 0 6px 14px -8px rgba(220,38,38,1); }
+
+        .merge-dialog { position: fixed; inset: 0; background: rgba(15,18,35,.55); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 999; }
+        .merge-dialog.hidden { display: none; }
+        .merge-dialog .dialog-box { background: #fff; border-radius: 16px; padding: 1.6rem; width: 420px; max-width: calc(100vw - 2rem); box-shadow: 0 30px 70px -30px rgba(0,0,0,.7); }
+        .merge-dialog h3 { margin-bottom: .6rem; font-size: 1.05rem; }
+        .merge-dialog label { font-size: .84rem; font-weight: 600; color: var(--muted); }
+        .merge-dialog select { width: 100%; padding: .55rem .6rem; margin: .3rem 0 .8rem; border: 1px solid var(--line); border-radius: 9px; font-family: inherit; font-size: .88rem; background: #fff; }
+        .merge-dialog .dialog-actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+
+        .layout { display: flex; gap: 1rem; align-items: stretch; height: calc(100vh - 8.5rem); min-height: 420px; }
+        .list-pane {
+            flex: 0 0 340px; min-width: 260px; background: #fff; border: 1px solid var(--line);
+            border-radius: var(--radius); box-shadow: var(--shadow); display: flex; flex-direction: column; overflow: hidden;
+        }
+        .list-head { padding: .9rem 1rem .7rem; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+        .list-head h2 { font-size: .95rem; font-weight: 700; }
+        .list-head #countBadge { font-size: .78rem; color: var(--muted); font-weight: 500; }
+        .list-scroll { flex: 1; overflow-y: auto; }
+        .list-item { padding: .8rem 1rem; border-bottom: 1px solid #f1f3fa; cursor: pointer; transition: background .12s; border-left: 3px solid transparent; }
+        .list-item:hover { background: #f6f8fd; }
+        .list-item.selected { background: #eef2ff; border-left-color: var(--brand); }
+        .list-item .filename { font-weight: 700; font-size: .86rem; word-break: break-all; color: var(--ink); margin-bottom: .3rem; }
+        .list-item .meta { font-size: .73rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: .6rem; }
+        .list-item .preview {
+            font-size: .72rem; color: var(--muted); background: #f6f8fd; border: 1px solid var(--line);
+            border-radius: 7px; padding: .4rem .5rem; max-height: 42px; overflow: hidden; margin-top: .4rem;
+            white-space: pre-wrap; line-height: 1.4;
+        }
+
+        .detail-pane {
+            flex: 1; min-width: 0; background: #fff; border: 1px solid var(--line);
+            border-radius: var(--radius); box-shadow: var(--shadow); display: flex; flex-direction: column; overflow: hidden;
+        }
+        .detail-head { padding: .9rem 1.4rem; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+        .detail-head .title { font-size: .95rem; font-weight: 700; word-break: break-all; color: var(--ink); }
+        .detail-head .actions { display: flex; gap: .5rem; flex-shrink: 0; }
+        .detail-body { flex: 1; overflow-y: auto; padding: 1.2rem 1.4rem; }
+        .detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #98a2bd; font-size: .9rem; text-align: center; padding: 2rem; }
+        .meta-line { font-size: .8rem; color: var(--muted); margin-bottom: .8rem; }
+
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-thumb { background: #c8d0e4; border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
+        ::-webkit-scrollbar-thumb:hover { background: #aab4d4; border: 2px solid transparent; background-clip: content-box; }
+        ::-webkit-scrollbar-track { background: transparent; }
+
+        @media (max-width: 860px) {
+            .topbar { flex-wrap: wrap; gap: .5rem; padding: .6rem .9rem; }
+            .tabs { order: 3; width: 100%; }
+            .layout { flex-direction: column; height: auto; }
+            .list-pane { flex: none; max-height: 40vh; }
+            .detail-pane { min-height: 50vh; }
+            .tv-viewer { flex-direction: column; }
+            .tv-bars { flex: none; padding-right: 84px; }
+        }
+    </style>
+</head>
+<body>
+    __NAV__
+
+    <main>
+        <section class="tab-pane pane-narrow" id="tab-transcribe">
+            <div class="pane-inner pane-narrow">
+                <div class="card">
+                    <div class="card-title">Upload Audio for Transcription</div>
+                    <div class="card-body">
+                        <div class="upload-area" id="uploadArea" onclick="document.getElementById('audioFile').click()">
+                            <div class="upload-glyph">&#8593;</div>
+                            <p>Drop an audio file here or click to browse</p>
+                            <input type="file" id="audioFile" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus" multiple onchange="fileSelected(this)">
+                            <div class="formats">WAV, MP3, MP4, MKV, FLAC, OGG, M4A, WebM, OPUS</div>
+                        </div>
+                        <div id="fileName" style="display:none;"></div>
+
+                        <div id="progressArea" class="progress-area" style="display:none;">
+                            <div class="prog-block">
+                                <div class="prog-label">Diarization</div>
+                                <div class="pbar"><div id="diarProgressBar">0%</div></div>
+                                <div id="diarProgressStage" class="prog-stage">Preparing...</div>
+                            </div>
+                            <div id="transcriptionArea" style="display:none;">
+                                <div class="prog-label">Transcription</div>
+                                <div class="tt-area" id="transcriptionBarArea">
+                                    <div id="transcriptionSegments"></div>
+                                    <div id="transcriptionCaretLayer" class="tt-caret-layer">
+                                        <div id="transcriptionPointer" class="tt-pointer"></div>
+                                    </div>
+                                </div>
+                                <div id="transcriptionPointerLabel" class="tt-pointer-label"></div>
+                                <div id="transcriptionLegend" style="display:none;"></div>
+                                <div id="transcriptionStage" class="prog-stage">Waiting for diarization...</div>
+                            </div>
+                            <div class="prog-actions">
+                                <button id="cancelJobBtn" type="button" class="btn-cancel" onclick="cancelActiveJob()" style="display:none;">Cancel</button>
+                            </div>
+                        </div>
+
+                        <div class="options">
+                            <label>Output:
+                                <select id="outputMode">
+                                    <option value="transcribe">Transcribe with diarization</option>
+                                    <option value="diarize">Diarization only</option>
+                                </select>
+                            </label>
+                            <label>Speakers:
+                                <input type="number" id="numSpeakers" min="0" max="30" placeholder="auto" style="width:64px">
+                            </label>
+                            <button class="btn btn-primary" id="processBtn" onclick="processAudio()" disabled>Process Audio</button>
+                        </div>
+
+                        <div class="results-area" id="resultsArea" style="display:none;">
+                            <h3>Results</h3>
+                            <div id="timelineContainer"></div>
+                            <div id="resultsContent"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="tab-pane" id="tab-voiceprints">
+            <div class="pane-inner pane-wide">
+                <div class="toolbar">
+                    <button class="btn btn-success" onclick="rescanVoices()">Rescan Voices Directory</button>
+                    <button class="btn btn-primary" onclick="refresh()">Refresh</button>
+                    <button class="btn btn-ghost" onclick="openMergeDialog()">Merge Speakers</button>
+                </div>
+
+                <div id="rescanStatus">
+                    <div class="spinner"></div>
+                    <span class="status-stage">Scanning...</span>
+                    <span class="status-count"></span>
+                </div>
+
+                <div id="speakers-list"></div>
+            </div>
+        </section>
+
+        <section class="tab-pane" id="tab-history">
+            <div class="pane-inner pane-full">
+                <div class="layout">
+                    <div class="list-pane">
+                        <div class="list-head">
+                            <h2>Saved Transcriptions</h2>
+                            <span id="countBadge"></span>
+                        </div>
+                        <div class="list-scroll" id="listContainer"></div>
+                        <div id="emptyState" class="empty" style="display:none;">
+                            <div class="icon">&#128196;</div>
+                            <p>No transcriptions yet.</p>
+                            <p style="font-size:.8rem;margin-top:.3rem;">Process audio files to see them here.</p>
+                        </div>
+                    </div>
+
+                    <div class="detail-pane">
+                        <div class="detail-head">
+                            <span class="title" id="detailTitle">Transcription</span>
+                            <div class="actions" id="detailActions" style="display:none;">
+                                <button class="btn btn-success btn-sm" onclick="downloadTranscription(currentId)">Download</button>
+                                <button class="btn btn-danger btn-sm" onclick="deleteTranscription(currentId)">Delete</button>
+                            </div>
+                        </div>
+                        <div class="detail-body" id="detailBody">
+                            <div class="detail-empty">Select a transcription from the list to view it here.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="tab-pane" id="tab-settings">
+            <div class="pane-inner pane-narrow">
+                <div class="card">
+                    <div class="card-title">System Status</div>
+                    <div class="card-body">
+                        <div class="status-grid" id="statusGrid">
+                            <div class="status-item"><div class="label">Models</div><div class="value" id="stModels">Loading...</div><div class="sub" id="stModelsSub"></div></div>
+                            <div class="status-item"><div class="label">ASR Backend</div><div class="value" id="stAsr">-</div></div>
+                            <div class="status-item"><div class="label">Diarization</div><div class="value" id="stDiar">-</div></div>
+                            <div class="status-item"><div class="label">RAM</div><div class="value" id="stRam">-</div><div class="mini-bar" id="stRamBar"><div></div></div></div>
+                            <div class="status-item"><div class="label">GPU</div><div class="value" id="stGpu">-</div><div class="sub" id="stGpuSub"></div><div class="mini-bar" id="stGpuBar"><div></div></div></div>
+                            <div class="status-item"><div class="label">Disk</div><div class="value" id="stDisk">-</div><div class="mini-bar" id="stDiskBar"><div></div></div></div>
+                            <div class="status-item"><div class="label">CUDA Device</div><div class="value" id="stCuda">-</div></div>
+                            <div class="status-item"><div class="label">Version</div><div class="value" id="stVersion">-</div></div>
+                            <div class="status-item"><div class="label">Active Job</div><div class="value" id="stJob">-</div><div class="sub" id="stJobSub"></div></div>
+                        </div>
+                        <div style="margin-top:1rem;">
+                            <button class="btn btn-ghost btn-sm" onclick="checkStatus()">Refresh status</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Windows Client Token</div>
+                    <div class="card-body">
+                        <p style="font-size:.86rem;color:var(--muted);margin-bottom:.9rem;line-height:1.6;">
+                            API token for the <code style="background:#f2f5fb;padding:.1rem .35rem;border-radius:5px;border:1px solid var(--line);">asr-client</code> drop-target client. One token per user; generating a new one invalidates the previous token. Put it in <code style="background:#f2f5fb;padding:.1rem .35rem;border-radius:5px;border:1px solid var(--line);">asr-client/.env</code> as <code style="background:#f2f5fb;padding:.1rem .35rem;border-radius:5px;border:1px solid var(--line);">TOKEN=...</code>.
+                        </p>
+                        <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;">
+                            <button class="btn btn-primary" id="genTokenBtn" onclick="generateClientToken()">Generate token</button>
+                            <code id="tokenValue" style="display:none;padding:.5rem .7rem;background:#f2f5fb;border:1px solid var(--line);border-radius:9px;font-size:.8rem;word-break:break-all;"></code>
+                            <button class="btn btn-ghost btn-sm" id="copyTokenBtn" style="display:none;" onclick="copyClientToken()">Copy</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Session</div>
+                    <div class="card-body">
+                        <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+                            <div style="font-size:.88rem;color:var(--muted);" id="sessionInfo">Loading...</div>
+                            <button class="btn btn-ghost btn-sm" onclick="logout()">Log out</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div class="merge-dialog hidden" id="mergeDialog">
+        <div class="dialog-box">
+            <h3>Merge Speakers</h3>
+            <p style="font-size:.85rem;color:var(--muted);margin-bottom:.9rem;">Snippets from secondary speaker will be moved to primary. Secondary will be removed.</p>
+            <label>Primary (keep):</label>
+            <select id="mergePrimary"></select>
+            <label>Secondary (absorb):</label>
+            <select id="mergeSecondary"></select>
+            <div class="dialog-actions">
+                <button class="btn btn-ghost" onclick="closeMergeDialog()">Cancel</button>
+                <button class="btn btn-warning" onclick="mergeSpeakers()">Merge</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="__PREFIX__/static/viewer.js"></script>
+    <script>
+        const P = '__PREFIX__';
+        const API = P + '/api/voiceprint';
+
+        let speakersData = [];
+        let transcripts = [];
+        let currentId = null;
+        let currentAudio = null;
+        let currentPlayBtn = null;
+        let rescanInFlight = false;
+        let stageTicker = null;
+        let jobUiActive = false;
+
+        function escHtml(s) {
+            const d = document.createElement('div');
+            d.textContent = s;
+            return d.innerHTML;
+        }
+
+        function basename(path) {
+            return path.split(/[/\\]/).pop();
+        }
+
+        function toast(msg, isError) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast show' + (isError ? ' error' : '');
+            setTimeout(() => t.className = 'toast', 4000);
+        }
+
+        function formatDuration(sec) {
+            if (!sec || sec <= 0) return '-';
+            if (sec < 60) return sec.toFixed(1) + 's';
+            const m = Math.floor(sec / 60);
+            const s = Math.floor(sec % 60);
+            return m > 0 ? m + 'm ' + s + 's' : s + 's';
+        }
+
+        function formatDate(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        async function apiFetch(path, opts) {
+            try {
+                const r = await fetch(API + path, opts);
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return await r.json();
+            } catch (e) {
+                toast('Error: ' + e.message, true);
+                throw e;
+            }
+        }
+
+        // --- Tab routing (SPA) ---
+
+        function tabFromPath() {
+            const p = location.pathname;
+            if (p.endsWith('/voices')) return 'voiceprints';
+            if (p.endsWith('/transcriptions')) return 'history';
+            if (p.endsWith('/settings')) return 'settings';
+            return 'transcribe';
+        }
+
+        function activateTab(name) {
+            const panes = ['transcribe', 'voiceprints', 'history', 'settings'];
+            if (!panes.includes(name)) name = 'transcribe';
+            for (const p of panes) {
+                document.getElementById('tab-' + p).classList.toggle('active', p === name);
+            }
+            document.querySelectorAll('.tabs a').forEach(a => {
+                a.classList.toggle('active', a.dataset.tab === name);
+            });
+            if (name === 'voiceprints') refresh();
+            if (name === 'history') loadTranscripts();
+            if (name === 'settings') checkStatus();
+        }
+
+        document.querySelectorAll('.tabs a').forEach(a => {
+            a.addEventListener('click', e => {
+                e.preventDefault();
+                history.pushState(null, '', a.getAttribute('href'));
+                activateTab(a.dataset.tab);
+            });
+        });
+        window.addEventListener('popstate', () => activateTab(tabFromPath()));
+
+        // --- Session / status ---
+
+        async function loadUser() {
+            try {
+                const r = await fetch(P + '/api/user');
+                const d = await r.json();
+                const el = document.getElementById('userDisplay');
+                const info = document.getElementById('sessionInfo');
+                if (d.authenticated) {
+                    el.innerHTML = escHtml(d.username);
+                    if (info) info.textContent = 'Signed in as ' + d.username;
+                } else {
+                    el.innerHTML = '<a href="' + P + '/login">login</a>';
+                    if (info) info.textContent = 'Not signed in';
+                }
+            } catch (e) {
+                document.getElementById('userDisplay').textContent = '';
+            }
+        }
+
+        function logout() {
+            window.location.href = P + '/api/auth/logout';
+        }
+
+        function setMiniBar(id, pct) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.classList.toggle('warn', pct >= 80);
+            el.firstElementChild.style.width = Math.min(100, Math.max(0, pct)) + '%';
+        }
+
+        async function checkStatus() {
+            const fmtGb = b => (b / 1073741824).toFixed(1) + ' GB';
+            try {
+                const r = await fetch(P + '/health');
+                const d = await r.json();
+                const ready = d.model_status === 'ready';
+                const m = d.models || {};
+                document.getElementById('stModels').innerHTML = ready ? '<span class="status-ok">Ready</span>' : '<span class="status-fail">Not loaded</span>';
+                let sub = m.ttl_minutes ? 'TTL ' + m.ttl_minutes + ' min' : '';
+                if (m.idle_seconds != null) sub += (sub ? ' · ' : '') + 'idle ' + Math.round(m.idle_seconds) + 's';
+                document.getElementById('stModelsSub').textContent = sub;
+
+                const asrEl = document.getElementById('stAsr');
+                const asr = m.asr;
+                if (asr) {
+                    asrEl.innerHTML = escHtml(asr.name || '-') + ' · ' +
+                        (asr.loaded ? '<span class="status-ok">loaded</span>' : '<span class="status-idle">unloaded</span>');
+                } else {
+                    asrEl.textContent = '-';
+                }
+
+                const diarEl = document.getElementById('stDiar');
+                if (m.vad && m.embedding) {
+                    diarEl.innerHTML = '<span class="status-ok">VAD + ECAPA loaded</span>';
+                } else if (m.vad || m.embedding) {
+                    diarEl.innerHTML = '<span class="status-idle">partial</span>';
+                } else {
+                    diarEl.innerHTML = '<span class="status-idle">unloaded</span>';
+                }
+
+                if (d.ram) {
+                    document.getElementById('stRam').textContent = fmtGb(d.ram.used) + ' / ' + fmtGb(d.ram.total) + ' (' + d.ram.percent + '%)';
+                    setMiniBar('stRamBar', d.ram.percent);
+                } else {
+                    document.getElementById('stRam').textContent = 'unavailable';
+                }
+
+                const gpuEl = document.getElementById('stGpu');
+                const gpuSub = document.getElementById('stGpuSub');
+                if (d.gpu) {
+                    gpuEl.textContent = fmtGb(d.gpu.mem_used) + ' / ' + fmtGb(d.gpu.mem_total) + ' (' + d.gpu.mem_percent + '%)';
+                    gpuSub.textContent = d.gpu.name + ' · ' + d.gpu.util + '% util · ' + d.gpu.temperature + '°C';
+                    setMiniBar('stGpuBar', d.gpu.mem_percent);
+                } else {
+                    gpuEl.innerHTML = '<span class="status-idle">not available</span>';
+                    gpuSub.textContent = '';
+                    setMiniBar('stGpuBar', 0);
+                }
+
+                if (d.disk) {
+                    document.getElementById('stDisk').textContent = fmtGb(d.disk.used) + ' / ' + fmtGb(d.disk.total) + ' (' + d.disk.percent + '%)';
+                    setMiniBar('stDiskBar', d.disk.percent);
+                } else {
+                    document.getElementById('stDisk').textContent = 'unavailable';
+                }
+
+                const jobEl = document.getElementById('stJob');
+                const jobSub = document.getElementById('stJobSub');
+                if (d.active_job) {
+                    jobEl.innerHTML = '<span class="status-ok">Running</span>';
+                    jobSub.textContent = d.active_job.filename + ' · ' + (d.active_job.stage || d.active_job.mode);
+                } else {
+                    jobEl.innerHTML = '<span class="status-idle">Idle</span>';
+                    jobSub.textContent = '';
+                }
+
+                document.getElementById('stCuda').textContent = d.cuda_device || '-';
+                document.getElementById('stVersion').textContent = d.version || '-';
+                const dot = document.getElementById('hdrStatusDot');
+                const txt = document.getElementById('hdrStatusText');
+                if (dot && txt) {
+                    dot.className = 'dot ' + (ready ? 'ok' : '');
+                    txt.textContent = ready ? 'Models ready' : 'Models loading';
+                }
+            } catch (e) {
+                document.getElementById('stModels').innerHTML = '<span class="status-fail">Error</span>';
+                const dot = document.getElementById('hdrStatusDot');
+                const txt = document.getElementById('hdrStatusText');
+                if (dot && txt) { dot.className = 'dot bad'; txt.textContent = 'Server unreachable'; }
+            }
+        }
+
+        async function generateClientToken() {
+            try {
+                const r = await fetch(P + '/api/token', { method: 'POST', credentials: 'same-origin' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                const el = document.getElementById('tokenValue');
+                el.textContent = d.token;
+                el.style.display = 'inline-block';
+                document.getElementById('copyTokenBtn').style.display = 'inline-block';
+                toast('Token generated — copy it into asr-client/.env');
+            } catch (e) {
+                toast('Failed to generate token: ' + e.message, true);
+            }
+        }
+
+        async function copyClientToken() {
+            const el = document.getElementById('tokenValue');
+            try {
+                await navigator.clipboard.writeText(el.textContent);
+                toast('Token copied to clipboard');
+            } catch (e) {
+                toast('Copy failed — select the token manually', true);
+            }
+        }
+
+        // --- Transcribe tab: upload + SSE progress + results ---
+
+        function buildLegendTable(allSpeakers, durations) {
+            const table = document.createElement('table');
+            table.className = 'legend-table';
+            for (const spk of allSpeakers) {
+                const tr = document.createElement('tr');
+                const tdSw = document.createElement('td');
+                const swatch = document.createElement('div');
+                swatch.className = 'legend-swatch';
+                swatch.style.background = getSpeakerColor(spk, allSpeakers);
+                tdSw.appendChild(swatch);
+                const tdName = document.createElement('td');
+                let label = spk;
+                if (durations && durations[spk] !== undefined) {
+                    label += ' (' + durations[spk].toFixed(1) + 's)';
+                }
+                tdName.textContent = label;
+                tr.appendChild(tdSw);
+                tr.appendChild(tdName);
+                table.appendChild(tr);
+            }
+            return table;
+        }
+
+        function renderTimeline(result, container) {
+            if (!result || !result.segments || !result.segments.length) return;
+
+            const segments = result.segments;
+            const audioDur = result.audio_duration_sec || (segments.length ? Math.max(...segments.map(s => s.end)) : 0);
+            if (audioDur <= 0) return;
+
+            const allSpeakers = [...new Set(segments.map(s => s.speaker))].sort();
+
+            const fileLabel = document.createElement('div');
+            fileLabel.className = 'file-label';
+            fileLabel.textContent = (result._fileName || 'Audio') + ' - ' + allSpeakers.length + ' speaker(s), ' + formatTime(audioDur);
+            container.appendChild(fileLabel);
+
+            const barContainer = document.createElement('div');
+            barContainer.className = 'bar-container';
+
+            for (const seg of segments) {
+                const left = (seg.start / audioDur * 100).toFixed(4);
+                const width = ((seg.end - seg.start) / audioDur * 100).toFixed(4);
+                const color = getSpeakerColor(seg.speaker, allSpeakers);
+                const div = document.createElement('div');
+                div.className = 'bar-seg';
+                div.style.left = left + '%';
+                div.style.width = width + '%';
+                div.style.background = color;
+                div.title = seg.speaker + '  ' + formatTime(seg.start) + ' - ' + formatTime(seg.end) + ' (' + (seg.end - seg.start).toFixed(1) + 's)';
+                if (parseFloat(width) > 3) div.textContent = seg.speaker.replace('Speaker ', 'S');
+                barContainer.appendChild(div);
+            }
+            container.appendChild(barContainer);
+
+            const timeAxis = document.createElement('div');
+            timeAxis.className = 'time-axis';
+            const numTicks = Math.min(10, Math.max(2, Math.floor(audioDur / 10)));
+            for (let i = 0; i <= numTicks; i++) {
+                const tick = document.createElement('span');
+                tick.textContent = formatTime(audioDur * i / numTicks);
+                timeAxis.appendChild(tick);
+            }
+            container.appendChild(timeAxis);
+
+            const durations = {};
+            for (const spk of allSpeakers) {
+                durations[spk] = segments.filter(s => s.speaker === spk).reduce((acc, s) => acc + (s.end - s.start), 0);
+            }
+            container.appendChild(buildLegendTable(allSpeakers, durations));
+        }
+
+        function fileSelected(input) {
+            const files = input.files;
+            const el = document.getElementById('fileName');
+            const btn = document.getElementById('processBtn');
+            const ALLOWED = ['.wav', '.mp3', '.mp4', '.mkv', '.flac', '.ogg', '.m4a', '.webm', '.opus'];
+            const bad = [...files].filter(f => {
+                const dot = f.name.lastIndexOf('.');
+                return dot < 0 || !ALLOWED.includes(f.name.slice(dot).toLowerCase());
+            });
+            if (bad.length) {
+                el.textContent = 'Skipped unsupported file(s): ' + bad.map(f => f.name).join(', ');
+                el.style.display = 'block';
+            } else if (files.length > 0) {
+                if (files.length === 1) {
+                    el.textContent = files[0].name;
+                } else {
+                    el.textContent = files.length + ' files selected';
+                }
+                el.style.display = 'block';
+                btn.disabled = false;
+                return;
+            } else {
+                el.style.display = 'none';
+                btn.disabled = true;
+                return;
+            }
+            btn.disabled = true;
+        }
+
+        const uploadArea = document.getElementById('uploadArea');
+        uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+        uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+        uploadArea.addEventListener('drop', e => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length) {
+                document.getElementById('audioFile').files = e.dataTransfer.files;
+                fileSelected(document.getElementById('audioFile'));
+            }
+        });
+
+        function enterJobUi(label) {
+            jobUiActive = true;
+            document.getElementById('uploadArea').style.display = 'none';
+            document.querySelector('#tab-transcribe .options').style.display = 'none';
+            const fn = document.getElementById('fileName');
+            fn.textContent = label;
+            fn.style.display = 'block';
+            const btn = document.getElementById('processBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Processing...';
+            const resultsArea = document.getElementById('resultsArea');
+            resultsArea.style.display = 'none';
+            document.getElementById('timelineContainer').innerHTML = '';
+            const progressArea = document.getElementById('progressArea');
+            progressArea.style.display = 'block';
+            const cancelBtn = document.getElementById('cancelJobBtn');
+            cancelBtn.style.display = '';
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = 'Cancel';
+            stopStageTicker();
+            document.getElementById('diarProgressBar').style.width = '0%';
+            document.getElementById('diarProgressBar').textContent = '0%';
+            document.getElementById('diarProgressStage').textContent = 'Preparing...';
+            document.getElementById('transcriptionArea').style.display = 'none';
+            document.getElementById('transcriptionStage').textContent = 'Waiting for diarization...';
+            document.getElementById('transcriptionSegments').innerHTML = '';
+            document.getElementById('transcriptionPointer').style.display = 'none';
+            document.getElementById('transcriptionPointerLabel').textContent = '';
+            document.getElementById('transcriptionLegend').style.display = 'none';
+            document.getElementById('transcriptionLegend').innerHTML = '';
+        }
+
+        function exitJobUi() {
+            jobUiActive = false;
+            document.getElementById('cancelJobBtn').style.display = 'none';
+            stopStageTicker();
+            document.getElementById('uploadArea').style.display = '';
+            document.querySelector('#tab-transcribe .options').style.display = '';
+            const btn = document.getElementById('processBtn');
+            const files = document.getElementById('audioFile').files;
+            btn.innerHTML = 'Process Audio';
+            btn.disabled = !files.length;
+            const fn = document.getElementById('fileName');
+            if (!files.length) {
+                fn.style.display = 'none';
+                fn.textContent = '';
+            }
+        }
+
+        function newSseState(mode) {
+            return {
+                mode,
+                audioDur: 0,
+                allSpeakers: [],
+                finalData: null,
+                diarProgressBar: document.getElementById('diarProgressBar'),
+                diarProgressStage: document.getElementById('diarProgressStage'),
+                transcriptionArea: document.getElementById('transcriptionArea'),
+                transcriptionSegments: document.getElementById('transcriptionSegments'),
+                transcriptionPointer: document.getElementById('transcriptionPointer'),
+                transcriptionPointerLabel: document.getElementById('transcriptionPointerLabel'),
+                transcriptionStage: document.getElementById('transcriptionStage'),
+                transcriptionLegend: document.getElementById('transcriptionLegend'),
+                stageText: '',
+                elapsedBase: null,
+                predictedRemaining: null,
+                predictedAt: null,
+                cancelled: false,
+                noResult: false,
+            };
+        }
+
+        function stopStageTicker() {
+            if (stageTicker) {
+                clearInterval(stageTicker);
+                stageTicker = null;
+            }
+        }
+
+        function formatElapsed(sec) {
+            sec = Math.max(0, Math.round(sec));
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = sec % 60;
+            const mm = String(m).padStart(2, '0');
+            const ss = String(s).padStart(2, '0');
+            return h > 0 ? h + ':' + mm + ':' + ss : m + ':' + ss;
+        }
+
+        function transcriptionStageText(st) {
+            const parts = [];
+            if (st.stageText) parts.push(st.stageText);
+            if (st.elapsedBase !== null) {
+                parts.push(formatElapsed((Date.now() - st.elapsedBase) / 1000) + ' passed');
+                if (st.predictedAt !== null) {
+                    const left = st.predictedRemaining - (Date.now() - st.predictedAt) / 1000;
+                    parts.push('~' + formatElapsed(Math.max(0, left)) + ' left');
+                }
+            }
+            return parts.join(' · ');
+        }
+
+        function startStageTicker(st) {
+            if (stageTicker || st.elapsedBase === null) return;
+            stageTicker = setInterval(() => {
+                st.transcriptionStage.textContent = transcriptionStageText(st);
+            }, 1000);
+        }
+
+        function handleSseData(data, st) {
+            if (data.stage === 'error') {
+                stopStageTicker();
+                throw new Error(data.error || 'Processing failed');
+            }
+
+            if (data.stage === 'cancelled') {
+                stopStageTicker();
+                st.cancelled = true;
+                const cbtn = document.getElementById('cancelJobBtn');
+                cbtn.disabled = true;
+                cbtn.textContent = 'Cancelled';
+                toast('Processing cancelled');
+                return;
+            }
+
+            if (data.stage === 'done' && !data.result) {
+                stopStageTicker();
+                st.noResult = true;
+                st.diarProgressStage.textContent = 'Complete!';
+                if (st.mode === 'transcribe') st.transcriptionStage.textContent = 'Complete!';
+                return;
+            }
+
+            if (data.stage === 'done' && data.result) {
+                stopStageTicker();
+                st.finalData = data.result;
+                st.diarProgressBar.style.width = '100%';
+                st.diarProgressBar.textContent = '100%';
+                st.diarProgressStage.textContent = 'Complete!';
+                if (st.mode === 'transcribe') {
+                    if (st.transcriptionPointer) st.transcriptionPointer.style.left = '100%';
+                    let doneText = 'Complete!';
+                    if (data.processing_time_sec !== undefined && data.processing_time_sec !== null) {
+                        doneText = 'Complete — processed in ' + formatElapsed(data.processing_time_sec);
+                        if (data.speedup) doneText += ' · ' + data.speedup + 'x realtime';
+                    }
+                    st.transcriptionStage.textContent = doneText;
+                }
+                return;
+            }
+
+            if (data.phase === 'diarization') {
+                const pct = Math.round((data.progress || 0) * 100);
+                st.diarProgressBar.style.width = pct + '%';
+                st.diarProgressBar.textContent = pct + '%';
+                if (data.stage) st.diarProgressStage.textContent = data.stage;
+
+                if (data.stage === 'diarization_complete' && st.mode === 'transcribe') {
+                    const segments = data.segments || [];
+                    st.audioDur = data.audio_duration_sec || 0;
+                    st.allSpeakers = [...new Set(segments.map(s => s.speaker))].sort();
+
+                    if (st.audioDur > 0 && segments.length) {
+                        st.transcriptionArea.style.display = 'block';
+                        fillSpeakerBars(st.transcriptionSegments, segments, st.audioDur, st.allSpeakers);
+                        st.transcriptionPointer.style.display = 'block';
+                        st.transcriptionPointer.style.left = '0%';
+                        st.transcriptionLegend.style.display = 'none';
+                    }
+                }
+            }
+
+            if (data.phase === 'transcription' && data.stage !== 'done') {
+                if (data.progress !== undefined) {
+                    st.stageText = data.stage || '';
+                    if (data.elapsed_sec !== undefined) {
+                        st.elapsedBase = Date.now() - data.elapsed_sec * 1000;
+                    }
+                    if (data.predicted_remaining_sec !== undefined && data.predicted_remaining_sec !== null) {
+                        st.predictedRemaining = data.predicted_remaining_sec;
+                        st.predictedAt = Date.now();
+                    }
+                    st.transcriptionStage.textContent = transcriptionStageText(st);
+                    startStageTicker(st);
+
+                    if (data.segment_index !== undefined && st.audioDur > 0) {
+                        const segStart = data.segment_start || 0;
+                        const pointerPct = (segStart / st.audioDur * 100).toFixed(2);
+                        st.transcriptionPointer.style.left = pointerPct + '%';
+                        st.transcriptionPointerLabel.textContent = data.segment_speaker + ' @ ' + formatTime(segStart);
+                    }
+                }
+            }
+        }
+
+        async function readSseBody(body, st) {
+            const reader = body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+                            handleSseData(data, st);
+                        } catch (pe) {
+                            if (pe.message && !pe.message.includes('JSON')) throw pe;
+                        }
+                    }
+                }
+            }
+        }
+
+        function renderResultToTimeline(result, container) {
+            if (!result) return;
+            const hasResults = (result.results || []).some(r => r && (r.text || '').trim());
+            if (hasResults) {
+                if (renderTranscriptViewer(result, container)) return;
+            }
+            if (result.segments && result.segments.length) {
+                renderTimeline(result, container);
+            }
+        }
+
+        function showDownloadLink(allResults) {
+            const lines = [];
+            for (const item of allResults) {
+                lines.push('=== ' + item.file + ' ===');
+                if (item.error) {
+                    lines.push('ERROR: ' + item.error);
+                    lines.push('');
+                    continue;
+                }
+                const res = item.result || {};
+                const turns = (res.results || []).filter(r => r && (r.text || '').trim());
+                if (turns.length) {
+                    for (const t of turns) {
+                        lines.push('[' + (t.speaker || '?') + '] ' +
+                            formatTime(t.start || 0) + ' - ' + formatTime(t.end || 0));
+                        lines.push(t.text.trim());
+                        lines.push('');
+                    }
+                } else {
+                    lines.push(JSON.stringify(res, null, 2));
+                    lines.push('');
+                }
+            }
+            const txt = lines.join('\n');
+            const blob = new Blob([txt], { type: 'text/plain' });
+            if (window._resultUrl) URL.revokeObjectURL(window._resultUrl);
+            window._resultUrl = URL.createObjectURL(blob);
+            const resultsContent = document.getElementById('resultsContent');
+            resultsContent.innerHTML = '';
+            const dl = document.createElement('a');
+            dl.href = window._resultUrl;
+            dl.download = 'transcription.txt';
+            dl.className = 'btn btn-primary';
+            dl.style.display = 'inline-block';
+            dl.textContent = 'Download transcription';
+            resultsContent.appendChild(dl);
+            document.getElementById('resultsArea').style.display = 'block';
+        }
+
+        async function attachActiveJob(job) {
+            const mode = (job && job.mode) || 'transcribe';
+            const fname = (job && job.filename) || 'audio';
+            if (!document.getElementById('tab-transcribe').classList.contains('active')) {
+                history.pushState(null, '', P + '/gui');
+            }
+            activateTab('transcribe');
+            enterJobUi('Processing: ' + fname);
+            if (job && job.can_cancel === false) {
+                document.getElementById('cancelJobBtn').style.display = 'none';
+            }
+            const st = newSseState(mode);
+            try {
+                const r = await fetch(P + '/api/asr/active/stream', { credentials: 'same-origin' });
+                if (!r.ok) throw new Error('Active job ended before attach');
+                await readSseBody(r.body, st);
+            } catch (e) {
+                toast('Failed to attach to running job: ' + e.message, true);
+                exitJobUi();
+                return;
+            }
+            if (st.cancelled) {
+                exitJobUi();
+                return;
+            }
+            if (st.noResult) {
+                exitJobUi();
+                toast('Processing complete');
+                setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+                return;
+            }
+            if (!st.finalData) {
+                toast('Lost connection to running job', true);
+                exitJobUi();
+                return;
+            }
+            const allResults = [];
+            st.finalData._fileName = fname;
+            allResults.push({ file: fname, result: st.finalData });
+            renderResultToTimeline(st.finalData, document.getElementById('timelineContainer'));
+            showDownloadLink(allResults);
+            exitJobUi();
+            toast('Processing complete');
+            setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+        }
+
+        async function processAudio() {
+            const fileInput = document.getElementById('audioFile');
+            if (!fileInput.files.length) { toast('Please select a file', true); return; }
+
+            const mode = document.getElementById('outputMode').value;
+            const numSpeakers = document.getElementById('numSpeakers').value;
+            const btn = document.getElementById('processBtn');
+            const timelineContainer = document.getElementById('timelineContainer');
+
+            const allResults = [];
+            const total = fileInput.files.length;
+            enterJobUi(total === 1 ? fileInput.files[0].name : total + ' files');
+
+            for (let i = 0; i < total; i++) {
+                const file = fileInput.files[i];
+                btn.innerHTML = '<span class="spinner"></span>Processing ' + (i + 1) + '/' + total + '...';
+                enterJobUi('Processing ' + (i + 1) + '/' + total + ': ' + file.name);
+
+                const form = new FormData();
+                form.append('file', file);
+                if (numSpeakers) form.append('num_speakers', numSpeakers);
+
+                try {
+                    const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
+                    const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
+
+                    if (r.status === 409) {
+                        let info = {};
+                        try { info = await r.json(); } catch (e) { }
+                        if (info.job) {
+                            toast('Already processing — attaching to running job');
+                            await attachActiveJob(info.job);
+                        } else {
+                            toast(info.detail || 'Another transcription is already in progress', true);
+                        }
+                        return;
+                    }
+
+                    if (!r.ok) {
+                        const errText = await r.text();
+                        throw new Error(errText);
+                    }
+
+                    const st = newSseState(mode);
+                    await readSseBody(r.body, st);
+
+                    if (st.cancelled) {
+                        allResults.push({ file: file.name, error: 'Cancelled' });
+                        break;
+                    }
+
+                    if (st.finalData) {
+                        st.finalData._fileName = file.name;
+                        allResults.push({ file: file.name, result: st.finalData });
+                        renderResultToTimeline(st.finalData, timelineContainer);
+                    }
+                } catch (e) {
+                    allResults.push({ file: file.name, error: e.message });
+                    toast('Error processing ' + file.name + ': ' + e.message, true);
+                }
+            }
+
+            showDownloadLink(allResults);
+            toast('Processing complete');
+            exitJobUi();
+            setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+        }
+
+        async function cancelActiveJob() {
+            const btn = document.getElementById('cancelJobBtn');
+            if (btn.disabled) return;
+            btn.disabled = true;
+            btn.textContent = 'Cancelling…';
+            try {
+                const r = await fetch(P + '/api/asr/active/cancel', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                });
+                if (!r.ok) {
+                    let d = {};
+                    try { d = await r.json(); } catch (e) { }
+                    throw new Error(d.detail || ('HTTP ' + r.status));
+                }
+                toast('Cancellation requested');
+            } catch (e) {
+                toast('Cancel failed: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Cancel';
+            }
+        }
+
+        async function checkActiveJob() {
+            if (jobUiActive) return;
+            try {
+                const r = await fetch(P + '/api/asr/active', { credentials: 'same-origin' });
+                if (!r.ok) return;
+                const d = await r.json();
+                if (d.active && d.job && !jobUiActive) {
+                    await attachActiveJob(d.job);
+                }
+            } catch (e) {
+            }
+        }
+
+        // --- Voiceprints tab ---
+
+        async function refresh() {
+            const data = await apiFetch('/speakers');
+            speakersData = data.speakers || [];
+            renderSpeakers();
+        }
+
+        function renderSpeakers() {
+            const el = document.getElementById('speakers-list');
+            if (!speakersData.length) {
+                el.innerHTML = '<div class="card"><div class="empty">No speakers found. Drop audio files into the voices directory and click Rescan, or run a diarization to auto-collect snippets.</div></div>';
+                return;
+            }
+            el.innerHTML = speakersData.map(s => `
+                <div class="card" id="speaker-${escHtml(s.name)}">
+                    <div class="card-header" onclick="toggleSpeaker('${escHtml(s.name)}')">
+                        <h3>
+                            ${escHtml(s.name)}
+                            ${s.has_voiceprint ? '<span class="badge badge-green">voiceprint</span>' : '<span class="badge badge-gray">no voiceprint</span>'}
+                        </h3>
+                        <div class="meta">
+                            <span>${s.snippet_count} snippets</span>
+                            <span>${formatDuration(s.total_duration_sec)}</span>
+                            ${s.pitch_hz ? '<span>' + s.pitch_hz.toFixed(0) + ' Hz</span>' : ''}
+                        </div>
+                    </div>
+                    <div class="card-body-fold" id="body-${escHtml(s.name)}">
+                        <div class="empty">Loading snippets...</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function toggleSpeaker(name) {
+            const body = document.getElementById('body-' + name);
+            if (body.classList.contains('open')) {
+                body.classList.remove('open');
+                return;
+            }
+            body.classList.add('open');
+            try {
+                const data = await apiFetch('/speakers/' + encodeURIComponent(name) + '/snippets');
+                if (!data.snippets || !data.snippets.length) {
+                    body.innerHTML = '<div class="empty">No snippets</div>';
+                    return;
+                }
+                body.innerHTML = `
+                    <ul class="speaker-list">
+                        ${data.snippets.map(s => `
+                            <li>
+                                <div>
+                                    <button class="btn-play" id="play-${s.id}" onclick="togglePlay(${s.id})" title="Play">&#9654;</button>
+                                    <strong style="margin-left:0.5rem;">${escHtml(basename(s.file_path))}</strong>
+                                    <span style="color:var(--muted);margin-left:0.5rem;">${s.duration_sec.toFixed(1)}s</span>
+                                    ${s.source_audio ? '<span style="color:#98a2bd;margin-left:0.5rem;font-size:0.8rem;">from ' + escHtml(basename(s.source_audio)) + '</span>' : ''}
+                                </div>
+                                <div class="actions">
+                                    <button class="btn btn-danger btn-sm" onclick="deleteSnippet(${s.id}, '${escHtml(name)}')">Remove</button>
+                                </div>
+                            </li>
+                        `).join('')}
+                    </ul>
+                    <div class="form-inline">
+                        <span class="form-label">Add snippet:</span>
+                        <input type="file" id="upload-${escHtml(name)}" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus">
+                        <button class="btn btn-primary btn-sm" onclick="uploadSnippet('${escHtml(name)}')">Upload</button>
+                        <button class="btn btn-warning btn-sm" onclick="renamePrompt('${escHtml(name)}')">Rename</button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteSpeaker('${escHtml(name)}')">Delete Speaker</button>
+                    </div>
+                `;
+            } catch (e) {
+                body.innerHTML = '<div class="empty">Failed to load snippets</div>';
+            }
+        }
+
+        async function deleteSnippet(id, speakerName) {
+            if (!confirm('Remove this snippet? The voiceprint will be auto-refined.')) return;
+            await apiFetch('/snippets/' + id, { method: 'DELETE' });
+            toast('Snippet removed');
+            toggleSpeaker(speakerName);
+            refresh();
+        }
+
+        async function uploadSnippet(name) {
+            const input = document.getElementById('upload-' + name);
+            if (!input.files[0]) { toast('Select a file first', true); return; }
+            const f = input.files[0];
+            const dot = f.name.lastIndexOf('.');
+            const ALLOWED = ['.wav', '.mp3', '.mp4', '.mkv', '.flac', '.ogg', '.m4a', '.webm', '.opus'];
+            if (dot < 0 || !ALLOWED.includes(f.name.slice(dot).toLowerCase())) {
+                toast('Unsupported file format: ' + f.name, true);
+                input.value = '';
+                return;
+            }
+            const form = new FormData();
+            form.append('file', input.files[0]);
+            await apiFetch('/speakers/' + encodeURIComponent(name) + '/upload', { method: 'POST', body: form });
+            toast('Snippet uploaded, voiceprint refining...');
+            input.value = '';
+            toggleSpeaker(name);
+            refresh();
+        }
+
+        function renamePrompt(name) {
+            const newName = prompt('Rename speaker "' + name + '" to:', name);
+            if (!newName || newName === name) return;
+            renameSpeaker(name, newName);
+        }
+
+        async function renameSpeaker(oldName, newName) {
+            const res = await apiFetch('/speakers/' + encodeURIComponent(oldName) + '/rename', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ new_name: newName }),
+            });
+            if (res && res.error) { toast(res.error, true); return; }
+            toast('Renamed to ' + newName);
+            refresh();
+        }
+
+        async function deleteSpeaker(name) {
+            if (!confirm('Delete speaker "' + name + '" and all their snippets?')) return;
+            await apiFetch('/speakers/' + encodeURIComponent(name), { method: 'DELETE' });
+            toast('Speaker deleted');
+            refresh();
+        }
+
+        async function rescanVoices() {
+            if (rescanInFlight) return;
+            rescanInFlight = true;
+            const statusEl = document.getElementById('rescanStatus');
+            const stageEl = statusEl.querySelector('.status-stage');
+            const countEl = statusEl.querySelector('.status-count');
+            statusEl.classList.add('visible');
+            stageEl.textContent = 'Scanning...';
+            countEl.textContent = '';
+            try {
+                const r = await fetch(API + '/rescan/stream', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                });
+                if (r.status === 409) {
+                    let info = {};
+                    try { info = await r.json(); } catch (e) { }
+                    throw new Error(info.detail || 'Another job is already running');
+                }
+                if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+
+                const reader = r.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let finalResult = null;
+                let lastRefresh = 0;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        let data;
+                        try { data = JSON.parse(line.slice(6)); } catch (e) { continue; }
+                        if (data.stage === 'error') throw new Error(data.error || 'Rescan failed');
+                        if (data.stage === 'done') {
+                            finalResult = data.result;
+                            continue;
+                        }
+                        if (data.stage) stageEl.textContent = data.stage;
+                        countEl.textContent = (data.scanned !== undefined ? data.scanned + ' scanned, ' : '') +
+                            (data.added !== undefined ? data.added + ' added' : '');
+                        const now = Date.now();
+                        if (now - lastRefresh > 1200) {
+                            lastRefresh = now;
+                            refresh();
+                        }
+                    }
+                    if (finalResult) { statusEl.classList.remove('visible'); break; }
+                }
+                if (finalResult) {
+                    toast('Scanned ' + finalResult.scanned + ' files, added ' + finalResult.added + ' new snippets');
+                } else {
+                    toast('Rescan finished');
+                }
+                await refresh();
+            } catch (e) {
+                toast('Rescan failed: ' + e.message, true);
+            } finally {
+                rescanInFlight = false;
+                statusEl.classList.remove('visible');
+            }
+        }
+
+        function openMergeDialog() {
+            const dialog = document.getElementById('mergeDialog');
+            const primary = document.getElementById('mergePrimary');
+            const secondary = document.getElementById('mergeSecondary');
+            const names = speakersData.map(s => s.name);
+            if (names.length < 2) { toast('Need at least two speakers to merge', true); return; }
+            primary.innerHTML = names.map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('');
+            secondary.innerHTML = names.map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('');
+            if (names.length > 1) secondary.selectedIndex = 1;
+            dialog.classList.remove('hidden');
+        }
+
+        function closeMergeDialog() {
+            document.getElementById('mergeDialog').classList.add('hidden');
+        }
+
+        async function mergeSpeakers() {
+            const primary = document.getElementById('mergePrimary').value;
+            const secondary = document.getElementById('mergeSecondary').value;
+            if (primary === secondary) { toast('Select different speakers', true); return; }
+            if (!confirm('Merge "' + secondary + '" into "' + primary + '"? This will move all snippets and refine the primary voiceprint.')) return;
+            closeMergeDialog();
+            await apiFetch('/speakers/merge', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ primary, secondary }),
+            });
+            toast(secondary + ' merged into ' + primary);
+            refresh();
+        }
+
+        function togglePlay(snippetId) {
+            if (currentAudio && currentPlayBtn && currentPlayBtn.dataset.snippetId === String(snippetId)) {
+                currentAudio.pause();
+                currentAudio.currentTime = 0;
+                currentAudio = null;
+                currentPlayBtn.innerHTML = '&#9654;';
+                currentPlayBtn.classList.remove('playing');
+                currentPlayBtn = null;
+                return;
+            }
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio.currentTime = 0;
+                currentPlayBtn.innerHTML = '&#9654;';
+                currentPlayBtn.classList.remove('playing');
+            }
+            const btn = document.getElementById('play-' + snippetId);
+            const audio = new Audio(API + '/snippets/' + snippetId + '/audio');
+            audio.onended = () => {
+                btn.innerHTML = '&#9654;';
+                btn.classList.remove('playing');
+                if (currentAudio === audio) currentAudio = null;
+                if (currentPlayBtn === btn) currentPlayBtn = null;
+            };
+            audio.onerror = () => {
+                toast('Failed to play audio', true);
+                btn.innerHTML = '&#9654;';
+                btn.classList.remove('playing');
+                currentAudio = null;
+                currentPlayBtn = null;
+            };
+            audio.play();
+            btn.innerHTML = '&#9632;';
+            btn.classList.add('playing');
+            btn.dataset.snippetId = snippetId;
+            currentAudio = audio;
+            currentPlayBtn = btn;
+        }
+
+        // --- History tab ---
+
+        function getTextPreview(result) {
+            if (!result) return '';
+            const results = result.results || [];
+            if (results.length) {
+                const texts = results.map(r => r.text || '').filter(Boolean);
+                const full = texts.join(' ');
+                return full.length > 180 ? full.substring(0, 180) + '...' : full;
+            }
+            const segments = result.segments || [];
+            if (segments.length) {
+                const texts = segments.map(s => s.text || '').filter(Boolean);
+                const full = texts.join(' ');
+                return full.length > 180 ? full.substring(0, 180) + '...' : full;
+            }
+            return '';
+        }
+
+        function renderList() {
+            const container = document.getElementById('listContainer');
+            const empty = document.getElementById('emptyState');
+            const badge = document.getElementById('countBadge');
+
+            if (!transcripts.length) {
+                container.innerHTML = '';
+                empty.style.display = 'block';
+                badge.textContent = '';
+                return;
+            }
+
+            empty.style.display = 'none';
+            badge.textContent = transcripts.length + ' file(s)';
+            container.innerHTML = '';
+
+            for (const t of transcripts) {
+                const item = document.createElement('div');
+                item.className = 'list-item' + (t.id === currentId ? ' selected' : '');
+                item.id = 'item-' + t.id;
+                item.onclick = () => selectTranscription(t.id);
+
+                const preview = getTextPreview(t.result);
+                const speakers = t.total_speakers || 0;
+                const dur = t.audio_duration_sec || 0;
+
+                item.innerHTML =
+                    '<div class="filename">' + escHtml(t.audio_filename) + '</div>' +
+                    '<div class="meta">' +
+                    '<span>' + formatDate(t.created_at) + '</span>' +
+                    (speakers ? '<span>' + speakers + ' speaker(s)</span>' : '') +
+                    (dur ? '<span>' + formatDuration(dur) + '</span>' : '') +
+                    '</div>' +
+                    (preview ? '<div class="preview">' + escHtml(preview) + '</div>' : '');
+
+                container.appendChild(item);
+            }
+        }
+
+        async function loadTranscripts() {
+            try {
+                const r = await fetch(P + '/api/transcripts', { credentials: 'same-origin' });
+                const data = await r.json();
+                transcripts = data.transcripts || [];
+                renderList();
+                if (currentId === null && transcripts.length) {
+                    selectTranscription(transcripts[0].id);
+                } else if (currentId && !transcripts.some(t => t.id === currentId)) {
+                    currentId = null;
+                    document.getElementById('detailTitle').textContent = 'Transcription';
+                    document.getElementById('detailActions').style.display = 'none';
+                    document.getElementById('detailBody').innerHTML =
+                        '<div class="detail-empty">Select a transcription from the list to view it here.</div>';
+                }
+            } catch (e) {
+                toast('Failed to load transcriptions', true);
+            }
+        }
+
+        async function selectTranscription(id) {
+            currentId = id;
+            renderList();
+            document.getElementById('detailTitle').textContent = 'Loading...';
+            document.getElementById('detailActions').style.display = 'none';
+            document.getElementById('detailBody').innerHTML =
+                '<div class="detail-empty">Loading...</div>';
+            try {
+                const r = await fetch(P + '/api/transcripts/' + id, { credentials: 'same-origin' });
+                const item = await r.json();
+                const result = item.result || {};
+
+                document.getElementById('detailTitle').textContent = item.audio_filename;
+                document.getElementById('detailActions').style.display = 'flex';
+                const body = document.getElementById('detailBody');
+                body.innerHTML = '';
+
+                const metaLine = document.createElement('div');
+                metaLine.className = 'meta-line';
+                metaLine.textContent = 'Date: ' + formatDate(item.created_at) +
+                    '  ·  Speakers: ' + (item.total_speakers || 0) +
+                    '  ·  Duration: ' + formatDuration(item.audio_duration_sec);
+                body.appendChild(metaLine);
+
+                if (!renderTranscriptViewer(result, body)) {
+                    const results = (result.results || []).filter(x => x && (x.text || '').trim());
+                    if (results.length) {
+                        const pane = document.createElement('div');
+                        pane.className = 'tv-text';
+                        renderBlocks(pane, results);
+                        body.appendChild(pane);
+                    } else {
+                        const note = document.createElement('div');
+                        note.style.cssText = 'color:#98a2bd;font-size:0.85rem;';
+                        note.textContent = 'No content stored for this entry.';
+                        body.appendChild(note);
+                    }
+                }
+            } catch (e) {
+                document.getElementById('detailTitle').textContent = 'Transcription';
+                document.getElementById('detailActions').style.display = 'none';
+                document.getElementById('detailBody').innerHTML =
+                    '<div class="detail-empty">Failed to load transcription.</div>';
+                toast('Failed to load transcription', true);
+            }
+        }
+
+        function downloadTranscription(id) {
+            window.open(P + '/api/transcripts/' + id + '/download', '_blank');
+        }
+
+        async function deleteTranscription(id) {
+            if (!confirm('Delete this transcription?')) return;
+            try {
+                const r = await fetch(P + '/api/transcripts/' + id, { method: 'DELETE', credentials: 'same-origin' });
+                if (r.ok) {
+                    transcripts = transcripts.filter(t => t.id !== id);
+                    const wasCurrent = id === currentId;
+                    currentId = null;
+                    renderList();
+                    if (wasCurrent) {
+                        document.getElementById('detailTitle').textContent = 'Transcription';
+                        document.getElementById('detailActions').style.display = 'none';
+                        document.getElementById('detailBody').innerHTML =
+                            '<div class="detail-empty">Select a transcription from the list to view it here.</div>';
+                    }
+                    if (transcripts.length) {
+                        selectTranscription(transcripts[0].id);
+                    }
+                    toast('Deleted');
+                } else {
+                    toast('Delete failed', true);
+                }
+            } catch (e) {
+                toast('Delete failed', true);
+            }
+        }
+
+        // --- Init ---
+
+        loadUser();
+        checkStatus();
+        activateTab(tabFromPath());
+        checkActiveJob();
+        setInterval(checkActiveJob, 5000);
+    </script>
+</body>
+</html>
