@@ -36,6 +36,7 @@ def transcribe_audio_sync(
     prefix_ids: Optional[list[int]] = None,
     _no_window: bool = False,
     progress_cb=None,
+    context: str = "",
 ) -> dict:
     """Transcribe audio (or a precomputed mel) with the active ASR backend."""
     return _backend().transcribe_audio_sync(
@@ -47,6 +48,7 @@ def transcribe_audio_sync(
         prefix_ids=prefix_ids,
         _no_window=_no_window,
         progress_cb=progress_cb,
+        context=context,
     )
 
 
@@ -62,6 +64,7 @@ async def transcribe_audio_async(
     mel_spectrogram: Optional[np.ndarray] = None,
     past_kv_cache_ort: Optional[dict] = None,
     prefix_ids: Optional[list[int]] = None,
+    context: str = "",
 ) -> dict:
     loop = asyncio.get_event_loop()
     from asr_mcp.core.model_state import executor as _executor
@@ -73,5 +76,6 @@ async def transcribe_audio_async(
             mel_spectrogram=mel_spectrogram,
             past_kv_cache_ort=past_kv_cache_ort,
             prefix_ids=prefix_ids,
+            context=context,
         ),
     )

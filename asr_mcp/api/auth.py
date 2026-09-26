@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 logger = logging.getLogger("asr_mcp.api.auth")
 
@@ -94,7 +94,7 @@ def get_session_user(request: Request) -> Optional[str]:
     return request.scope.get("session", {}).get("user")
 
 
-def require_auth(request: Request) -> Optional[RedirectResponse]:
+def require_auth(request: Request) -> Optional[Response]:
     """Check if request is authenticated. Returns RedirectResponse to /login if not."""
     path = request.url.path or "/"
     # Normalize double slashes
@@ -113,6 +113,13 @@ def require_auth(request: Request) -> Optional[RedirectResponse]:
     user = get_session_user(request)
     if user:
         return None
+
+    api_key = request.headers.get("X-API-Key")
+    if api_key:
+        from asr_mcp.api.security import is_valid_api_key
+        if is_valid_api_key(api_key):
+            return None
+        return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
 
     return RedirectResponse(url=redirect_url(request, "/login"), status_code=302)
 

@@ -20,6 +20,7 @@ class ActiveJob:
         self.user_id = user_id
         self.started_at = time.time()
         self.status = "running"
+        self.cancel_requested = False
         self.events: List[dict] = []
         self.subscribers: List[asyncio.Queue] = []
 
@@ -29,8 +30,10 @@ class ActiveJob:
             "id": self.id,
             "mode": self.mode,
             "filename": self.filename,
+            "user_id": self.user_id,
             "started_at": self.started_at,
             "status": self.status,
+            "cancel_requested": self.cancel_requested,
             "stage": last.get("stage"),
             "progress": last.get("progress"),
             "phase": last.get("phase"),
@@ -66,8 +69,8 @@ def publish(evt) -> None:
     for q in list(job.subscribers):
         q.put_nowait(evt)
     stage = evt.get("stage")
-    if stage in ("done", "error") and evt.get("phase") != "diarization":
-        finish(job, "done" if stage == "done" else "error")
+    if stage in ("done", "error", "cancelled") and evt.get("phase") != "diarization":
+        finish(job, "done" if stage == "done" else stage)
 
 
 def attach(job: ActiveJob) -> Tuple[List[dict], Optional[asyncio.Queue]]:

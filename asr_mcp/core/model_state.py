@@ -126,6 +126,16 @@ class ModelState:
         )
 
     @property
+    def ready_for_diarize(self) -> bool:
+        """Diarization only needs VAD + embedding (never the ASR backend)."""
+        return bool(self.vad_session is not None and self.embedding_session is not None)
+
+    @property
+    def ready_for_transcribe(self) -> bool:
+        """Transcription turns only need the ASR backend (diarization is done)."""
+        return bool(self.backend is not None and self.backend.is_loaded)
+
+    @property
     def any_loaded(self) -> bool:
         return bool(
             (self.backend is not None and self.backend.is_loaded)
@@ -181,35 +191,48 @@ class ModelState:
         log_gpu_memory("embedding unloaded")
 
 
+    def _ensure_settings(self):
+        if not self.settings:
+            from asr_mcp.config.settings import get_settings
+            self.settings = get_settings()
+        return self.settings
+
+    def _ensure_backend(self, gc) -> None:
+        """Load/pick the ASR backend per TRANSCRIBE_ASR_MODEL (no-op if loaded)."""
+        from asr_mcp.transcribers import get_backend
+        settings = self._ensure_settings()
+        if self.backend is None or self.backend.name != settings.asr_model:
+            if self.backend is not None:
+                self.backend.unload()
+                gc.collect()
+            self.backend = get_backend(settings)
+        if not self.backend.is_loaded:
+            logger.info("Loading ASR backend '%s'...", self.backend.name)
+            self.backend.load(settings)
+
+    def _ensure_vad_embedding(self) -> None:
+        """Load VAD + embedding sessions (no-op if present)."""
+        from asr_mcp.core.model_loader import (
+            load_vad_session,
+            load_embedding_session,
+        )
+        settings = self._ensure_settings()
+        if self.vad_session is None:
+            logger.info("Loading VAD session (CPU)...")
+            self.vad_session = load_vad_session(settings)
+        if self.embedding_session is None:
+            logger.info("Loading embedding session...")
+            self.embedding_session = load_embedding_session(settings)
+
     def reload_models(self):
         """Load any missing models (full cold start or granular fill)."""
         if self.is_ready:
             self.touch()
             return
-        if not self.settings:
-            from asr_mcp.config.settings import get_settings
-            self.settings = get_settings()
-        from asr_mcp.core.model_loader import (
-            load_vad_session,
-            load_embedding_session,
-        )
-        from asr_mcp.transcribers import get_backend
         import gc
         try:
-            if self.backend is None or self.backend.name != self.settings.asr_model:
-                if self.backend is not None:
-                    self.backend.unload()
-                    gc.collect()
-                self.backend = get_backend(self.settings)
-            if not self.backend.is_loaded:
-                logger.info("Loading ASR backend '%s'...", self.backend.name)
-                self.backend.load(self.settings)
-            if self.vad_session is None:
-                logger.info("Loading VAD session (CPU)...")
-                self.vad_session = load_vad_session(self.settings)
-            if self.embedding_session is None:
-                logger.info("Loading embedding session...")
-                self.embedding_session = load_embedding_session(self.settings)
+            self._ensure_backend(gc)
+            self._ensure_vad_embedding()
             self.touch()
             if self.is_ready:
                 logger.info("Models ready")
@@ -217,6 +240,38 @@ class ModelState:
                 logger.warning("Model load incomplete")
         except Exception as e:
             logger.error("Failed to reload models: %s", e)
+
+    def ensure_diarize_ready(self):
+        """Load only what diarization needs (VAD + embedding, no ASR backend).
+
+        If a backend is already resident (e.g. from a prior transcription), unload
+        it first so diarization never competes with it for VRAM.
+        """
+        if self.ready_for_diarize and not self.ready_for_transcribe:
+            self.touch()
+            return
+        import gc
+        try:
+            if self.backend is not None and self.backend.is_loaded:
+                logger.info("Unloading ASR backend before diarization (VRAM)")
+                self.backend.unload()
+                gc.collect()
+            self._ensure_vad_embedding()
+            self.touch()
+        except Exception as e:
+            logger.error("Failed to load diarize models: %s", e)
+
+    def ensure_backend_ready(self):
+        """Load only the ASR backend (transcription turns, post-diarization)."""
+        if self.ready_for_transcribe:
+            self.touch()
+            return
+        import gc
+        try:
+            self._ensure_backend(gc)
+            self.touch()
+        except Exception as e:
+            logger.error("Failed to load ASR backend: %s", e)
 
     def ensure_ready(self):
         """Ensure models are loaded, reload if needed, and record usage."""

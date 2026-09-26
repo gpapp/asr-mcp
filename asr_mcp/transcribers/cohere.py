@@ -458,6 +458,7 @@ class CohereBackend(ASRBackend):
         prefix_ids: Optional[list[int]] = None,
         _no_window: bool = False,
         progress_cb: Optional[callable] = None,
+        context: str = "",
     ) -> dict:
         start_time = time.time()
 

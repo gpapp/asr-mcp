@@ -60,6 +60,14 @@ class TranscriptModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
+class ApiTokenModel(Base):
+    __tablename__ = "api_tokens"
+
+    user_id = Column(String(255), primary_key=True)
+    token_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 class SnippetModel(Base):
     __tablename__ = "snippets"
 

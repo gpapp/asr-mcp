@@ -58,8 +58,12 @@ class ASRBackend(ABC):
         prefix_ids=None,
         _no_window: bool = False,
         progress_cb: Optional[Callable[[dict], None]] = None,
+        context: str = "",
     ) -> dict:
         """Transcribe audio (or precomputed features). Returns:
         {text, segments, audio_duration_sec, inference_time_sec,
          tokens_generated, [error]}
+
+        ``context`` is an optional short carry-over transcript that a backend
+        may use as a decoding hint. Backends without a context slot ignore it.
         """

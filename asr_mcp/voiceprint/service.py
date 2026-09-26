@@ -175,6 +175,23 @@ class VoiceprintService:
     def list_snippets(self, speaker_name: str, user_id: str = DEFAULT_USER) -> list[dict]:
         return self._snippets.list_by_speaker(speaker_name, user_id=user_id)
 
+    def refine_speaker(self, speaker_name: str, user_id: str = DEFAULT_USER) -> dict:
+        snippets = self._snippets.list_by_speaker(speaker_name, user_id=user_id)
+        if not snippets:
+            return {"error": f"No snippets found for '{speaker_name}'"}
+        self._auto_refine(speaker_name, user_id=user_id)
+        vp = self._db.get(speaker_name, user_id=user_id)
+        if not vp:
+            return {"error": f"Voiceprint could not be built for '{speaker_name}' (embedding session unavailable?)"}
+        return {
+            "status": "refined",
+            "speaker_name": speaker_name,
+            "snippet_count": len(snippets),
+            "total_duration_sec": round(sum(s.get("duration_sec", 0.0) for s in snippets), 2),
+            "pitch_hz": round(vp.get("pitch_hz", 0.0), 1),
+            "energy_rms": round(vp.get("energy_rms", 0.0), 4),
+        }
+
     def delete_snippet(self, snippet_id: int, user_id: str = DEFAULT_USER) -> dict:
         sn = self._snippets.get(snippet_id, user_id=user_id)
         if not sn:

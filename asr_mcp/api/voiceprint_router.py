@@ -4,7 +4,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from asr_mcp.api.schemas import (
@@ -27,7 +27,7 @@ def _get_service(settings: Settings, ensure_gpu: bool = False):
     from asr_mcp.core.model_state import state
 
     if ensure_gpu:
-        state.ensure_ready()
+        state.ensure_diarize_ready()
     db = DatabaseManager(settings.db_path)
     service = VoiceprintService(settings.data_dir, db)
     service.set_voices_dir(settings.voices_dir)
@@ -82,6 +82,8 @@ async def merge_speakers(
 async def upload_snippet(
     speaker_name: str,
     file: UploadFile = File(...),
+    start_sec: float = Query(None),
+    end_sec: float = Query(None),
     user_id: str = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ):
@@ -100,6 +102,14 @@ async def upload_snippet(
         waveform, sr = load_audio(str(tmp_path))
         audio_data = waveform.numpy().squeeze()
 
+        if start_sec is not None or end_sec is not None:
+            total_sec = len(audio_data) / sr
+            s = max(0.0, float(start_sec or 0.0))
+            e = min(total_sec, float(end_sec) if end_sec is not None else total_sec)
+            if e <= s:
+                return {"error": f"Invalid segment: end ({e:.1f}s) must be after start ({s:.1f}s)"}
+            audio_data = audio_data[int(s * sr):int(e * sr)]
+
         service = _get_service(settings, ensure_gpu=True)
         result = service.add_snippet(
             speaker_name=speaker_name,
@@ -107,6 +117,8 @@ async def upload_snippet(
             user_id=user_id,
             sample_rate=sr,
             source_audio=file.filename,
+            start_sec=start_sec,
+            end_sec=end_sec,
         )
         return result
     except Exception as e:
@@ -117,6 +129,16 @@ async def upload_snippet(
             tmp_dir.rmdir()
         except Exception:
             pass
+
+
+@router.post("/speakers/{speaker_name}/refine")
+async def refine_speaker(
+    speaker_name: str,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    service = _get_service(settings, ensure_gpu=True)
+    return service.refine_speaker(speaker_name, user_id=user_id)
 
 
 @router.delete("/snippets/{snippet_id}")

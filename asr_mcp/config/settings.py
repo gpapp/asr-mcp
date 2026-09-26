@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     qwen_max_new_tokens: int = Field(default=256)
     qwen_max_inference_batch_size: int = Field(default=8)
     qwen_quantize_4bit: bool = Field(default=True, description="Load quantized Qwen3-ASR via load_in_4bit")
+    qwen_aligner_quantize_4bit: bool = Field(
+        default=True,
+        description="Load the Qwen3 forced aligner in 4-bit (saves ~0.9GB VRAM; "
+                    "set false for maximum timestamp precision)",
+    )
 
     # Embedding Model (ECAPA-TDNN)
     embedding_model_repo: str = Field(default="Wespeaker/wespeaker-ecapa-tdnn512-LM")
@@ -120,6 +125,8 @@ class Settings(BaseSettings):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.model_cache_dir.mkdir(parents=True, exist_ok=True)
         self.voices_dir.mkdir(parents=True, exist_ok=True)
+        self.qwen_model_dir.mkdir(parents=True, exist_ok=True)
+        self.qwen_forced_aligner_dir.mkdir(parents=True, exist_ok=True)
 
 
 _settings: Optional[Settings] = None

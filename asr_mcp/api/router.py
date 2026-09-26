@@ -5,6 +5,7 @@ from asr_mcp.api.speaker_router import router as speaker_router
 from asr_mcp.api.mcp_router import router as mcp_router
 from asr_mcp.api.voiceprint_router import router as voiceprint_router
 from asr_mcp.api.transcript_router import router as transcript_router
+from asr_mcp.api.token_router import router as token_router
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(asr_router)
@@ -12,3 +13,4 @@ api_router.include_router(speaker_router)
 api_router.include_router(mcp_router)
 api_router.include_router(voiceprint_router)
 api_router.include_router(transcript_router)
+api_router.include_router(token_router)

@@ -127,6 +127,9 @@
                         <div id="transcriptionLegend" style="display:none;"></div>
                         <div id="transcriptionStage" style="font-size:0.78rem;color:#666;margin-top:0.15rem;">Waiting for diarization...</div>
                     </div>
+                    <div style="margin-top:0.8rem;">
+                        <button id="cancelJobBtn" type="button" onclick="cancelActiveJob()" style="display:none;padding:0.35rem 1rem;border:1px solid #dc3545;background:#fff;color:#dc3545;border-radius:6px;cursor:pointer;font-size:0.85rem;">Cancel</button>
+                    </div>
                 </div>
 
                 <div class="options">
@@ -149,6 +152,20 @@
                 </div>
             </div>
         </div>
+
+        <div class="card">
+            <div class="card-title">Windows Client Token</div>
+            <div class="card-body">
+                <p style="font-size:0.85rem;color:#555;margin-bottom:0.8rem;">
+                    API token for the <code>asr-client</code> drop-target client. One token per user; generating a new one invalidates the previous token. Put it in <code>asr-client/.env</code> as <code>TOKEN=...</code>.
+                </p>
+                <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+                    <button class="btn btn-primary" id="genTokenBtn" onclick="generateClientToken()">Generate token</button>
+                    <code id="tokenValue" style="display:none;padding:0.45rem 0.6rem;background:#f4f6f8;border:1px solid #ddd;border-radius:4px;font-size:0.8rem;word-break:break-all;"></code>
+                    <button class="btn btn-primary" id="copyTokenBtn" style="display:none;" onclick="copyClientToken()">Copy</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div class="toast" id="toast"></div>
@@ -167,6 +184,31 @@
             t.textContent = msg;
             t.className = 'toast show' + (isError ? ' error' : '');
             setTimeout(() => t.className = 'toast', 4000);
+        }
+
+        async function generateClientToken() {
+            try {
+                const r = await fetch(P + '/api/token', { method: 'POST', credentials: 'same-origin' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const d = await r.json();
+                const el = document.getElementById('tokenValue');
+                el.textContent = d.token;
+                el.style.display = 'inline-block';
+                document.getElementById('copyTokenBtn').style.display = 'inline-block';
+                toast('Token generated — copy it into asr-client/.env');
+            } catch (e) {
+                toast('Failed to generate token: ' + e.message, true);
+            }
+        }
+
+        async function copyClientToken() {
+            const el = document.getElementById('tokenValue');
+            try {
+                await navigator.clipboard.writeText(el.textContent);
+                toast('Token copied to clipboard');
+            } catch (e) {
+                toast('Copy failed — select the token manually', true);
+            }
         }
 
         function buildLegendTable(allSpeakers, durations) {
@@ -312,6 +354,7 @@
         });
 
         function enterJobUi(label) {
+            jobUiActive = true;
             document.getElementById('uploadArea').style.display = 'none';
             document.querySelector('.options').style.display = 'none';
             const fn = document.getElementById('fileName');
@@ -325,10 +368,16 @@
             document.getElementById('timelineContainer').innerHTML = '';
             const progressArea = document.getElementById('progressArea');
             progressArea.style.display = 'block';
+            const cancelBtn = document.getElementById('cancelJobBtn');
+            cancelBtn.style.display = '';
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = 'Cancel';
+            stopStageTicker();
             document.getElementById('diarProgressBar').style.width = '0%';
             document.getElementById('diarProgressBar').textContent = '0%';
             document.getElementById('diarProgressStage').textContent = 'Preparing...';
             document.getElementById('transcriptionArea').style.display = 'none';
+            document.getElementById('transcriptionStage').textContent = 'Waiting for diarization...';
             document.getElementById('transcriptionSegments').innerHTML = '';
             document.getElementById('transcriptionPointer').style.display = 'none';
             document.getElementById('transcriptionPointerLabel').textContent = '';
@@ -337,6 +386,9 @@
         }
 
         function exitJobUi() {
+            jobUiActive = false;
+            document.getElementById('cancelJobBtn').style.display = 'none';
+            stopStageTicker();
             document.getElementById('uploadArea').style.display = '';
             document.querySelector('.options').style.display = '';
             const btn = document.getElementById('processBtn');
@@ -364,22 +416,93 @@
                 transcriptionPointerLabel: document.getElementById('transcriptionPointerLabel'),
                 transcriptionStage: document.getElementById('transcriptionStage'),
                 transcriptionLegend: document.getElementById('transcriptionLegend'),
+                stageText: '',
+                elapsedBase: null,
+                predictedRemaining: null,
+                predictedAt: null,
+                cancelled: false,
+                noResult: false,
             };
+        }
+
+        let stageTicker = null;
+        let jobUiActive = false;
+
+        function stopStageTicker() {
+            if (stageTicker) {
+                clearInterval(stageTicker);
+                stageTicker = null;
+            }
+        }
+
+        function formatElapsed(sec) {
+            sec = Math.max(0, Math.round(sec));
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = sec % 60;
+            const mm = String(m).padStart(2, '0');
+            const ss = String(s).padStart(2, '0');
+            return h > 0 ? h + ':' + mm + ':' + ss : m + ':' + ss;
+        }
+
+        function transcriptionStageText(st) {
+            const parts = [];
+            if (st.stageText) parts.push(st.stageText);
+            if (st.elapsedBase !== null) {
+                parts.push(formatElapsed((Date.now() - st.elapsedBase) / 1000) + ' passed');
+                if (st.predictedAt !== null) {
+                    const left = st.predictedRemaining - (Date.now() - st.predictedAt) / 1000;
+                    parts.push('~' + formatElapsed(Math.max(0, left)) + ' left');
+                }
+            }
+            return parts.join(' · ');
+        }
+
+        function startStageTicker(st) {
+            if (stageTicker || st.elapsedBase === null) return;
+            stageTicker = setInterval(() => {
+                st.transcriptionStage.textContent = transcriptionStageText(st);
+            }, 1000);
         }
 
         function handleSseData(data, st) {
             if (data.stage === 'error') {
+                stopStageTicker();
                 throw new Error(data.error || 'Processing failed');
             }
 
+            if (data.stage === 'cancelled') {
+                stopStageTicker();
+                st.cancelled = true;
+                const cbtn = document.getElementById('cancelJobBtn');
+                cbtn.disabled = true;
+                cbtn.textContent = 'Cancelled';
+                toast('Processing cancelled');
+                return;
+            }
+
+            if (data.stage === 'done' && !data.result) {
+                stopStageTicker();
+                st.noResult = true;
+                st.diarProgressStage.textContent = 'Complete!';
+                if (st.mode === 'transcribe') st.transcriptionStage.textContent = 'Complete!';
+                return;
+            }
+
             if (data.stage === 'done' && data.result) {
+                stopStageTicker();
                 st.finalData = data.result;
                 st.diarProgressBar.style.width = '100%';
                 st.diarProgressBar.textContent = '100%';
                 st.diarProgressStage.textContent = 'Complete!';
                 if (st.mode === 'transcribe') {
                     if (st.transcriptionPointer) st.transcriptionPointer.style.left = '100%';
-                    st.transcriptionStage.textContent = 'Complete!';
+                    let doneText = 'Complete!';
+                    if (data.processing_time_sec !== undefined && data.processing_time_sec !== null) {
+                        doneText = 'Complete — processed in ' + formatElapsed(data.processing_time_sec);
+                        if (data.speedup) doneText += ' · ' + data.speedup + 'x realtime';
+                    }
+                    st.transcriptionStage.textContent = doneText;
                 }
                 return;
             }
@@ -407,8 +530,16 @@
 
             if (data.phase === 'transcription' && data.stage !== 'done') {
                 if (data.progress !== undefined) {
-                    const pct = Math.round(data.progress * 100);
-                    if (data.stage) st.transcriptionStage.textContent = data.stage;
+                    st.stageText = data.stage || '';
+                    if (data.elapsed_sec !== undefined) {
+                        st.elapsedBase = Date.now() - data.elapsed_sec * 1000;
+                    }
+                    if (data.predicted_remaining_sec !== undefined && data.predicted_remaining_sec !== null) {
+                        st.predictedRemaining = data.predicted_remaining_sec;
+                        st.predictedAt = Date.now();
+                    }
+                    st.transcriptionStage.textContent = transcriptionStageText(st);
+                    startStageTicker(st);
 
                     if (data.segment_index !== undefined && st.audioDur > 0) {
                         const segStart = data.segment_start || 0;
@@ -497,6 +628,9 @@
             const mode = (job && job.mode) || 'transcribe';
             const fname = (job && job.filename) || 'audio';
             enterJobUi('Processing: ' + fname);
+            if (job && job.can_cancel === false) {
+                document.getElementById('cancelJobBtn').style.display = 'none';
+            }
             const st = newSseState(mode);
             try {
                 const r = await fetch(P + '/api/asr/active/stream', { credentials: 'same-origin' });
@@ -505,6 +639,16 @@
             } catch (e) {
                 toast('Failed to attach to running job: ' + e.message, true);
                 exitJobUi();
+                return;
+            }
+            if (st.cancelled) {
+                exitJobUi();
+                return;
+            }
+            if (st.noResult) {
+                exitJobUi();
+                toast('Processing complete');
+                setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
                 return;
             }
             if (!st.finalData) {
@@ -568,6 +712,11 @@
                     const st = newSseState(mode);
                     await readSseBody(r.body, st);
 
+                    if (st.cancelled) {
+                        allResults.push({ file: file.name, error: 'Cancelled' });
+                        break;
+                    }
+
                     if (st.finalData) {
                         st.finalData._fileName = file.name;
                         allResults.push({ file: file.name, result: st.finalData });
@@ -585,12 +734,36 @@
             setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
         }
 
+        async function cancelActiveJob() {
+            const btn = document.getElementById('cancelJobBtn');
+            if (btn.disabled) return;
+            btn.disabled = true;
+            btn.textContent = 'Cancelling…';
+            try {
+                const r = await fetch(P + '/api/asr/active/cancel', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                });
+                if (!r.ok) {
+                    let d = {};
+                    try { d = await r.json(); } catch (e) { /* ignore */ }
+                    throw new Error(d.detail || ('HTTP ' + r.status));
+                }
+                toast('Cancellation requested');
+            } catch (e) {
+                toast('Cancel failed: ' + e.message, true);
+                btn.disabled = false;
+                btn.textContent = 'Cancel';
+            }
+        }
+
         async function checkActiveJob() {
+            if (jobUiActive) return;
             try {
                 const r = await fetch(P + '/api/asr/active', { credentials: 'same-origin' });
                 if (!r.ok) return;
                 const d = await r.json();
-                if (d.active && d.job) {
+                if (d.active && d.job && !jobUiActive) {
                     await attachActiveJob(d.job);
                 }
             } catch (e) {
@@ -601,6 +774,7 @@
         loadUser();
         checkStatus();
         checkActiveJob();
+        setInterval(checkActiveJob, 5000);
     </script>
 </body>
 </html>

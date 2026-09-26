@@ -35,6 +35,8 @@ After completing any code changes:
 - SessionMiddleware cookie → AuthMiddleware innermost → public paths bypass
 - Middleware order: AuthMiddleware (innermost) → SessionMiddleware → CORSMiddleware → logging
 - `TRANSCRIBE_PREFIX` sets URL prefix for redirects behind reverse proxy
+- **API token auth**: `X-API-Key` header with a DB token (or static `TRANSCRIBE_API_KEYS` value). `require_auth` returns 401 JSON for an invalid header (never a login redirect); valid header passes without a session. Tokens: `api_tokens` table, sha256-hashed, one per user (`TokenDB.create` replaces), plaintext returned once by `POST /api/token` (session UI card "Windows Client Token"). `get_current_user` order: session → DB token → static key → default/401.
+- **Client no-save**: Windows client calls `/api/asr/transcribe/upload?save=false` → TranscriptDB.save skipped; voiceprint snippet uploads are still persisted. Exception: if the SSE consumer disconnects before `done` (`event_stream` sets `client_disconnected` on GeneratorExit/CancelledError), the transcript IS saved so it appears in the web UI history. Save logic lives in `run_transcribe`'s `_persist_transcript(reason)` (both the main path and the no-segments path call it on disconnect).
 
 ### GPU Backend
 - **CUDA library preload**: `model_loader.py` runs `_preload_cuda_libs()` at module import — `import torch` then `ctypes.CDLL(libcudnn.so.9/libcublas.so.12/libcublasLt.so.12, RTLD_GLOBAL)`. The base image has no cuDNN in system paths (only the pip `nvidia-cudnn-cu12` wheel); ORT cannot find it alone and would silently fall back to CPU, then crash on `GPU_SHRINK_RUN_OPTIONS` (`Did not find an arena based allocator ... gpu:0`). Any refactor that removes a module-level `import torch` (e.g. from `streaming/handler.py`) can regress this — keep the preload or re-add torch import.
@@ -56,13 +58,13 @@ After completing any code changes:
 
 ### Transcription Chunking (Long Audio)
 
-**Turn preparation** (`asr_router.py::_prepare_turns`) — every second of the timeline is covered by exactly one turn:
+**Turn preparation** (`asr_router.py::_prepare_turns`) — every second of the timeline is covered by exactly one turn. Turns feed the timeline/display and post-hoc speaker attribution; they are NOT decode units:
 1. Merge same-speaker diarized segments into turns (gap ≤1.5s)
-2. Split turns >30s (`MAX_TURN_SEC`) at their largest internal diarized-segment gap
+2. Split turns >120s (`MAX_TURN_SEC`) at their largest internal diarized-segment gap
 3. **Exact boundary refinement** (`_refine_boundaries_with_vad`): raw uncollapsed VAD over the full file; each VAD section spanning a gap is embedded and attributed to the better-matching adjacent speaker (known DB voiceprint, else ≤30s of that speaker's own turn audio); `_best_split` picks the ownership cut (margin-weighted); both turns move to one shared cut at the exact start of the first section owned by the incoming speaker (or gap end if the gap is entirely the left speaker's)
 4. **Fallback chain for any remaining gap**: energy-dip cut (`_gap_boundary`, quietest pause centre) → midpoint
 5. Edges extended to 0.0 / audio_duration
-6. `_transcribe_turn` slices the waveform per turn → one `transcribe_audio_sync()` call
+6. **Transcription** (`asr_router.py::_transcribe_file`): ONE whole-file `transcribe_audio_sync()` call; the backend decodes in its own windows (Qwen `_transcribe_chunked`, Cohere `_transcribe_windowed`), then each returned item's midpoint maps onto the turns (`_speaker_for_span`, bisect) and consecutive same-speaker items group into `TranscribeResult` runs — audio is never cut at speaker boundaries
 
 **Decode windowing** (`transcribers/cohere.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
 - Plans ≤30s windows (`_plan_window_bounds`), each cut snapped to the minimum frame-energy point inside a ±100-frame band (never mid-word); tails <300 frames merge into the previous window
@@ -112,6 +114,7 @@ asr-mcp/
 │   │   ├── speaker_router.py  # POST /speaker/register, /identify, GET /list, DELETE /{name}
 │   │   ├── voiceprint_router.py # CRUD + upload + merge + rename + rescan
 │   │   ├── transcript_router.py # User-scoped transcript CRUD + download
+│   │   ├── token_router.py     # GET/POST /token — client API token status + generation
 │   │   ├── mcp_router.py      # MCP tools + resources + /call
 │   │   ├── schemas.py         # Pydantic request/response models
 │   │   ├── security.py        # API key auth + path validation
@@ -160,6 +163,10 @@ asr-mcp/
 │       ├── index.html          # Audio processing dashboard (upload + results)
 │       ├── transcripts.html    # Transcription history (card grid)
 │       └── voices.html         # Voiceprint management dashboard
+├── asr-client/
+│   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt output, voiceprints
+│   ├── transcribe.bat          # Drop-target wrapper (py/python launcher)
+│   └── .env.example            # SERVER_URL + TOKEN template
 ├── Dockerfile                 # nvidia/cuda:12.2.0 base
 ├── docker-compose.yml         # GPU passthrough + named volumes + port 8087
 ├── nginx_snippet.conf         # nginx location /asr-mcp/ with proxy_pass
@@ -179,6 +186,7 @@ asr-mcp/
 | `snippets` | `id` (INTEGER) | Auto-collected audio snippets (FLAC files) |
 | `sessions` | `id` (TEXT) | Session data with TTL expiration |
 | `transcripts` | `id` (INTEGER) | Stored transcription results |
+| `api_tokens` | `user_id` (TEXT) | One client API token per user (SHA-256 hash) |
 
 ## API Endpoints
 
@@ -191,7 +199,10 @@ asr-mcp/
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
 | `/api/asr/transcribe` | POST | API key | Transcribe by file path |
-| `/api/asr/transcribe/upload` | POST | Session | Transcribe uploaded audio |
+| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save) |
+| `/api/asr/active` | GET | Session/API key | Current job (any user) + `can_cancel` for requester |
+| `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
+| `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
 | `/api/asr/ws/stream` | WS | No | Real-time streaming transcription |
 | `/api/speaker/register` | POST | API key | Register voiceprint |
 | `/api/speaker/register/upload` | POST | API key | Register voiceprint from upload |
@@ -204,6 +215,9 @@ asr-mcp/
 | `/api/voiceprint/merge` | POST | Session | Merge speakers |
 | `/api/voiceprint/rename` | POST | Session | Rename speaker |
 | `/api/voiceprint/rescan` | POST | Session | Rescan voices directory |
+| `/api/voiceprint/speakers/{name}/upload` | POST | Session/API key | Add snippet (optional `?start_sec=&end_sec=`) |
+| `/api/voiceprint/speakers/{name}/refine` | POST | Session/API key | Rebuild voiceprint from snippets |
+| `/api/token` | GET/POST | Session/API key | Client API token status / generate (one per user) |
 | `/api/transcripts` | GET | Session | List all transcriptions for user |
 | `/api/transcripts/{id}` | GET | Session | Get transcription by ID |
 | `/api/transcripts/{id}/download` | GET | Session | Download as plain text |
@@ -243,6 +257,7 @@ asr-mcp/
 | `TRANSCRIBE_QWEN_MAX_NEW_TOKENS` | `256` | Max decode tokens for Qwen3-ASR |
 | `TRANSCRIBE_QWEN_MAX_INFERENCE_BATCH_SIZE` | `8` | Qwen3-ASR inference batch size |
 | `TRANSCRIBE_QWEN_QUANTIZE_4BIT` | `true` | Load Qwen3-ASR via BitsAndBytes load_in_4bit |
+| `TRANSCRIBE_QWEN_ALIGNER_QUANTIZE_4BIT` | `true` | Load the Qwen3 forced aligner in 4-bit (saves ~0.9GB VRAM); falls back to fp16 automatically if the 4-bit load fails |
 | `TRANSCRIBE_HF_TOKEN` | - | HuggingFace token for gated models |
 | `API_KEYS` | - | Comma-separated API keys |
 
@@ -383,7 +398,7 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - **Why 40 chars**: a 120-char window snapped BACKWARD across the pause to an earlier sentence end, burying the pause mid-paragraph. Keep the snap window tight.
 
 ### 25. `stage: "done"` in SSE Finishes the Job — Progress Events Must Not Use It
-- `_sse_put` publishes every event to `job_state.publish`, which calls `finish()` when `stage in ("done","error")` → `_active = None`. If a mid-job progress event says `done` (pipeline used to emit final diarization progress as `stage: "done"`), the TTL monitor sees no running job and unloads models WHILE the turn loop still runs → `'NoneType' has no attribute 'get_inputs'`.
+- `_sse_put` publishes every event to `job_state.publish`, which calls `finish()` when `stage in ("done","error","cancelled")` → `_active = None`. If a mid-job progress event says `done` (pipeline used to emit final diarization progress as `stage: "done"`), the TTL monitor sees no running job and unloads models WHILE the turn loop still runs → `'NoneType' has no attribute 'get_inputs'`. `"cancelled"` is emitted ONLY by run_transcribe's `except JobCancelled` handler (cancel via `POST /api/asr/active/cancel` sets `job.cancel_requested`; `JobCancelled(BaseException)` is raised from progress callbacks so backend `except Exception` blocks cannot swallow it).
 - Pipeline final progress stage must be `"diarization_finished"` (NOT `"done"`). `job_state.publish` also guards `evt.get("phase") != "diarization"` so real terminal events (which carry NO phase key) still finish the job.
 - `state.touch()` at the start of the transcribe turn loop so idle-TTL never counts job time as idle.
 - Import rule: `from asr_mcp.core import job_state` — the MODULE (functions `start_job/get_running/publish/finish/ensure_finished`); there is NO `job_state` symbol to import.

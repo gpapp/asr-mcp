@@ -1,11 +1,13 @@
 import asyncio
+import bisect
 import json
 import logging
 import re
 import tempfile
+import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
@@ -22,10 +24,17 @@ from asr_mcp.speaker.vad import split_at_energy_dips
 logger = logging.getLogger("asr_mcp.api.asr_router")
 router = APIRouter(prefix="/asr", tags=["ASR"])
 
-MIN_CHUNK_SAMPLES = 1600
 MAX_TURN_SEC = 120.0
-PARAGRAPH_PAUSE_SEC = 2.5
+PARAGRAPH_PAUSE_SEC = 3.0
 _SENT_END_RE = re.compile(r'[.!?…]["”’)\]]?(?=\s|$)')
+
+
+class JobCancelled(BaseException):
+    """Raised from progress callbacks to abort a cancelled job.
+
+    Subclasses BaseException so backend/diarizer ``except Exception`` blocks
+    do not swallow it; only run_transcribe's explicit handler catches it.
+    """
 
 
 def _merge_into_turns(segments, max_gap_sec=3.0):
@@ -208,46 +217,111 @@ def _apply_paragraph_breaks(text, segments, turn_audio, sample_rate):
     return "\n\n".join(p for p in parts if p)
 
 
-def _transcribe_turn(audio_np, turn, sample_rate=16000, progress_cb=None):
-    """Transcribe a single speaker turn as one coherent audio chunk."""
+def _speaker_for_span(start, end, turns, starts):
+    """Diarization speaker for a time span: midpoint lookup in sorted turns."""
+    if not turns:
+        return None
+    mid = (start + end) / 2.0
+    i = bisect.bisect_right(starts, mid) - 1
+    if i < 0:
+        return turns[0].get("speaker")
+    if i >= len(turns):
+        return turns[-1].get("speaker")
+    turn = turns[i]
+    if float(turn["start"]) <= mid <= float(turn["end"]):
+        return turn.get("speaker")
+    if i + 1 < len(turns):
+        nxt = turns[i + 1]
+        if mid - float(turn["end"]) <= float(nxt["start"]) - mid:
+            return turn.get("speaker")
+        return nxt.get("speaker")
+    return turn.get("speaker")
+
+
+def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None):
+    """Transcribe the whole file in one backend call; attribute output post-hoc.
+
+    The backend decodes in its own windows and returns timestamped items on
+    the file timeline. Each item's midpoint maps onto the diarized turns to
+    recover its speaker; consecutive same-speaker items become one
+    TranscribeResult run, so the audio is never cut at speaker boundaries.
+    """
     from asr_mcp.core.transcriber import transcribe_audio_sync
 
-    start_sample = int(turn["start"] * sample_rate)
-    end_sample = int(turn["end"] * sample_rate)
-    turn_audio = audio_np[start_sample:end_sample]
-
-    if len(turn_audio) < MIN_CHUNK_SAMPLES:
-        return []
-
-    dur = (end_sample - start_sample) / sample_rate
-    logger.info("Transcribing turn: %.1f-%.1fs (%.1fs, %s)",
-                turn["start"], turn["end"], dur, turn["speaker"])
-
-    tr = transcribe_audio_sync(audio=turn_audio, progress_cb=progress_cb)
-
-    logger.info("Turn result: text=%d chars, tokens=%d, inference=%.2fs, error=%s",
-                len(tr.get("text", "")), tr.get("tokens_generated", 0),
+    dur = len(audio_np) / sample_rate
+    turns = list(turns or [])
+    logger.info("Transcribing file: %.1fs (%d diarization turns for attribution)",
+                dur, len(turns))
+    tr = transcribe_audio_sync(audio=audio_np, progress_cb=progress_cb)
+    logger.info("File result: text=%d chars, segments=%d, inference=%.2fs, error=%s",
+                len(tr.get("text") or ""), len(tr.get("segments") or []),
                 tr.get("inference_time_sec", 0), tr.get("error"))
 
-    text = (tr.get("text") or "").strip()
-    segments = tr.get("segments")
     error = tr.get("error")
-    if not text and not segments and not error:
+    text_all = (tr.get("text") or "").strip()
+    if not text_all and not tr.get("segments") and not error:
         return []
+    if not turns:
+        turns = [{"start": 0.0, "end": dur, "speaker": None}]
+    starts = [float(t["start"]) for t in turns]
 
-    text = _apply_paragraph_breaks(text, segments, turn_audio, sample_rate)
+    items = sorted(
+        (s for s in (tr.get("segments") or []) if (s.get("text") or "").strip()),
+        key=lambda s: float(s.get("start") or 0.0),
+    )
+    runs = []
+    for it in items:
+        s = float(it.get("start") or 0.0)
+        e = float(it.get("end") or s)
+        spk = _speaker_for_span(s, e, turns, starts)
+        if runs and runs[-1]["speaker"] == spk:
+            runs[-1]["items"].append(it)
+        else:
+            runs.append({"speaker": spk, "items": [it]})
 
-    return [TranscribeResult(
-        text=text,
-        segments=segments,
-        start=turn["start"],
-        end=turn["end"],
-        speaker=turn["speaker"],
-        audio_duration_sec=tr.get("audio_duration_sec", 0),
-        inference_time_sec=tr.get("inference_time_sec", 0),
-        tokens_generated=tr.get("tokens_generated", 0),
-        error=error,
-    )]
+    if not runs:
+        return [TranscribeResult(
+            text=text_all,
+            start=0.0,
+            end=dur,
+            speaker=_speaker_for_span(0.0, dur, turns, starts),
+            audio_duration_sec=tr.get("audio_duration_sec", 0),
+            inference_time_sec=tr.get("inference_time_sec", 0),
+            tokens_generated=tr.get("tokens_generated", 0),
+            error=error,
+        )]
+
+    logger.info("Attributed %d items into %d speaker runs", len(items), len(runs))
+    results = []
+    for ri, run in enumerate(runs):
+        segs = run["items"]
+        start = min(float(s.get("start") or 0.0) for s in segs)
+        end = max(float(s.get("end") or 0.0) for s in segs)
+        text = " ".join((s.get("text") or "") for s in segs)
+        run_audio = audio_np[int(start * sample_rate):int(end * sample_rate)]
+        rel = [
+            {
+                "start": float(s.get("start") or 0.0) - start,
+                "end": float(s.get("end") or 0.0) - start,
+                "text": s.get("text") or "",
+            }
+            for s in segs
+        ]
+        text = _apply_paragraph_breaks(
+            text, rel, run_audio if len(run_audio) else None, sample_rate,
+        ).strip()
+        results.append(TranscribeResult(
+            text=text,
+            segments=segs,
+            start=start,
+            end=end,
+            speaker=run["speaker"],
+            audio_duration_sec=tr.get("audio_duration_sec", 0),
+            inference_time_sec=tr.get("inference_time_sec", 0) if ri == 0 else 0.0,
+            tokens_generated=tr.get("tokens_generated", 0) if ri == 0 else 0,
+            error=error if ri == len(runs) - 1 else None,
+        ))
+    return results
 
 
 def _gap_boundary(audio, gap_start_sec, gap_end_sec, sample_rate=16000,
@@ -627,10 +701,20 @@ def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=N
         sample_rate=sample_rate,
         known_speakers=known_speakers,
     )
-    all_results = []
-    for turn in turns:
-        all_results.extend(_transcribe_turn(audio_np, turn, sample_rate))
+    _switch_to_backend_phase()
+    all_results = _transcribe_file(audio_np, turns or segments, sample_rate)
     return _merge_consecutive_same_speaker_results(all_results)
+
+
+def _switch_to_backend_phase():
+    """Phase switch: diarization/turn-prep done (uses VAD+embedding) -> transcribe turns (ASR backend).
+
+    Unloads the embedding session (frees its GPU arena) then loads the ASR
+    backend, so diarization and transcription never hold VRAM at the same time.
+    """
+    from asr_mcp.core.model_state import state
+    state.unload_embedding()
+    state.ensure_backend_ready()
 
 
 def _result_to_dict(r):
@@ -710,10 +794,9 @@ async def diarize_endpoint(
     from asr_mcp.core.model_state import state
     from asr_mcp.diarization.pipeline import Diarizer
 
-    state.ensure_ready()
-    if not state.is_ready:
+    state.ensure_diarize_ready()
+    if not state.ready_for_diarize:
         return DiarizeResponse(segments=[], total_time_sec=0, error="Models not loaded. CUDA GPU required.")
-    state.unload_encoder()
     diarizer = Diarizer(state, settings)
     known_speakers = req.known_speakers or _load_known_speakers(settings, user_id)
     result = await diarizer.run(
@@ -761,8 +844,11 @@ async def diarize_upload(
     busy = job_state.get_running()
     if busy is not None:
         content = {"detail": "A transcription is already in progress"}
-        if busy.user_id == user_id:
-            content["job"] = busy.meta()
+        m = busy.meta()
+        m["can_cancel"] = (
+            busy.user_id == user_id and busy.mode == "transcribe" and busy.status == "running"
+        )
+        content["job"] = m
         return JSONResponse(status_code=409, content=content)
 
     content = await file.read()
@@ -788,16 +874,15 @@ async def diarize_upload(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return JSONResponse(status_code=400, content={"detail": f"Audio conversion failed: {e}"})
 
-    if not state.is_ready:
-        state.ensure_ready()
-    if not state.is_ready:
+    if not state.ready_for_diarize:
+        state.ensure_diarize_ready()
+    if not state.ready_for_diarize:
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return JSONResponse(status_code=503, content={"detail": "Models not loaded. CUDA GPU required."})
 
     queue = asyncio.Queue()
     job = job_state.start_job(mode="diarize", filename=file.filename, user_id=user_id)
-    state.unload_encoder()
 
     from asr_mcp.core.model_state import log_gpu_memory
     log_gpu_memory("diarize start")
@@ -877,8 +962,8 @@ async def transcribe_endpoint(
     from asr_mcp.voiceprint.utils import load_audio
     import numpy as np
 
-    state.ensure_ready()
-    if not state.is_ready:
+    state.ensure_diarize_ready()
+    if not state.ready_for_diarize:
         return TranscribeResponse(
             results=[TranscribeResult(error="Models not loaded. CUDA GPU required.")],
             total_time_sec=0,
@@ -897,6 +982,7 @@ async def transcribe_endpoint(
 
     segments = diarization.get("segments", [])
     if not segments:
+        _switch_to_backend_phase()
         result = transcribe_audio_sync(audio=audio_np)
         return TranscribeResponse(
             results=[TranscribeResult(**result)],
@@ -913,6 +999,7 @@ async def transcribe_endpoint(
 async def transcribe_upload(
     file: UploadFile = File(...),
     num_speakers: int = None,
+    save: bool = Query(True),
     settings: Settings = Depends(get_settings),
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
@@ -920,8 +1007,11 @@ async def transcribe_upload(
     busy = job_state.get_running()
     if busy is not None:
         content = {"detail": "A transcription is already in progress"}
-        if busy.user_id == user_id:
-            content["job"] = busy.meta()
+        m = busy.meta()
+        m["can_cancel"] = (
+            busy.user_id == user_id and busy.mode == "transcribe" and busy.status == "running"
+        )
+        content["job"] = m
         return JSONResponse(status_code=409, content=content)
 
     content = await file.read()
@@ -943,25 +1033,29 @@ async def transcribe_upload(
     from asr_mcp.voiceprint.utils import load_audio
     import numpy as np
 
-    if not state.is_ready:
-        state.ensure_ready()
-    if not state.is_ready:
+    if not state.ready_for_diarize:
+        state.ensure_diarize_ready()
+    if not state.ready_for_diarize:
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return JSONResponse(status_code=503, content={"detail": "Models not loaded. CUDA GPU required."})
 
     queue = asyncio.Queue()
     job = job_state.start_job(mode="transcribe", filename=file.filename, user_id=user_id)
+    client_disconnected = False
 
     from asr_mcp.core.model_state import log_gpu_memory
     log_gpu_memory("transcribe start")
 
     async def run_transcribe():
+        job_t0 = time.monotonic()
         try:
             diarizer = Diarizer(state, settings)
             known_speakers = _load_known_speakers(settings, user_id)
 
             async def progress_cb(evt):
+                if job.cancel_requested:
+                    raise JobCancelled()
                 evt.setdefault("phase", "diarization")
                 await _sse_put(queue, evt)
 
@@ -977,6 +1071,45 @@ async def transcribe_upload(
 
             segments = diarization.get("segments", [])
             audio_dur = diarization.get("audio_duration_sec", 0.0)
+
+            def _done_event(result):
+                processing = round(time.monotonic() - job_t0, 1)
+                speedup = round(audio_dur / processing, 2) if processing > 0 and audio_dur else None
+                logger.info(
+                    "Transcription finished: %.1fs audio in %.1fs (%s)",
+                    audio_dur or 0.0, processing,
+                    f"{speedup:g}x realtime" if speedup else "n/a",
+                )
+                payload = {
+                    "stage": "done",
+                    "progress": 1.0,
+                    "result": result,
+                    "processing_time_sec": processing,
+                }
+                if speedup:
+                    payload["speedup"] = speedup
+                return payload
+
+            def _persist_transcript(reason):
+                try:
+                    import hashlib as _hl
+                    file_hash = _hl.sha256(content).hexdigest()[:16]
+                    from asr_mcp.db.manager import DatabaseManager, TranscriptDB
+                    db = DatabaseManager(settings.db_path)
+                    tdb = TranscriptDB(db)
+                    tdb.save(
+                        audio_filename=file.filename,
+                        result=diarization,
+                        user_id=user_id,
+                        file_hash=file_hash,
+                        total_speakers=diarization.get("total_speakers", 0),
+                        audio_duration_sec=diarization.get("audio_duration_sec", 0.0),
+                        processing_time_sec=diarization.get("total_time_sec", 0.0),
+                    )
+                    if reason:
+                        logger.info("Transcript preserved server-side (%s): %s", reason, file.filename)
+                except Exception as e:
+                    logger.warning("Failed to save transcription: %s", e)
 
             try:
                 from asr_mcp.db.manager import DatabaseManager
@@ -1020,88 +1153,102 @@ async def transcribe_upload(
             })
 
             state.unload_embedding()
+            state.ensure_backend_ready()
+            if job.cancel_requested:
+                raise JobCancelled()
 
             if not segments:
                 await _sse_put(queue, {"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
                 result = transcribe_audio_sync(audio=audio_np)
                 diarization["results"] = [_result_to_dict(TranscribeResult(**result))]
-                await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
+                if client_disconnected:
+                    _persist_transcript("client disconnected")
+                await _sse_put(queue, _done_event(diarization))
                 return
 
-            total_turns = len(turns)
+            attr_turns = turns or segments
+            dur = audio_dur or (len(audio_np) / (sr or 16000))
+            starts = [float(t["start"]) for t in attr_turns]
             loop = asyncio.get_running_loop()
-            results = []
-            for turn_idx, turn in enumerate(turns):
-                state.touch()
-                p = turn_idx / max(total_turns, 1)
-                await _sse_put(queue, {
-                    "stage": f"Transcribing turn {turn_idx+1}/{total_turns} ({turn['speaker']})",
-                    "progress": p,
-                    "phase": "transcription",
-                    "segment_index": turn_idx,
-                    "total_segments": total_turns,
-                    "segment_speaker": turn["speaker"],
-                    "segment_start": turn["start"],
-                    "segment_end": turn["end"],
-                })
+            transcribe_t0 = time.monotonic()
 
-                def _make_window_cb(turn_idx=turn_idx, turn=turn):
-                    def _emit_window(evt):
-                        queue.put_nowait(evt)
-                        job_state.publish(evt)
+            def _timing(processed):
+                now = time.monotonic()
+                payload = {"elapsed_sec": round(now - job_t0, 1)}
+                total = audio_dur or 0.0
+                if processed > 0 and total > 0:
+                    trans_elapsed = now - transcribe_t0
+                    if trans_elapsed > 0:
+                        payload["predicted_remaining_sec"] = round(
+                            max(total - processed, 0.0) * trans_elapsed / processed, 1
+                        )
+                return payload
 
-                    def cb(i, n):
-                        frac = (turn_idx + i / max(n, 1)) / max(total_turns, 1)
-                        span = turn["end"] - turn["start"]
-                        win_start = turn["start"] + span * ((i - 1) / max(n, 1))
-                        win_end = turn["start"] + span * (i / max(n, 1))
-                        loop.call_soon_threadsafe(_emit_window, {
-                            "stage": f"Transcribing turn {turn_idx+1}/{total_turns} — window {i}/{n} ({turn['speaker']})",
-                            "progress": frac,
-                            "phase": "transcription",
-                            "segment_index": turn_idx,
-                            "total_segments": total_turns,
-                            "segment_speaker": turn["speaker"],
-                            "segment_start": round(win_start, 2),
-                            "segment_end": round(win_end, 2),
-                            "turn_start": turn["start"],
-                            "turn_end": turn["end"],
-                            "window": i,
-                            "total_windows": n,
-                        })
-                    return cb
+            state.touch()
+            await _sse_put(queue, {
+                "stage": "Transcribing audio",
+                "progress": 0.0,
+                "phase": "transcription",
+                "segment_index": 0,
+                "total_segments": 1,
+                "segment_speaker": _speaker_for_span(0.0, 0.0, attr_turns, starts) or "",
+                "segment_start": 0.0,
+                "segment_end": 0.0,
+                **_timing(0.0),
+            })
 
-                turn_results = await loop.run_in_executor(
-                    None,
-                    _transcribe_turn, audio_np, turn, 16000, _make_window_cb(),
-                )
-                results.extend(turn_results)
+            def _make_window_cb():
+                def _emit_window(evt):
+                    queue.put_nowait(evt)
+                    job_state.publish(evt)
 
+                def cb(i, n):
+                    if job.cancel_requested:
+                        raise JobCancelled()
+                    frac = i / max(n, 1)
+                    win_start = dur * ((i - 1) / max(n, 1))
+                    win_end = dur * (i / max(n, 1))
+                    loop.call_soon_threadsafe(_emit_window, {
+                        "stage": f"Transcribing — window {i}/{n}",
+                        "progress": frac,
+                        "phase": "transcription",
+                        "segment_index": i - 1,
+                        "total_segments": n,
+                        "segment_speaker": _speaker_for_span(win_start, win_end, attr_turns, starts) or "",
+                        "segment_start": round(win_start, 2),
+                        "segment_end": round(win_end, 2),
+                        "turn_start": round(win_start, 2),
+                        "turn_end": round(win_end, 2),
+                        "window": i,
+                        "total_windows": n,
+                        **_timing(dur * frac),
+                    })
+                return cb
+
+            results = await loop.run_in_executor(
+                None, _transcribe_file, audio_np, attr_turns, 16000, _make_window_cb(),
+            )
+            if job.cancel_requested:
+                raise JobCancelled()
             results = _merge_consecutive_same_speaker_results(results)
             diarization["results"] = [_result_to_dict(r) for r in results]
             diarization["total_time_sec"] = sum(
                 (r.inference_time_sec if hasattr(r, 'inference_time_sec') else 0) for r in results
             )
 
-            try:
-                import hashlib as _hl
-                file_hash = _hl.sha256(content).hexdigest()[:16]
-                from asr_mcp.db.manager import DatabaseManager, TranscriptDB
-                db = DatabaseManager(settings.db_path)
-                tdb = TranscriptDB(db)
-                tdb.save(
-                    audio_filename=file.filename,
-                    result=diarization,
-                    user_id=user_id,
-                    file_hash=file_hash,
-                    total_speakers=diarization.get("total_speakers", 0),
-                    audio_duration_sec=diarization.get("audio_duration_sec", 0.0),
-                    processing_time_sec=diarization.get("total_time_sec", 0.0),
-                )
-            except Exception as e:
-                logger.warning("Failed to save transcription: %s", e)
+            if save:
+                _persist_transcript(None)
+            elif client_disconnected:
+                _persist_transcript("client disconnected")
 
-            await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": diarization})
+            await _sse_put(queue, _done_event(diarization))
+        except JobCancelled:
+            logger.info("Transcription cancelled by user: %s", file.filename)
+            await _sse_put(queue, {
+                "stage": "cancelled",
+                "progress": 0.0,
+                "message": "Cancelled by user",
+            })
         except Exception as e:
             logger.error("Transcribe failed: %s", e)
             await _sse_put(queue, {"stage": "error", "error": str(e)})
@@ -1116,11 +1263,16 @@ async def transcribe_upload(
     asyncio.create_task(run_transcribe())
 
     async def event_stream():
-        while True:
-            evt = await queue.get()
-            if evt is None:
-                break
-            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+        nonlocal client_disconnected
+        try:
+            while True:
+                evt = await queue.get()
+                if evt is None:
+                    break
+                yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+        except (GeneratorExit, asyncio.CancelledError):
+            client_disconnected = True
+            raise
 
     return StreamingResponse(
         event_stream(),
@@ -1139,10 +1291,14 @@ async def active_job(
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
 ):
-    job = job_state.get_for_user(user_id)
+    job = job_state.get_running()
     if job is None:
         return {"active": False}
-    return {"active": True, "job": job.meta()}
+    meta = job.meta()
+    meta["can_cancel"] = (
+        job.user_id == user_id and job.mode == "transcribe" and job.status == "running"
+    )
+    return {"active": True, "job": meta}
 
 
 @router.get("/active/stream")
@@ -1151,22 +1307,28 @@ async def active_job_stream(
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
 ):
-    job = job_state.get_for_user(user_id)
+    job = job_state.get_running()
     if job is None:
         return JSONResponse(status_code=404, content={"detail": "No active job"})
 
+    owner = job.user_id == user_id
     snap, sub = job_state.attach(job)
+
+    def _scrub(evt):
+        if not owner and isinstance(evt, dict) and "result" in evt:
+            return {k: v for k, v in evt.items() if k != "result"}
+        return evt
 
     async def event_stream():
         for evt in snap:
-            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+            yield f"data: {json.dumps(_safe_json(_scrub(evt)))}\n\n"
         if sub is None:
             return
         while True:
             evt = await sub.get()
             if evt is None:
                 break
-            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+            yield f"data: {json.dumps(_safe_json(_scrub(evt)))}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -1177,6 +1339,24 @@ async def active_job_stream(
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post("/active/cancel")
+async def active_job_cancel(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+    _: str = Depends(verify_api_key),
+):
+    job = job_state.get_for_user(user_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"detail": "No active job"})
+    if job.status != "running":
+        return JSONResponse(status_code=409, content={"detail": f"Job is already {job.status}"})
+    if job.mode != "transcribe":
+        return JSONResponse(status_code=409, content={"detail": "Cancel is only supported for transcriptions"})
+    job.cancel_requested = True
+    logger.info("Cancel requested for job %s (%s)", job.id, job.filename)
+    return {"status": "cancelling", "job": job.meta()}
 
 
 @router.post("/stream")

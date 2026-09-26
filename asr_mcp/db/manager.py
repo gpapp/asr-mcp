@@ -1,5 +1,7 @@
 import datetime
+import hashlib
 import json
+import secrets
 import struct
 import threading
 from pathlib import Path
@@ -9,6 +11,7 @@ import numpy as np
 from sqlalchemy.orm import Session as SASession
 
 from asr_mcp.db.models import (
+    ApiTokenModel,
     Base,
     SessionModel,
     SnippetModel,
@@ -394,6 +397,51 @@ class SessionDB:
                 }
                 for r in rows
             ]
+
+
+class TokenDB:
+    def __init__(self, db_manager: DatabaseManager):
+        self._db = db_manager
+
+    @staticmethod
+    def _hash(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def create(self, user_id: str) -> str:
+        token = secrets.token_urlsafe(32)
+        now = datetime.datetime.utcnow()
+        with self._db.get_session() as session:
+            row = session.get(ApiTokenModel, user_id)
+            if row:
+                row.token_hash = self._hash(token)
+                row.created_at = now
+            else:
+                session.add(ApiTokenModel(
+                    user_id=user_id,
+                    token_hash=self._hash(token),
+                    created_at=now,
+                ))
+            session.commit()
+        return token
+
+    def verify(self, token: str) -> Optional[str]:
+        if not token:
+            return None
+        with self._db.get_session() as session:
+            row = session.query(ApiTokenModel).filter_by(
+                token_hash=self._hash(token)
+            ).first()
+            return row.user_id if row else None
+
+    def get_info(self, user_id: str) -> Optional[dict]:
+        with self._db.get_session() as session:
+            row = session.get(ApiTokenModel, user_id)
+            if not row:
+                return None
+            return {
+                "user_id": row.user_id,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
 
 
 class TranscriptDB:
