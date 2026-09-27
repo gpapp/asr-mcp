@@ -5,6 +5,11 @@ response queue; this registry mirrors every event so a later
 GET /active/stream (e.g. after a page reload) can replay history and
 follow the same job live.  All mutators run on the event loop with no
 awaits between snapshot and subscribe, so attach is race-free.
+
+Activity channel: separate lightweight subscribers that receive only
+job start/finish transitions ({"active": true/false, ...}) so GUIs can
+replace polling of GET /active with one long-lived SSE connection
+(GET /activity/stream).
 """
 import asyncio
 import time
@@ -42,11 +47,37 @@ class ActiveJob:
 
 _active: Optional[ActiveJob] = None
 
+# Lightweight activity subscribers: one queue per connected GET
+# /activity/stream client.  Receives only start/finish transitions.
+_activity_subs: List[asyncio.Queue] = []
+
+
+def subscribe_activity() -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    _activity_subs.append(q)
+    return q
+
+
+def unsubscribe_activity(q: asyncio.Queue) -> None:
+    try:
+        _activity_subs.remove(q)
+    except ValueError:
+        pass
+
+
+def _notify_activity(evt: dict) -> None:
+    for q in list(_activity_subs):
+        try:
+            q.put_nowait(evt)
+        except Exception:
+            pass
+
 
 def start_job(mode: str, filename: str, user_id: str) -> ActiveJob:
     global _active
     job = ActiveJob(mode=mode, filename=filename, user_id=user_id)
     _active = job
+    _notify_activity({"active": True, "job": job.meta()})
     return job
 
 
@@ -97,6 +128,7 @@ def finish(job: ActiveJob, status: str) -> None:
     job.subscribers.clear()
     if _active is job:
         _active = None
+        _notify_activity({"active": False, "job": {"id": job.id, "status": status}})
 
 
 def ensure_finished(job: Optional[ActiveJob] = None) -> None:

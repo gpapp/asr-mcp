@@ -76,6 +76,44 @@ class Qwen3Backend(ASRBackend):
 
     name = "qwen3-asr"
 
+    # Static (code, display-name) list — see ASRBackend.LANGUAGES.
+    LANGUAGES = [
+        ("ar", "Arabic"),
+        ("cantonese", "cantonese"),
+        ("yue", "Cantonese"),
+        ("zh", "Chinese"),
+        ("cs", "Czech"),
+        ("da", "Danish"),
+        ("nl", "Dutch"),
+        ("en", "English"),
+        ("fil", "fil"),
+        ("fi", "Finnish"),
+        ("fr", "French"),
+        ("de", "German"),
+        ("el", "Greek"),
+        ("hi", "Hindi"),
+        ("hu", "Hungarian"),
+        ("id", "Indonesian"),
+        ("it", "Italian"),
+        ("ja", "Japanese"),
+        ("ko", "Korean"),
+        ("mk", "Macedonian"),
+        ("ms", "Malay"),
+        ("fa", "Persian"),
+        ("pl", "Polish"),
+        ("pt", "Portuguese"),
+        ("ro", "Romanian"),
+        ("ru", "Russian"),
+        ("es", "Spanish"),
+        ("sv", "Swedish"),
+        ("tl", "Tagalog"),
+        ("th", "Thai"),
+        ("tr", "Turkish"),
+        ("vi", "Vietnamese"),
+        ("zh-cn", "zh-cn"),
+        ("zh-tw", "zh-tw"),
+    ]
+
     def __init__(self):
         super().__init__()
         self.recognizer = None  # Qwen3ASRModel (includes forced aligner)

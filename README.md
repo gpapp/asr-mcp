@@ -5,7 +5,7 @@ GPU-accelerated ASR MCP server with speaker diarization, voiceprint recognition,
 ## Features
 
 - **ASR with Diarization**: Detect and separate multiple speakers in audio. Pluggable backends via `TRANSCRIBE_ASR_MODEL`: Cohere Transcribe ONNX (default, English), Qwen3-ASR (4-bit, transformers) or Whisper large-v3-turbo (faster-whisper, int8-quantized).
-- **Language Selection**: `?language=hu` (ISO 639-1) or `auto` on the upload endpoint; default `en`.
+- **Language Selection**: `?language=hu` (ISO 639-1) or `auto` on the upload endpoint (default `auto`); pick it from the GUI dropdown or the client's `LANGUAGE=` in `.env` — per-backend lists served by `GET /api/asr/languages`.
 - **Voiceprint Recognition**: Register, identify, and manage speaker profiles with ECAPA-TDNN embeddings.
 - **Streaming Transcription**: Real-time WebSocket dual-channel transcription.
 - **Auto Voiceprint Collection**: Snippets auto-collected from diarization for registered speakers.
@@ -93,8 +93,9 @@ by the client ARE kept (they feed refinement).
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
 | `/api/asr/transcribe` | POST | API key | Transcribe by file path |
-| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side save; `?language=hu` or `auto`) |
-| `/api/asr/active` | GET | Session/API key | Current job (any user) + `can_cancel` for requester |
+| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side save; `?language=hu` or `auto`, default `auto`) |
+| `/api/asr/languages` | GET | Session/API key | Static language list of the configured backend (`{backend, supports_auto, languages}`) |
+| `/api/asr/activity/stream` | GET | Session/API key | SSE push of job start/finish (snapshot on connect + keep-alive pings; replaces polling `/active`) |
 | `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
 | `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
 | `/api/asr/ws/stream` | WS | No | Real-time streaming transcription |
@@ -171,7 +172,7 @@ asr-mcp/
 │   ├── server.py              # FastAPI app + lifespan + auth routes
 │   ├── api/
 │   │   ├── router.py          # Combines sub-routers under /api
-│   │   ├── asr_router.py      # POST /asr/diarize, /transcribe (+upload, SSE), /active/stream
+│   │   ├── asr_router.py      # POST /asr/diarize, /transcribe (+upload, SSE), /activity/stream, /active/stream
 │   │   ├── speaker_router.py  # POST /speaker/register, /identify, GET /list
 │   │   ├── voiceprint_router.py # CRUD + upload + merge + rename + rescan + refine
 │   │   ├── transcript_router.py # User-scoped transcript CRUD + download
@@ -185,7 +186,7 @@ asr-mcp/
 │   ├── core/
 │   │   ├── model_state.py     # ModelState, is_gpu_oom, GPU_SHRINK_RUN_OPTIONS, lazy-load/TTL
 │   │   ├── model_loader.py    # HuggingFace download + ORT session init (arena caps)
-│   │   ├── job_state.py       # Active job tracking (start/publish/finish/attach)
+│   │   ├── job_state.py       # Active job tracking (start/publish/finish/attach/activity subs)
 │   │   └── transcriber.py     # Thin facade → state.backend (Cohere ONNX / Qwen3-ASR / Whisper)
 │   ├── transcribers/
 │   │   ├── base.py            # ASRBackend ABC (context/progress_cb interface)

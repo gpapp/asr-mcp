@@ -359,6 +359,11 @@
                                     <option value="diarize">Diarization only</option>
                                 </select>
                             </label>
+                            <label>Language:
+                                <select id="langSel">
+                                    <option value="auto">Auto-detect</option>
+                                </select>
+                            </label>
                             <label>Speakers:
                                 <input type="number" id="numSpeakers" min="0" max="30" placeholder="auto" style="width:64px">
                             </label>
@@ -1280,7 +1285,9 @@
                 if (numSpeakers) form.append('num_speakers', numSpeakers);
 
                 try {
-                    const endpoint = mode === 'transcribe' ? P + '/api/asr/transcribe/upload' : P + '/api/asr/diarize/upload';
+                    const endpoint = mode === 'transcribe'
+                        ? P + '/api/asr/transcribe/upload?language=' + encodeURIComponent(document.getElementById('langSel').value || 'auto')
+                        : P + '/api/asr/diarize/upload';
                     const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
 
                     if (r.status === 409) {
@@ -1348,16 +1355,41 @@
             }
         }
 
-        async function checkActiveJob() {
-            if (jobUiActive) return;
-            try {
-                const r = await fetch(P + '/api/asr/active', { credentials: 'same-origin' });
-                if (!r.ok) return;
-                const d = await r.json();
-                if (d.active && d.job && !jobUiActive) {
-                    await attachActiveJob(d.job);
+        async function connectActivity() {
+            // One long-lived SSE connection; the server pushes job
+            // start/finish instead of us polling GET /active.
+            while (true) {
+                let connected = false;
+                try {
+                    const r = await fetch(P + '/api/asr/activity/stream', { credentials: 'same-origin' });
+                    if (r.ok && r.body) {
+                        connected = true;
+                        const reader = r.body.getReader();
+                        const dec = new TextDecoder();
+                        let buf = '';
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            buf += dec.decode(value, { stream: true });
+                            let idx;
+                            while ((idx = buf.indexOf('\n\n')) >= 0) {
+                                const chunk = buf.slice(0, idx);
+                                buf = buf.slice(idx + 2);
+                                for (const line of chunk.split('\n')) {
+                                    if (line.startsWith(':')) continue;   // keep-alive comment
+                                    if (!line.startsWith('data:')) continue;
+                                    let d;
+                                    try { d = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+                                    if (d.active && d.job && !jobUiActive) {
+                                        attachActiveJob(d.job).catch(() => {});
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
                 }
-            } catch (e) {
+                await new Promise(res => setTimeout(res, connected ? 1000 : 3000));
             }
         }
 
@@ -1781,14 +1813,32 @@
             }
         }
 
+        // --- Language dropdown (static list from the configured backend) ---
+        async function loadLanguages() {
+            const sel = document.getElementById('langSel');
+            try {
+                const r = await fetch(P + '/api/asr/languages', { credentials: 'same-origin' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const data = await r.json();
+                sel.innerHTML = '';
+                sel.appendChild(new Option(
+                    data.supports_auto === false ? 'Auto-detect (English fallback)' : 'Auto-detect', 'auto'));
+                (data.languages || []).forEach(l => sel.appendChild(new Option(l.name, l.code)));
+            } catch (e) {
+                // Endpoint unavailable — keep a small common-language fallback list.
+                ['en', 'hu', 'de', 'fr', 'es', 'it', 'pt', 'ru', 'zh', 'ja', 'ko', 'ar', 'hi', 'tr', 'pl', 'nl', 'sv', 'uk']
+                    .forEach(c => sel.appendChild(new Option(c, c)));
+            }
+        }
+
         // --- Init ---
 
         loadUser();
         checkStatus();
+        loadLanguages();
         activateTab(tabFromPath());
         document.getElementById('transcriptionBarArea').addEventListener('click', seekLivePane);
-        checkActiveJob();
-        setInterval(checkActiveJob, 5000);
+        connectActivity();
     </script>
 </body>
 </html>

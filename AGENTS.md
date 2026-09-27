@@ -131,7 +131,7 @@ asr-mcp/
 │   ├── core/
 │   │   ├── model_state.py     # ModelState, is_gpu_oom, log_gpu_memory, GPU_SHRINK_RUN_OPTIONS, run_embedding
 │   │   ├── model_loader.py    # HuggingFace download + ORT session init (CUDA EP, arena caps, _preload_cuda_libs)
-│   │   ├── job_state.py       # Active job tracking: start/publish/finish/attach (import the MODULE)
+│   │   ├── job_state.py       # Active job tracking: start/publish/finish/attach + activity subscribe (import the MODULE)
 │   │   └── transcriber.py     # Thin facade: forwards transcribe_audio_sync/mel to state.backend
 │   ├── transcribers/
 │   │   ├── base.py            # ASRBackend ABC (load/unload/is_loaded/transcribe_audio_sync)
@@ -207,8 +207,9 @@ asr-mcp/
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
 | `/api/asr/transcribe` | POST | API key | Transcribe by file path |
-| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save; `?language=hu` ISO 639-1 or `auto`, default `en`) |
-| `/api/asr/active` | GET | Session/API key | Current job (any user) + `can_cancel` for requester |
+| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save; `?language=hu` ISO 639-1 or `auto`, default `auto`) |
+| `/api/asr/languages` | GET | Session/API key | Static language list of the configured backend (no model load) — `{backend, supports_auto, languages:[{code,name}]}` |
+| `/api/asr/activity/stream` | GET | Session/API key | SSE push of job start/finish (snapshot on connect + keep-alive pings; replaces polling `/active`) |
 | `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
 | `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
 | `/api/asr/ws/stream` | WS | No | Real-time streaming transcription |
@@ -416,6 +417,7 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - Pipeline final progress stage must be `"diarization_finished"` (NOT `"done"`). `job_state.publish` also guards `evt.get("phase") != "diarization"` so real terminal events (which carry NO phase key) still finish the job.
 - `state.touch()` at the start of the transcribe turn loop so idle-TTL never counts job time as idle.
 - Import rule: `from asr_mcp.core import job_state` — the MODULE (functions `start_job/get_running/publish/finish/ensure_finished`); there is NO `job_state` symbol to import.
+- **Activity channel** (replaces polling `GET /active`): `job_state.subscribe_activity()/unsubscribe_activity()` queues receive only `{"active": true/false, ...}` transitions from `start_job`/`finish`. `GET /api/asr/activity/stream` subscribes BEFORE taking its snapshot (a start/finish racing the connect lands in the queue, not lost), sends the snapshot first, then pushes changes with 20s `: ping` keep-alives. GUI keeps one long-lived `connectActivity()` reader; `POST /active/cancel` and the per-job `/active/stream` are unchanged.
 
 ### 26. Never Pin Session Objects — Resolve `state.*_session` Live
 - Storing `state.embedding_session` into another object (`set_embedding_session`) leaves a stale/None reference once lazy-load/TTL/phase-unload replaces or clears it → `'NoneType' ... get_inputs` deep in a helper.
@@ -428,7 +430,14 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - Encoder OOM escalation: reload fresh arena → retry GPU once → CPU fallback. Embedding OOM: straight to cached CPU session.
 
 ### 28. Language Must Be Threaded End-to-End — Routers, Prompt, and Decode
-- `transcribe/upload` accepts `?language=` (ISO 639-1 or `auto`, default `en`) → `_transcribe_file(language=...)` → `transcribe_audio_sync(language=...)`. Before this, routers never passed `language` and every backend silently forced English — Hungarian audio decoded as English hallucination.
+- `transcribe/upload` accepts `?language=` (ISO 639-1 or `auto`, default `auto`) → `_transcribe_file(language=...)` → `transcribe_audio_sync(language=...)`. Before this, routers never passed `language` and every backend silently forced English — Hungarian audio decoded as English hallucination.
+- Each backend carries a **static `LANGUAGES: list[(code, name)]` class attribute** (+ `SUPPORTS_AUTO`) — available without loading the model; `GET /api/asr/languages` serves it. GUI dropdown (Transcribe options) and the client (`LANGUAGE=` in .env / `--language` flag) both default to `auto`.
+- `auto` handling: whisper (`None` → faster-whisper detect), qwen3 (`_to_canonical_language` → `None` = detect), cohere (no `<|auto|>` vocab token → explicit English-prompt fallback, `SUPPORTS_AUTO=False`, GUI labels it "English fallback").
 - Cohere: the decoder prompt embeds language tokens (`<|hu|>` id 87, `<|en|>` id 62) — build it **per request** via `_prompt_ids_for(language)` (cached in `_prompt_cache`), NOT once at load with `language="en"`. Qwen maps via `LANGUAGE_MAP` (`"hu" → "Hungarian"`); Whisper passes the ISO code straight to faster-whisper (`auto`/empty → detect).
 - **Cohere model limitation**: cohere-transcribe-03-2026-ONNX q4 cannot transcribe Hungarian at all — en prompt → English hallucination, hu prompt → Cyrillic/spam hallucination (verified; English control input is perfect). Use whisper for non-English.
 - 56.8-min hu podcast benchmark (GTX 1650): whisper 498s/1290MiB/7.1× (excellent quality), cohere 1295s/2392MiB/2.65× (hu unusable), qwen3 2388s/2830MiB/1.43× (correct content, no punctuation).
+
+### 29. Auto-Collect: Cumulative Total vs Per-Chunk Cap
+- `auto_collect_from_diarization()` (voiceprint/service.py) pre-loops each segment while `current_total < AUTO_COLLECT_MAX_SEGMENT_SEC` (300s) — but `current_total` is the speaker's CUMULATIVE DB total (target cap is `AUTO_COLLECT_MAX_TOTAL_SEC` = 1200s). Any speaker already ≥300s (23 of 35 here) never entered the loop → silently collected zero snippets forever. The per-chunk length is already bounded inside by `chunk_end = min(seg_start + MAX_SEGMENT_SEC, seg_end)`.
+- Rule: gate the OUTER loop on `MAX_TOTAL_SEC` only; keep `MAX_SEGMENT_SEC` as an inner chunk bound. Cap skips now log `Auto-collect: %s at snippet cap`, and upload routers log `Auto-collected %d snippets from %d segments` so silent skips are visible.
+- Auto-collect runs unconditionally after diarization (NOT gated on `save=false`) and only for speakers with a registered voiceprint for the requesting `user_id` (generic `Speaker N` labels are skipped by design).

@@ -15,12 +15,13 @@ SUPPORTED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm", ".opus
 
 USAGE = """Usage:
   transcribe <audio file> [more files...]   Transcribe files (writes <name>.txt next to each)
+                                            Optional: --language <code|auto> (overrides .env LANGUAGE)
   status                                    Check server/token connectivity
   voiceprints                               List speakers and voiceprints
   voiceprint-add <name> <file> [start] [end]   Create/refine a voiceprint from audio
   voiceprint-refine <name>                  Rebuild a voiceprint from its snippets
 
-Configuration: edit .env next to this script (SERVER_URL + TOKEN)."""
+Configuration: edit .env next to this script (SERVER_URL + TOKEN, optional LANGUAGE=auto)."""
 
 
 class ClientError(Exception):
@@ -37,6 +38,13 @@ def load_env():
             key, value = line.split("=", 1)
             env[key.strip()] = value.strip().strip('"').strip("'")
     return env
+
+
+def get_language():
+    """Forced transcription language: LANGUAGE (or TRANSCRIBE_LANGUAGE) from .env, default auto."""
+    env = load_env()
+    lang = (env.get("LANGUAGE") or env.get("TRANSCRIBE_LANGUAGE") or "auto").strip().lower()
+    return lang or "auto"
 
 
 def get_config():
@@ -177,14 +185,15 @@ def build_transcript(filename, result, date_str):
     return "\n".join(lines)
 
 
-def transcribe_file(base, token, path: Path):
+def transcribe_file(base, token, path: Path, language: str = "auto"):
     label = path.name
     if path.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
         raise ClientError(f"Unsupported file type '{path.suffix}' ({label})")
     if not path.is_file():
         raise ClientError(f"File not found: {path}")
 
-    url = f"{base}/api/asr/transcribe/upload?save=false"
+    url = (f"{base}/api/asr/transcribe/upload?save=false"
+           f"&language={urllib.parse.quote(language or 'auto')}")
     body, ctype = encode_multipart("file", path)
     resp = open_request("POST", url, data=body,
                         headers={"X-API-Key": token, "Content-Type": ctype},
@@ -326,16 +335,25 @@ def cmd_voiceprint_refine(name):
 
 def cmd_transcribe(paths):
     base, token = get_config()
-    if not paths:
+    args = list(paths)
+    language = get_language()
+    if "--language" in args:
+        i = args.index("--language")
+        if i + 1 >= len(args):
+            print("--language requires a code (e.g. hu) or 'auto'", file=sys.stderr)
+            return 2
+        language = args[i + 1].strip().lower() or "auto"
+        args = args[:i] + args[i + 2:]
+    if not args:
         print("No files given.")
         print(USAGE)
         return 2
     failures = 0
-    for raw in paths:
+    for raw in args:
         path = Path(raw).expanduser()
-        print(f"Transcribing {path.name} ...")
+        print(f"Transcribing {path.name} (language={language}) ...")
         try:
-            out_path = transcribe_file(base, token, path)
+            out_path = transcribe_file(base, token, path, language=language)
             print(f"  saved {out_path}")
         except ClientError as e:
             failures += 1

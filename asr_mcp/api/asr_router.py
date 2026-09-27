@@ -911,9 +911,13 @@ async def diarize_upload(
                 db = DatabaseManager(settings.db_path)
                 vp_service = VoiceprintService(settings.data_dir, db)
                 vp_service.set_voices_dir(settings.voices_dir)
-                vp_service.auto_collect_from_diarization(
+                collected = vp_service.auto_collect_from_diarization(
                     audio_path=str(wav_path), segments=segments, user_id=user_id,
                     source_id=file.filename,
+                )
+                logger.info(
+                    "Auto-collected %d snippets from %d segments for user %s",
+                    len(collected), len(segments), user_id,
                 )
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
@@ -1001,7 +1005,7 @@ async def transcribe_upload(
     file: UploadFile = File(...),
     num_speakers: int = None,
     save: bool = Query(True),
-    language: str = Query("en", description="ISO 639-1 code (e.g. hu) or 'auto' for detection"),
+    language: str = Query("auto", description="ISO 639-1 code (e.g. hu) or 'auto' for detection"),
     settings: Settings = Depends(get_settings),
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
@@ -1119,9 +1123,13 @@ async def transcribe_upload(
                 db = DatabaseManager(settings.db_path)
                 vp_service = VoiceprintService(settings.data_dir, db)
                 vp_service.set_voices_dir(settings.voices_dir)
-                vp_service.auto_collect_from_diarization(
+                collected = vp_service.auto_collect_from_diarization(
                     audio_path=str(wav_path), segments=segments, user_id=user_id,
                     source_id=file.filename,
+                )
+                logger.info(
+                    "Auto-collected %d snippets from %d segments for user %s",
+                    len(collected), len(segments), user_id,
                 )
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
@@ -1161,7 +1169,7 @@ async def transcribe_upload(
 
             if not segments:
                 await _sse_put(queue, {"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
-                result = transcribe_audio_sync(audio=audio_np)
+                result = transcribe_audio_sync(audio=audio_np, language=language)
                 diarization["results"] = [_result_to_dict(TranscribeResult(**result))]
                 if client_disconnected:
                     _persist_transcript("client disconnected")
@@ -1295,20 +1303,76 @@ async def transcribe_upload(
     )
 
 
-@router.get("/active")
-async def active_job(
+@router.get("/languages")
+async def list_languages(settings: Settings = Depends(get_settings)):
+    """Static language list of the configured ASR backend (no model load)."""
+    from asr_mcp.transcribers import BACKENDS_BY_NAME, resolve_backend_name
+    name = resolve_backend_name(settings)
+    cls = BACKENDS_BY_NAME.get(name)
+    return {
+        "backend": name,
+        "supports_auto": bool(cls.SUPPORTS_AUTO) if cls else True,
+        "languages": cls.language_list() if cls else [],
+    }
+
+
+@router.get("/activity/stream")
+async def activity_stream(
     request: Request,
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
 ):
-    job = job_state.get_running()
-    if job is None:
-        return {"active": False}
-    meta = job.meta()
-    meta["can_cancel"] = (
-        job.user_id == user_id and job.mode == "transcribe" and job.status == "running"
+    """Long-lived SSE of job start/finish transitions (replaces polling GET /active).
+
+    Emits an immediate snapshot (so a page load during a running job can
+    attach right away), then only when a job starts or ends.  Comment
+    keep-alives every 20s keep the connection alive through proxies.
+    """
+    sub = job_state.subscribe_activity()
+
+    def _with_can_cancel(meta: dict) -> dict:
+        meta = dict(meta)
+        meta["can_cancel"] = (
+            meta.get("user_id") == user_id
+            and meta.get("mode") == "transcribe"
+            and meta.get("status") == "running"
+        )
+        return meta
+
+    async def event_stream():
+        try:
+            # Subscribe BEFORE the snapshot: a start/finish racing this
+            # connection lands in the queue instead of being lost.
+            job = job_state.get_running()
+            snap = {
+                "active": job is not None,
+                "job": _with_can_cancel(job.meta()) if job else None,
+            }
+            yield f"data: {json.dumps(_safe_json(snap))}\n\n"
+            while True:
+                try:
+                    evt = await asyncio.wait_for(sub.get(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+                if evt is None:
+                    break
+                if evt.get("active") and isinstance(evt.get("job"), dict):
+                    evt = dict(evt)
+                    evt["job"] = _with_can_cancel(evt["job"])
+                yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+        finally:
+            job_state.unsubscribe_activity(sub)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
-    return {"active": True, "job": meta}
 
 
 @router.get("/active/stream")

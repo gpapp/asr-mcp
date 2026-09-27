@@ -24,6 +24,20 @@ class ASRBackend(ABC):
 
     name: str = "base"
 
+    # Static (code, display-name) pairs the backend supports for forced-language
+    # transcription. Populated by each concrete backend as a class attribute so
+    # the list is available WITHOUT loading the model.
+    LANGUAGES: list[tuple[str, str]] = []
+
+    # Whether language="auto" performs real detection (whisper/qwen) or falls
+    # back to a forced default (cohere has no <|auto|> prompt token).
+    SUPPORTS_AUTO: bool = True
+
+    @classmethod
+    def language_list(cls) -> list[dict]:
+        """Languages as [{"code", "name"}] for API responses."""
+        return [{"code": code, "name": display} for code, display in cls.LANGUAGES]
+
     def __init__(self) -> None:
         self.loaded: bool = False
 

@@ -559,13 +559,21 @@ class VoiceprintService:
                 continue
             current_total = speaker_totals.get(speaker_name, 0.0)
             if current_total >= AUTO_COLLECT_MAX_TOTAL_SEC:
+                logger.info(
+                    "Auto-collect: %s at snippet cap (%.0fs >= %.0fs), skipping",
+                    speaker_name, current_total, AUTO_COLLECT_MAX_TOTAL_SEC,
+                )
                 continue
 
             for seg in segs:
                 seg_start = seg["start"]
                 seg_end = seg["end"]
 
-                while seg_start < seg_end and current_total < AUTO_COLLECT_MAX_SEGMENT_SEC and current_total < AUTO_COLLECT_MAX_TOTAL_SEC:
+                # Per-chunk length is capped by chunk_end below (MAX_SEGMENT_SEC);
+                # current_total is the speaker's CUMULATIVE total, so it must only
+                # be gated by MAX_TOTAL_SEC — gating it on MAX_SEGMENT_SEC made
+                # every speaker with >=300s of snippets silently un-collectable.
+                while seg_start < seg_end and current_total < AUTO_COLLECT_MAX_TOTAL_SEC:
                     chunk_end = min(seg_start + AUTO_COLLECT_MAX_SEGMENT_SEC, seg_end)
                     dur = chunk_end - seg_start
 
