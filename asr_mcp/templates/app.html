@@ -156,6 +156,12 @@
         .tt-caret-layer { position: absolute; top: 0; bottom: 0; left: 0; right: 96px; pointer-events: none; }
         .tt-pointer { display: none; position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #ff4444; transition: left .15s ease; z-index: 10; }
         .tt-pointer-label { position: relative; height: 18px; font-size: .7rem; color: var(--muted); margin-top: .25rem; overflow: hidden; white-space: nowrap; }
+        .tt-overlay { position: absolute; top: 0; bottom: 0; left: 0; right: 96px; pointer-events: none; z-index: 5; }
+        .tt-overlay-fill { position: absolute; top: 0; bottom: 0; left: 0; right: 0; background: rgba(148, 163, 184, .45); transition: left .35s ease; }
+        .tt-text-pane { position: relative; margin-top: .55rem; max-height: 240px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #fbfcfe; font-size: .86rem; line-height: 1.55; color: var(--ink); white-space: pre-wrap; }
+        .tt-text-caret { display: inline-block; width: 2px; height: 1.05em; background: #ff4444; vertical-align: text-bottom; margin-left: 1px; animation: ttCaretBlink 1.1s steps(1) infinite; }
+        @keyframes ttCaretBlink { 50% { opacity: .15; } }
+        .tt-text-pane .tp-block.tp-active { background: rgba(79, 110, 247, .09); outline: 1px solid rgba(79, 110, 247, .3); border-radius: 8px; }
 
         .results-area { margin-top: 1.2rem; }
         .results-area h3 { font-size: .95rem; margin-bottom: .6rem; }
@@ -328,12 +334,17 @@
                                 <div class="prog-label">Transcription</div>
                                 <div class="tt-area" id="transcriptionBarArea">
                                     <div id="transcriptionSegments"></div>
+                                    <div id="transcriptionOverlay" class="tt-overlay">
+                                        <div id="transcriptionOverlayFill" class="tt-overlay-fill"></div>
+                                    </div>
                                     <div id="transcriptionCaretLayer" class="tt-caret-layer">
                                         <div id="transcriptionPointer" class="tt-pointer"></div>
+                                        <div id="transcriptionJumpCaret" class="tt-pointer"></div>
                                     </div>
                                 </div>
                                 <div id="transcriptionPointerLabel" class="tt-pointer-label"></div>
                                 <div id="transcriptionLegend" style="display:none;"></div>
+                                <div id="transcriptionTextPane" class="tt-text-pane" style="display:none;"></div>
                                 <div id="transcriptionStage" class="prog-stage">Waiting for diarization...</div>
                             </div>
                             <div class="prog-actions">
@@ -493,6 +504,7 @@
         let rescanInFlight = false;
         let stageTicker = null;
         let jobUiActive = false;
+        let activeSseState = null;
 
         function escHtml(s) {
             const d = document.createElement('div');
@@ -852,10 +864,17 @@
             document.getElementById('transcriptionPointerLabel').textContent = '';
             document.getElementById('transcriptionLegend').style.display = 'none';
             document.getElementById('transcriptionLegend').innerHTML = '';
+            const tp = document.getElementById('transcriptionTextPane');
+            tp.style.display = 'none';
+            tp.scrollTop = 0;
+            tp.innerHTML = '';
+            document.getElementById('transcriptionJumpCaret').style.display = 'none';
+            document.getElementById('transcriptionOverlayFill').style.left = '0%';
         }
 
         function exitJobUi() {
             jobUiActive = false;
+            activeSseState = null;
             document.getElementById('cancelJobBtn').style.display = 'none';
             stopStageTicker();
             document.getElementById('uploadArea').style.display = '';
@@ -872,7 +891,7 @@
         }
 
         function newSseState(mode) {
-            return {
+            const s = {
                 mode,
                 audioDur: 0,
                 allSpeakers: [],
@@ -885,13 +904,18 @@
                 transcriptionPointerLabel: document.getElementById('transcriptionPointerLabel'),
                 transcriptionStage: document.getElementById('transcriptionStage'),
                 transcriptionLegend: document.getElementById('transcriptionLegend'),
+                transcriptionTextPane: document.getElementById('transcriptionTextPane'),
+                transcriptionOverlayFill: document.getElementById('transcriptionOverlayFill'),
                 stageText: '',
                 elapsedBase: null,
                 predictedRemaining: null,
                 predictedAt: null,
                 cancelled: false,
                 noResult: false,
+                liveItems: [],
             };
+            activeSseState = s;
+            return s;
         }
 
         function stopStageTicker() {
@@ -963,6 +987,7 @@
                 st.diarProgressStage.textContent = 'Complete!';
                 if (st.mode === 'transcribe') {
                     if (st.transcriptionPointer) st.transcriptionPointer.style.left = '100%';
+                    if (st.transcriptionOverlayFill) st.transcriptionOverlayFill.style.left = '100%';
                     let doneText = 'Complete!';
                     if (data.processing_time_sec !== undefined && data.processing_time_sec !== null) {
                         doneText = 'Complete — processed in ' + formatElapsed(data.processing_time_sec);
@@ -990,6 +1015,11 @@
                         st.transcriptionPointer.style.display = 'block';
                         st.transcriptionPointer.style.left = '0%';
                         st.transcriptionLegend.style.display = 'none';
+                        st.transcriptionTextPane.style.display = 'block';
+                        st.transcriptionTextPane.innerHTML = '';
+                        st.liveItems.length = 0;
+                        st.transcriptionOverlayFill.style.left = '0%';
+                        document.getElementById('transcriptionJumpCaret').style.display = 'none';
                     }
                 }
             }
@@ -1013,8 +1043,99 @@
                         st.transcriptionPointer.style.left = pointerPct + '%';
                         st.transcriptionPointerLabel.textContent = data.segment_speaker + ' @ ' + formatTime(segStart);
                     }
+                    if (data.progress !== undefined && st.transcriptionOverlayFill) {
+                        st.transcriptionOverlayFill.style.left =
+                            Math.min((data.progress || 0) * 100, 100).toFixed(2) + '%';
+                    }
+                    if (data.new_segments !== undefined) {
+                        if (data.new_segments.length) st.liveItems.push(...data.new_segments);
+                        renderLivePane(st);
+                    }
                 }
             }
+        }
+
+        function groupLiveItems(items) {
+            const blocks = [];
+            let cur = null;
+            const join = parts => parts.join(' ').replace(/\s+([.,!?…:;])/g, '$1');
+            for (const it of items) {
+                const t = (it.text || '').trim();
+                if (!t) continue;
+                if (!cur) cur = { start: it.start || 0, end: it.end || it.start || 0, parts: [] };
+                cur.parts.push(t);
+                cur.end = it.end || cur.end;
+                const joined = join(cur.parts);
+                if (/[.!?…]["')\]]?$/.test(joined) || cur.end - cur.start > 10 || cur.parts.length > 60) {
+                    blocks.push({ start: cur.start, end: cur.end, text: joined });
+                    cur = null;
+                }
+            }
+            if (cur) blocks.push({ start: cur.start, end: cur.end, text: join(cur.parts) });
+            return blocks;
+        }
+
+        function renderLivePane(st) {
+            const pane = st.transcriptionTextPane;
+            if (!pane || pane.style.display === 'none') return;
+            const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
+            const blocks = groupLiveItems(st.liveItems);
+            pane.innerHTML = '';
+            blocks.forEach((b, idx) => {
+                const d = document.createElement('div');
+                d.className = 'tp-block';
+                d.dataset.start = b.start;
+                d.dataset.end = b.end;
+                const h = document.createElement('div');
+                h.className = 'tp-head';
+                h.textContent = formatTime(b.start) + ' – ' + formatTime(b.end);
+                const x = document.createElement('div');
+                x.className = 'tp-text';
+                x.textContent = b.text;
+                if (idx === blocks.length - 1) {
+                    const c = document.createElement('span');
+                    c.className = 'tt-text-caret';
+                    x.appendChild(c);
+                }
+                d.appendChild(h);
+                d.appendChild(x);
+                pane.appendChild(d);
+            });
+            if (nearBottom) pane.scrollTop = pane.scrollHeight;
+        }
+
+        function seekLivePane(e) {
+            const stx = activeSseState;
+            if (!stx || !stx.audioDur || !jobUiActive) return;
+            const pane = stx.transcriptionTextPane;
+            if (!pane || pane.style.display === 'none') return;
+            const rect = stx.transcriptionSegments.getBoundingClientRect();
+            if (!rect.width) return;
+            const frac = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
+            const t = frac * stx.audioDur;
+            const blocks = groupLiveItems(stx.liveItems);
+            if (!blocks.length) return;
+            let target = null, prev = null;
+            for (const b of blocks) {
+                if (t >= b.start && t < b.end) { target = b; break; }
+                if (b.start > t) { target = prev; break; }
+                prev = b;
+            }
+            if (!target) target = prev || blocks[blocks.length - 1];
+            const jc = document.getElementById('transcriptionJumpCaret');
+            jc.style.display = 'block';
+            jc.style.left = (frac * 100).toFixed(2) + '%';
+            const els = pane.querySelectorAll('.tp-block');
+            let el = null;
+            els.forEach((n, i) => { if (blocks[i] === target) el = n; });
+            if (!el) return;
+            els.forEach(n => n.classList.remove('tp-active'));
+            el.classList.add('tp-active');
+            const paneRect = pane.getBoundingClientRect();
+            const blockRect = el.getBoundingClientRect();
+            const delta = blockRect.top - (paneRect.top + pane.clientHeight / 4);
+            pane.scrollTop = Math.min(Math.max(pane.scrollTop + delta, 0),
+                                      pane.scrollHeight - pane.clientHeight);
         }
 
         async function readSseBody(body, st) {
@@ -1665,6 +1786,7 @@
         loadUser();
         checkStatus();
         activateTab(tabFromPath());
+        document.getElementById('transcriptionBarArea').addEventListener('click', seekLivePane);
         checkActiveJob();
         setInterval(checkActiveJob, 5000);
     </script>

@@ -126,6 +126,7 @@ class CohereBackend(ASRBackend):
         self.tokenizer = None
         self.tokens = None
         self.prompt_ids = None
+        self._prompt_cache = {}
         self.eos_token_id = 3
         self.settings = None
         self._cpu_encoder_session = None
@@ -402,13 +403,16 @@ class CohereBackend(ASRBackend):
         tokens_total = 0
         inference_total = 0.0
         errors = []
+        seg_reported = 0
 
         for i in range(n_windows):
             s, e = bounds[i], bounds[i + 1]
             off = s * HOP_LENGTH / SAMPLE_RATE
             if progress_cb:
                 try:
-                    progress_cb(i + 1, n_windows)
+                    progress_cb(i + 1, n_windows, " ".join(text_parts).strip(),
+                                segments_out[seg_reported:])
+                    seg_reported = len(segments_out)
                 except Exception:
                     logger.debug("progress_cb failed", exc_info=True)
             r = self.transcribe_audio_sync(
@@ -447,6 +451,34 @@ class CohereBackend(ASRBackend):
         return result
 
     # ---------- transcription ----------
+
+    def _prompt_ids_for(self, language: str) -> list:
+        """Decoder prompt for `language`, cached per code.
+
+        The load-time prompt is built for English; a request for another
+        language must swap the duplicated `<|lang|>` tokens (lesson 12: exact
+        token order via token_to_id). Falls back to the English prompt when
+        the language token is missing from the vocab or no tokenizer loaded.
+        """
+        lang = str(language or "en").strip().lower() or "en"
+        cache = self._prompt_cache
+        if lang in cache:
+            return cache[lang]
+        ids = None
+        if self.tokenizer:
+            token_to_id = self.tokenizer.get_vocab()
+            if f"<|{lang}|>" in token_to_id:
+                ids = _build_prompt_ids(self.tokenizer, lang)
+            else:
+                if lang != "en":
+                    logger.warning("<|%s|> missing from tokenizer vocab; using English prompt", lang)
+                if "<|en|>" in token_to_id:
+                    ids = _build_prompt_ids(self.tokenizer, "en")
+        if not ids:
+            ids = list(self.prompt_ids or [])
+        logger.info("Decoder prompt for language=%s: %s", lang, ids)
+        cache[lang] = ids
+        return ids
 
     def transcribe_audio_sync(
         self,
@@ -559,7 +591,7 @@ class CohereBackend(ASRBackend):
         if prefix_ids is not None:
             input_ids = np.array([prefix_ids], dtype=np.int64)
         else:
-            input_ids = np.array([self.prompt_ids], dtype=np.int64)
+            input_ids = np.array([self._prompt_ids_for(language)], dtype=np.int64)
 
         position = 0
         past_seq_len = 0

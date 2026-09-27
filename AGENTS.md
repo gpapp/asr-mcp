@@ -47,9 +47,16 @@ After completing any code changes:
 - **Arena shrinkage**: every GPU run passes `GPU_SHRINK_RUN_OPTIONS` (`memory.enable_memory_arena_shrinkage=gpu:0`, defined in `model_state.py`) so arenas release after each run instead of holding peak until session reload. Reload helpers clear the old session + `gc.collect()` BEFORE constructing the new one (no double-arena peak).
 - Peak VRAM: ~2.6GB with caps (target card: GTX 1650, 4096 MiB)
 
+### Whisper Backend (`TRANSCRIBE_ASR_MODEL=whisper`)
+- **faster-whisper / CTranslate2**, default model `large-v3-turbo`, always **quantized**: `TRANSCRIBE_WHISPER_COMPUTE_TYPE=auto` → `int8_float16` on CUDA / `int8` on CPU (~1.0GB VRAM measured on the GTX 1650; fp16 would be ~1.6GB + spikes).
+- **Load escalation**: requested compute type → `int8` on CUDA → `int8` on CPU; each failed attempt is logged and the model freed first. Runtime CUDA OOM rebuilds the model on CPU (`_fallback_to_cpu`) and retries the whole transcription once.
+- **Timestamps**: passes `without_timestamps=False` — segment-level start/end feed `_transcribe_file`'s speaker attribution (the faster-whisper default `True` yields one coarse segment per file). Progress events map segment end times onto 30s windows (`progress_cb(win, est_windows, partial_text, new_segments)`).
+- **Dependency hazard**: `faster-whisper` depends on the CPU `onnxruntime` wheel; both wheels write the same `site-packages/onnxruntime/` files, so installing the CPU wheel last silently kills the CUDA EP (then `GPU_SHRINK_RUN_OPTIONS` crashes — lesson 5). Keep `onnxruntime-gpu` LAST in `requirements.txt` and the Dockerfile's `pip install --force-reinstall --no-deps onnxruntime-gpu` step as guarantee.
+- Model download lands in `models/faster-whisper/<spec>/` (mounted volume); `_ensure_local_model` skips the download once `config.json` + `model.bin` exist.
+
 ### Model Lifecycle (lazy load + TTL + phase unloads)
 - **No auto-load at server start** — `server.py` lifespan does NOT load models; first GPU request calls `state.ensure_ready()`. Endpoint rule: any endpoint that embeds/transcribes/diarizes must call `ensure_ready()` (or be behind a handler that does).
-- **Backend-driven state** — `ModelState.backend` holds the active ASR backend instance (`cohere` | `qwen3-asr`, chosen by `TRANSCRIBE_ASR_MODEL`). `state.is_ready` = backend loaded **and** `embedding_session` **and** `vad_session`; `reload_models()` picks/loads the backend via `transcribers.get_backend()`, then fills vad+embedding. `unload_models()` delegates to `backend.unload()` + drops embedding/vad. Transcriber is a thin facade: `core/transcriber.py` forwards `transcribe_audio_sync(audio=...)` to `state.backend`.
+- **Backend-driven state** — `ModelState.backend` holds the active ASR backend instance (`cohere` | `qwen3-asr` | `whisper`, chosen by `TRANSCRIBE_ASR_MODEL`; compare via `transcribers.resolve_backend_name()` so case/whitespace can't cause a reload loop). `state.is_ready` = backend loaded **and** `embedding_session` **and** `vad_session`; `reload_models()` picks/loads the backend via `transcribers.get_backend()`, then fills vad+embedding. `unload_models()` delegates to `backend.unload()` + drops embedding/vad. Transcriber is a thin facade: `core/transcriber.py` forwards `transcribe_audio_sync(audio=...)` to `state.backend`.
 - **TTL**: `model_ttl_minutes` (default **5**) — monitor in `server.py` unloads idle models only when `state.any_loaded and idle > ttl` AND `job_state.get_running() is None`. Never unload mid-job.
 - **Phase unloads** (models not needed in a phase get freed for the next):
   - `/diarize` + `/diarize/upload`: `unload_encoder()` at job start (diarize never uses the encoder; `Diarizer.run()` gates on `vad_session`+`embedding_session` only, NOT `is_ready` — the encoder is intentionally unloaded)
@@ -130,7 +137,8 @@ asr-mcp/
 │   │   ├── base.py            # ASRBackend ABC (load/unload/is_loaded/transcribe_audio_sync)
 │   │   ├── __init__.py        # BACKENDS_BY_NAME + get_backend(settings) factory
 │   │   ├── cohere.py          # CohereBackend: ONNX encoder/decoder (windowed decode, chunking)
-│   │   └── qwen3.py           # Qwen3Backend: Qwen3-ASR via qwen_asr.Qwen3ASRModel (transformers)
+│   │   ├── qwen3.py           # Qwen3Backend: Qwen3-ASR via qwen_asr.Qwen3ASRModel (transformers)
+│   │   └── whisper.py         # WhisperBackend: faster-whisper/CTranslate2, int8-quantized large-v3-turbo
 │   ├── diarization/
 │   │   ├── pipeline.py        # Diarizer: 13-step pipeline
 │   │   ├── clustering.py      # AgglomerativeClustering, greedy merge, voiceprint matching
@@ -199,7 +207,7 @@ asr-mcp/
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
 | `/api/asr/transcribe` | POST | API key | Transcribe by file path |
-| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save) |
+| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save; `?language=hu` ISO 639-1 or `auto`, default `en`) |
 | `/api/asr/active` | GET | Session/API key | Current job (any user) + `can_cancel` for requester |
 | `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
 | `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
@@ -248,7 +256,7 @@ asr-mcp/
 | `TRANSCRIBE_VAD_THRESHOLD` | `0.5` | VAD speech probability cutoff |
 | `TRANSCRIBE_MODEL_TTL_MINUTES` | `5` | Idle minutes before GPU models unload (0 = disabled); skipped while a job is active |
 | `TRANSCRIBE_GPU_MEMORY_LIMIT_GB` | `4.0` | GPU size hint for CUDA arena caps (encoder = ×0.625, embedding = ÷4 capped at 768 MiB) |
-| `TRANSCRIBE_ASR_MODEL` | `cohere` | ASR backend: `cohere` (ONNX, default) or `qwen3-asr` (transformers/Qwen3-ASR) |
+| `TRANSCRIBE_ASR_MODEL` | `cohere` | ASR backend: `cohere` (ONNX, default), `qwen3-asr` (transformers/Qwen3-ASR) or `whisper` (faster-whisper) |
 | `TRANSCRIBE_QWEN_MODEL_NAME` | `Qwen/Qwen3-ASR-1.7B` | Qwen3-ASR model name (HF) |
 | `TRANSCRIBE_QWEN_MODEL_DIR` | `./models/qwen3-asr` | Qwen3-ASR local cache dir |
 | `TRANSCRIBE_QWEN_FORCED_ALIGNER_NAME` | `Qwen/Qwen3-ForcedAligner-0.6B` | Forced aligner model name (HF) |
@@ -258,6 +266,12 @@ asr-mcp/
 | `TRANSCRIBE_QWEN_MAX_INFERENCE_BATCH_SIZE` | `8` | Qwen3-ASR inference batch size |
 | `TRANSCRIBE_QWEN_QUANTIZE_4BIT` | `true` | Load Qwen3-ASR via BitsAndBytes load_in_4bit |
 | `TRANSCRIBE_QWEN_ALIGNER_QUANTIZE_4BIT` | `true` | Load the Qwen3 forced aligner in 4-bit (saves ~0.9GB VRAM); falls back to fp16 automatically if the 4-bit load fails |
+| `TRANSCRIBE_WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model size name or HF repo id |
+| `TRANSCRIBE_WHISPER_MODEL_DIR` | `./models/faster-whisper` | Whisper local download dir (subdir per model spec) |
+| `TRANSCRIBE_WHISPER_COMPUTE_TYPE` | `auto` | CTranslate2 compute type; `auto` = int8_float16 on CUDA / int8 on CPU (quantized to fit small GPUs) |
+| `TRANSCRIBE_WHISPER_BEAM_SIZE` | `5` | Whisper beam size |
+| `TRANSCRIBE_WHISPER_VAD_FILTER` | `true` | faster-whisper built-in Silero VAD filter |
+| `TRANSCRIBE_WHISPER_CPU_THREADS` | `0` | Threads for Whisper CPU decode (0 = CT2 default) |
 | `TRANSCRIBE_HF_TOKEN` | - | HuggingFace token for gated models |
 | `API_KEYS` | - | Comma-separated API keys |
 
@@ -412,3 +426,9 @@ These are hard-won bugs that **will** reappear if violated. Follow these rules w
 - Every GPU run passes `GPU_SHRINK_RUN_OPTIONS` (`memory.enable_memory_arena_shrinkage=gpu:0`) — without it the arena only releases on full session reload.
 - Cohere encoder reload (`reload_encoder` in `transcribers/cohere.py`) / embedding reload (`reload_embedding_session` in `model_loader.py`): set the field to `None` + `gc.collect()` BEFORE constructing the replacement — otherwise old arena (alive) + new session (allocating) peak together.
 - Encoder OOM escalation: reload fresh arena → retry GPU once → CPU fallback. Embedding OOM: straight to cached CPU session.
+
+### 28. Language Must Be Threaded End-to-End — Routers, Prompt, and Decode
+- `transcribe/upload` accepts `?language=` (ISO 639-1 or `auto`, default `en`) → `_transcribe_file(language=...)` → `transcribe_audio_sync(language=...)`. Before this, routers never passed `language` and every backend silently forced English — Hungarian audio decoded as English hallucination.
+- Cohere: the decoder prompt embeds language tokens (`<|hu|>` id 87, `<|en|>` id 62) — build it **per request** via `_prompt_ids_for(language)` (cached in `_prompt_cache`), NOT once at load with `language="en"`. Qwen maps via `LANGUAGE_MAP` (`"hu" → "Hungarian"`); Whisper passes the ISO code straight to faster-whisper (`auto`/empty → detect).
+- **Cohere model limitation**: cohere-transcribe-03-2026-ONNX q4 cannot transcribe Hungarian at all — en prompt → English hallucination, hu prompt → Cyrillic/spam hallucination (verified; English control input is perfect). Use whisper for non-English.
+- 56.8-min hu podcast benchmark (GTX 1650): whisper 498s/1290MiB/7.1× (excellent quality), cohere 1295s/2392MiB/2.65× (hu unusable), qwen3 2388s/2830MiB/1.43× (correct content, no punctuation).

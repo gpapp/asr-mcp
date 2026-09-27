@@ -314,6 +314,7 @@ class Qwen3Backend(ASRBackend):
         errors = []
         pos = 0
         window = 0
+        seg_reported = 0
 
         while pos < total:
             remaining = (total - pos) / SAMPLE_RATE
@@ -356,7 +357,10 @@ class Qwen3Backend(ASRBackend):
 
             if progress_cb and est_windows > 1:
                 try:
-                    progress_cb(min(window, est_windows), est_windows)
+                    progress_cb(min(window, est_windows), est_windows,
+                                " ".join(text_parts).strip(),
+                                segments_out[seg_reported:])
+                    seg_reported = len(segments_out)
                 except Exception:
                     logger.debug("progress_cb failed", exc_info=True)
 

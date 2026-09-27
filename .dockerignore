@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+data/
+models/
+voices/
+logs/
+.env
+.env.example
+asr-client/

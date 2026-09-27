@@ -241,6 +241,15 @@ async def health():
 
     asr_loaded = bool(state.backend is not None and state.backend.is_loaded)
     job = job_state.get_running()
+    active_job = None
+    if job is not None:
+        m = job.meta()
+        active_job = {
+            "mode": m["mode"],
+            "filename": m["filename"],
+            "stage": m["stage"],
+            "progress": m["progress"],
+        }
 
     return {
         "status": "healthy" if state.is_ready else "loading",
@@ -262,10 +271,7 @@ async def health():
             "idle_seconds": round(state.idle_seconds(), 1) if state.any_loaded else None,
             "ttl_minutes": settings.model_ttl_minutes,
         },
-        "active_job": (
-            {"mode": job.mode, "filename": job.filename, "stage": job.stage}
-            if job is not None else None
-        ),
+        "active_job": active_job,
     }
 
 

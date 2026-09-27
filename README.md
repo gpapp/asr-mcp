@@ -4,7 +4,8 @@ GPU-accelerated ASR MCP server with speaker diarization, voiceprint recognition,
 
 ## Features
 
-- **ASR with Diarization**: Detect and separate multiple speakers in audio using Cohere Transcribe ONNX.
+- **ASR with Diarization**: Detect and separate multiple speakers in audio. Pluggable backends via `TRANSCRIBE_ASR_MODEL`: Cohere Transcribe ONNX (default, English), Qwen3-ASR (4-bit, transformers) or Whisper large-v3-turbo (faster-whisper, int8-quantized).
+- **Language Selection**: `?language=hu` (ISO 639-1) or `auto` on the upload endpoint; default `en`.
 - **Voiceprint Recognition**: Register, identify, and manage speaker profiles with ECAPA-TDNN embeddings.
 - **Streaming Transcription**: Real-time WebSocket dual-channel transcription.
 - **Auto Voiceprint Collection**: Snippets auto-collected from diarization for registered speakers.
@@ -51,6 +52,9 @@ All settings use the `TRANSCRIBE_` env prefix. Key variables:
 | `TRANSCRIBE_PORT` | `8080` | Server port |
 | `TRANSCRIBE_MODEL_TTL_MINUTES` | `5` | Idle minutes before GPU models unload (0 = never; skipped while a job is active) |
 | `TRANSCRIBE_GPU_MEMORY_LIMIT_GB` | `4.0` | GPU size hint for CUDA arena caps (encoder ×0.625, embedding min(÷4, 768 MiB)) |
+| `TRANSCRIBE_ASR_MODEL` | `cohere` | ASR backend: `cohere` \| `qwen3-asr` \| `whisper` |
+| `TRANSCRIBE_WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model name/repo |
+| `TRANSCRIBE_WHISPER_COMPUTE_TYPE` | `auto` | CT2 compute type; `auto` = int8_float16 on CUDA / int8 on CPU |
 
 ## Windows Client (`asr-client/`)
 
@@ -89,7 +93,7 @@ by the client ARE kept (they feed refinement).
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
 | `/api/asr/transcribe` | POST | API key | Transcribe by file path |
-| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side save) |
+| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side save; `?language=hu` or `auto`) |
 | `/api/asr/active` | GET | Session/API key | Current job (any user) + `can_cancel` for requester |
 | `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
 | `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
@@ -182,11 +186,12 @@ asr-mcp/
 │   │   ├── model_state.py     # ModelState, is_gpu_oom, GPU_SHRINK_RUN_OPTIONS, lazy-load/TTL
 │   │   ├── model_loader.py    # HuggingFace download + ORT session init (arena caps)
 │   │   ├── job_state.py       # Active job tracking (start/publish/finish/attach)
-│   │   └── transcriber.py     # Thin facade → state.backend (Cohere ONNX / Qwen3-ASR)
+│   │   └── transcriber.py     # Thin facade → state.backend (Cohere ONNX / Qwen3-ASR / Whisper)
 │   ├── transcribers/
 │   │   ├── base.py            # ASRBackend ABC (context/progress_cb interface)
 │   │   ├── cohere.py          # Cohere ONNX: windowed decode + encoder chunking
-│   │   └── qwen3.py           # Qwen3-ASR + forced aligner (4-bit), OOM-backoff chunker
+│   │   ├── qwen3.py           # Qwen3-ASR + forced aligner (4-bit), OOM-backoff chunker
+│   │   └── whisper.py         # faster-whisper large-v3-turbo (int8-quantized CTranslate2)
 │   ├── diarization/
 │   │   ├── pipeline.py        # Diarizer: 13-step pipeline
 │   │   ├── clustering.py      # AgglomerativeClustering, greedy merge

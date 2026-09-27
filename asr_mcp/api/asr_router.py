@@ -238,7 +238,7 @@ def _speaker_for_span(start, end, turns, starts):
     return turn.get("speaker")
 
 
-def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None):
+def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None, language="en"):
     """Transcribe the whole file in one backend call; attribute output post-hoc.
 
     The backend decodes in its own windows and returns timestamped items on
@@ -248,11 +248,12 @@ def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None):
     """
     from asr_mcp.core.transcriber import transcribe_audio_sync
 
+    language = str(language or "en").strip().lower() or "en"
     dur = len(audio_np) / sample_rate
     turns = list(turns or [])
     logger.info("Transcribing file: %.1fs (%d diarization turns for attribution)",
                 dur, len(turns))
-    tr = transcribe_audio_sync(audio=audio_np, progress_cb=progress_cb)
+    tr = transcribe_audio_sync(audio=audio_np, progress_cb=progress_cb, language=language)
     logger.info("File result: text=%d chars, segments=%d, inference=%.2fs, error=%s",
                 len(tr.get("text") or ""), len(tr.get("segments") or []),
                 tr.get("inference_time_sec", 0), tr.get("error"))
@@ -1000,6 +1001,7 @@ async def transcribe_upload(
     file: UploadFile = File(...),
     num_speakers: int = None,
     save: bool = Query(True),
+    language: str = Query("en", description="ISO 639-1 code (e.g. hu) or 'auto' for detection"),
     settings: Settings = Depends(get_settings),
     user_id: str = Depends(get_current_user),
     _: str = Depends(verify_api_key),
@@ -1194,6 +1196,8 @@ async def transcribe_upload(
                 "segment_speaker": _speaker_for_span(0.0, 0.0, attr_turns, starts) or "",
                 "segment_start": 0.0,
                 "segment_end": 0.0,
+                "partial_text": "",
+                "new_segments": [],
                 **_timing(0.0),
             })
 
@@ -1202,13 +1206,13 @@ async def transcribe_upload(
                     queue.put_nowait(evt)
                     job_state.publish(evt)
 
-                def cb(i, n):
+                def cb(i, n, partial_text=None, new_segments=None):
                     if job.cancel_requested:
                         raise JobCancelled()
                     frac = i / max(n, 1)
                     win_start = dur * ((i - 1) / max(n, 1))
                     win_end = dur * (i / max(n, 1))
-                    loop.call_soon_threadsafe(_emit_window, {
+                    evt = {
                         "stage": f"Transcribing — window {i}/{n}",
                         "progress": frac,
                         "phase": "transcription",
@@ -1222,11 +1226,17 @@ async def transcribe_upload(
                         "window": i,
                         "total_windows": n,
                         **_timing(dur * frac),
-                    })
+                    }
+                    if partial_text is not None:
+                        evt["partial_text"] = partial_text
+                    if new_segments is not None:
+                        evt["new_segments"] = new_segments
+                    loop.call_soon_threadsafe(_emit_window, evt)
                 return cb
 
             results = await loop.run_in_executor(
                 None, _transcribe_file, audio_np, attr_turns, 16000, _make_window_cb(),
+                language,
             )
             if job.cancel_requested:
                 raise JobCancelled()
@@ -1315,8 +1325,9 @@ async def active_job_stream(
     snap, sub = job_state.attach(job)
 
     def _scrub(evt):
-        if not owner and isinstance(evt, dict) and "result" in evt:
-            return {k: v for k, v in evt.items() if k != "result"}
+        if not owner and isinstance(evt, dict):
+            return {k: v for k, v in evt.items()
+                    if k not in ("result", "partial_text", "new_segments")}
         return evt
 
     async def event_stream():

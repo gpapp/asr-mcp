@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     gpu_memory_limit_gb: float = Field(default=4.0, description="Max GPU memory limit")
     cpu_threads: int = Field(default=max(1, os.cpu_count() - 1))
 
-    # ASR backend selection: "cohere" (ONNX, default) or "qwen3-asr" (transformers)
-    asr_model: str = Field(default="cohere", description="ASR backend: cohere | qwen3-asr")
+    # ASR backend selection: "cohere" (ONNX, default), "qwen3-asr" (transformers) or "whisper" (faster-whisper)
+    asr_model: str = Field(default="cohere", description="ASR backend: cohere | qwen3-asr | whisper")
 
     # ASR Model (Cohere Transcribe ONNX)
     model_repo: str = Field(default="onnx-community/cohere-transcribe-03-2026-ONNX")
@@ -43,6 +43,21 @@ class Settings(BaseSettings):
         description="Load the Qwen3 forced aligner in 4-bit (saves ~0.9GB VRAM; "
                     "set false for maximum timestamp precision)",
     )
+
+    # ASR Model (Whisper via faster-whisper / CTranslate2, quantized for small GPUs)
+    whisper_model: str = Field(
+        default="large-v3-turbo",
+        description="faster-whisper model size (e.g. large-v3-turbo) or HuggingFace repo id",
+    )
+    whisper_model_dir: Path = Path("./models/faster-whisper")
+    whisper_compute_type: str = Field(
+        default="auto",
+        description="CTranslate2 compute type; auto = int8_float16 on CUDA, int8 on CPU "
+                    "(quantized so large-v3-turbo fits a 4GB card)",
+    )
+    whisper_beam_size: int = Field(default=5)
+    whisper_vad_filter: bool = Field(default=True, description="faster-whisper built-in VAD filter")
+    whisper_cpu_threads: int = Field(default=0, description="Threads for Whisper CPU decode (0 = CT2 default)")
 
     # Embedding Model (ECAPA-TDNN)
     embedding_model_repo: str = Field(default="Wespeaker/wespeaker-ecapa-tdnn512-LM")
@@ -106,7 +121,8 @@ class Settings(BaseSettings):
     @field_validator(
         "data_dir", "log_dir", "model_dir", "embedding_model_dir",
         "vad_model_dir", "model_cache_dir", "voices_dir",
-        "qwen_model_dir", "qwen_forced_aligner_dir", mode="before"
+        "qwen_model_dir", "qwen_forced_aligner_dir",
+        "whisper_model_dir", mode="before"
     )
     @classmethod
     def ensure_paths(cls, v):
@@ -127,6 +143,7 @@ class Settings(BaseSettings):
         self.voices_dir.mkdir(parents=True, exist_ok=True)
         self.qwen_model_dir.mkdir(parents=True, exist_ok=True)
         self.qwen_forced_aligner_dir.mkdir(parents=True, exist_ok=True)
+        self.whisper_model_dir.mkdir(parents=True, exist_ok=True)
 
 
 _settings: Optional[Settings] = None

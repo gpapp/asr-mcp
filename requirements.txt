@@ -21,9 +21,6 @@ soundfile
 librosa
 scikit-learn
 
-# ONNX Runtime (GPU — CUDA 12)
-onnxruntime-gpu>=1.22.0
-
 # Qwen3-ASR backend (transformers, optional)
 # sox==1.4.1 pinned: latest sox sdist lacks a wheel and fails to build under
 # pip build isolation (its setup imports numpy, which isn't in the build env)
@@ -32,6 +29,16 @@ qwen-asr
 transformers>=4.45.0
 accelerate
 bitsandbytes
+
+# Whisper backend (faster-whisper / CTranslate2 — int8 quantized for small GPUs)
+faster-whisper>=1.1.0
+
+# ONNX Runtime (GPU — CUDA 12). faster-whisper depends on the CPU onnxruntime
+# wheel; both wheels write the same site-packages/onnxruntime/ files, and pip may
+# install the CPU wheel last (silently killing the CUDA execution provider).
+# The Dockerfile re-installs onnxruntime-gpu explicitly after this file — for
+# local installs run: pip install --force-reinstall --no-deps onnxruntime-gpu
+onnxruntime-gpu>=1.22.0
 
 # Tokenizer & model download
 tokenizers

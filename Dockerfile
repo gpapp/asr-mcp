@@ -13,12 +13,18 @@ RUN python3 -m pip install --no-cache-dir \
 WORKDIR /app
 
 COPY requirements.txt .
+# faster-whisper (requirements) depends on the CPU onnxruntime wheel whose files
+# collide with onnxruntime-gpu (same package dir); the RUN below re-installs the
+# GPU wheel last so the CUDA execution provider stays intact (a silent CPU
+# fallback would then crash on GPU_SHRINK_RUN_OPTIONS).
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     torch torchaudio \
     --index-url https://download.pytorch.org/whl/cu121 && \
     python3 -m pip install \
-    -r requirements.txt
+    -r requirements.txt && \
+    python3 -m pip install --force-reinstall --no-deps \
+    "onnxruntime-gpu>=1.22.0"
 
 COPY asr_mcp ./asr_mcp
 

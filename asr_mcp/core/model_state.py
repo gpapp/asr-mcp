@@ -199,9 +199,9 @@ class ModelState:
 
     def _ensure_backend(self, gc) -> None:
         """Load/pick the ASR backend per TRANSCRIBE_ASR_MODEL (no-op if loaded)."""
-        from asr_mcp.transcribers import get_backend
+        from asr_mcp.transcribers import get_backend, resolve_backend_name
         settings = self._ensure_settings()
-        if self.backend is None or self.backend.name != settings.asr_model:
+        if self.backend is None or self.backend.name != resolve_backend_name(settings):
             if self.backend is not None:
                 self.backend.unload()
                 gc.collect()
