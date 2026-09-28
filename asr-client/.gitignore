@@ -1,0 +1,7 @@
+# Local configuration (never ship your token)
+.env
+
+# Local virtual environment
+.venv/
+
+__pycache__/

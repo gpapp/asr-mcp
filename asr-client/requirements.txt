@@ -1,0 +1,5 @@
+# asr-client has no third-party runtime dependencies — the client is
+# Python standard library only (http.client, urllib, json, pathlib).
+# This file exists so future dependencies can be declared here; both
+# transcribe.bat and the packaging workflow install from it when it
+# contains non-comment lines.

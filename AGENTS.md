@@ -171,8 +171,12 @@ asr-mcp/
 │       └── app.html            # Unified SPA: Transcribe / Voiceprints / History / Settings tabs
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt output, voiceprints
-│   ├── transcribe.bat          # Drop-target wrapper (py/python launcher)
+│   ├── transcribe.bat          # Drop-target wrapper: bootstraps .env + private .venv, runs client
+│   ├── requirements.txt        # Empty (stdlib-only); installed into .venv when it has lines
+│   ├── README.md               # Standalone-zip setup guide
 │   └── .env.example            # SERVER_URL + TOKEN template
+├── .github/workflows/asr-client.yml  # Builds standalone client zip on asr-client/** changes
+│                                    # (stdlib-import guard + no server cross-refs; zip = artifact)
 ├── Dockerfile                 # nvidia/cuda:12.2.0 base
 ├── docker-compose.yml         # GPU passthrough + named volumes + port 8087
 ├── nginx_snippet.conf         # nginx location /asr-mcp/ with proxy_pass

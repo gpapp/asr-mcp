@@ -58,22 +58,32 @@ All settings use the `TRANSCRIBE_` env prefix. Key variables:
 
 ## Windows Client (`asr-client/`)
 
-Stdlib-only Python client — no installs needed beyond Python 3.
+Stdlib-only Python client — no installs needed beyond Python 3. Distributed
+as a standalone zip built by GitHub Actions (`.github/workflows/asr-client.yml`,
+triggers on `asr-client/**` changes); the zip is a workflow artifact containing
+`transcribe_client.py`, `transcribe.bat`, `requirements.txt`, `README.md`, and
+`.env.example` — never `.env` or `.venv`.
 
 ```powershell
-cd asr-client
-copy .env.example .env
+# From the unzipped folder — first run creates .env from .env.example
+transcribe.bat status
 # Edit .env: SERVER_URL (include the /asr-mcp prefix when behind nginx) + TOKEN
 # Generate the token in the web UI ("Windows Client Token" card) or via POST /api/token
 ```
 
+`transcribe.bat` also creates a private `.venv` next to the script and runs the
+client with it (falls back to `py`/`python` on PATH); `requirements.txt` is
+installed there when it declares dependencies. The client has no server
+code/dependency cross-links — CI enforces stdlib-only imports.
+
 | Command | Description |
 |---------|-------------|
 | Drag files onto `transcribe.bat` | Transcribe with live progress; writes `<name>.txt` next to each file |
-| `python transcribe_client.py status` | Check server/token connectivity |
-| `python transcribe_client.py voiceprints` | List speakers and voiceprints |
-| `python transcribe_client.py voiceprint-add <name> <file> [start] [end]` | Create/refine a voiceprint from a clip |
-| `python transcribe_client.py voiceprint-refine <name>` | Rebuild a voiceprint from its snippets |
+| `transcribe.bat status` | Check server/token connectivity |
+| `transcribe.bat voiceprints` | List speakers and voiceprints |
+| `transcribe.bat voiceprint-add <name> <file> [start] [end]` | Create/refine a voiceprint from a clip |
+| `transcribe.bat voiceprint-refine <name>` | Rebuild a voiceprint from its snippets |
+| `transcribe.bat <file...> [--language <code>]` | Transcribe (language overrides `.env LANGUAGE`) |
 
 Client transcriptions use `?save=false` — nothing is stored in server transcript history.
 If the connection drops mid-job, the server finishes the run and saves the result to
@@ -225,8 +235,11 @@ asr-mcp/
 │       └── app.html            # Unified SPA (Transcribe / Voiceprints / History / Settings)
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt, voiceprints
-│   ├── transcribe.bat          # Drop-target wrapper (py/python launcher)
+│   ├── transcribe.bat          # Drop-target wrapper: bootstraps .env + private .venv
+│   ├── requirements.txt        # Empty (stdlib-only); installed into .venv when it has lines
+│   ├── README.md               # Standalone-zip setup guide
 │   └── .env.example            # SERVER_URL + TOKEN template
+├── .github/workflows/asr-client.yml  # Standalone client zip on asr-client/** changes
 ├── Dockerfile                 # nvidia/cuda:12.2.0 base
 ├── docker-compose.yml         # GPU passthrough + named volumes
 ├── nginx_snippet.conf         # nginx location block for /asr-mcp/

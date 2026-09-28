@@ -1,0 +1,94 @@
+name: asr-client
+
+on:
+  push:
+    paths:
+      - 'asr-client/**'
+      - '.github/workflows/asr-client.yml'
+  pull_request:
+    paths:
+      - 'asr-client/**'
+      - '.github/workflows/asr-client.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: python3 -m py_compile asr-client/transcribe_client.py
+
+      - name: Verify standalone (stdlib-only, no server cross-dependencies)
+        run: |
+          python3 - <<'EOF'
+          import ast
+          import pathlib
+          import sys
+
+          client_dir = pathlib.Path('asr-client')
+          stdlib = set(sys.stdlib_module_names)
+          errors = []
+
+          for py in sorted(client_dir.glob('*.py')):
+              if py.name.startswith('.'):
+                  continue
+              tree = ast.parse(py.read_text(encoding='utf-8'), filename=str(py))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      mods = [alias.name.split('.')[0] for alias in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      if node.level:  # relative import -> needs the package
+                          errors.append(f'{py.name}:{node.lineno}: relative import')
+                          continue
+                      mods = [(node.module or '').split('.')[0]]
+                  else:
+                      continue
+                  for mod in mods:
+                      if mod and mod not in stdlib:
+                          errors.append(f'{py.name}:{node.lineno}: non-stdlib import {mod!r}')
+
+          # No textual references to server modules/paths either
+          skip = {'.venv', '__pycache__'}
+          for path in sorted(client_dir.rglob('*')):
+              if not path.is_file() or skip & set(path.parts):
+                  continue
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except (UnicodeDecodeError, OSError):
+                  continue
+              for token in ('asr_mcp', 'from server', 'import server'):
+                  if token in text:
+                      errors.append(f'{path.name}: contains {token!r}')
+
+          if errors:
+              print('Standalone violation(s):')
+              for e in errors:
+                  print(f'  {e}')
+              sys.exit(1)
+          print('OK: stdlib-only, no server cross-dependencies')
+          EOF
+
+      - name: Build zip
+        run: |
+          set -euo pipefail
+          STAGE="dist/asr-client"
+          mkdir -p "$STAGE"
+          cp asr-client/transcribe_client.py \
+             asr-client/transcribe.bat \
+             asr-client/requirements.txt \
+             asr-client/README.md \
+             asr-client/.env.example \
+             "$STAGE/"
+          # Guard: never ship local config or virtualenv
+          test ! -e "$STAGE/.env"
+          test ! -e "$STAGE/.venv"
+          (cd dist && zip -r "../asr-client-${GITHUB_SHA::7}.zip" asr-client)
+          unzip -l "asr-client-${GITHUB_SHA::7}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asr-client
+          path: asr-client-*.zip
+          if-no-files-found: error
