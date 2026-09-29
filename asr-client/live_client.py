@@ -131,6 +131,8 @@ DETECTOR_DEFAULTS = {
     "post_roll_ms": 200,
     "min_voiced_ms": 120,
     "max_turn_sec": 30.0,
+    "merge_gap_sec": 1.0,
+    "max_merge_sec": 15.0,
 }
 
 
@@ -351,6 +353,99 @@ class TurnDetector:
         if not self._in_turn:
             return None
         return self._close_turn("flush")
+
+
+class TurnCoalescer:
+    """Hold a closed turn briefly and merge it into the next one.
+
+    Mirrors ``asr_mcp.streaming.turn_detector.TurnCoalescer``; re-implemented
+    here because the client cannot import the server.
+
+    ``hangover_ms`` is 320 ms so a live turn closes promptly, but natural
+    speech has 300-800 ms pauses mid-sentence, and every one of them used to
+    cut a turn.  A 0.4 s fragment is useless twice over: Whisper hallucinates
+    on it (a half-second of room noise reliably decodes to "Thank you.") and
+    ECAPA cannot identify anybody from 0.4 s of audio, so the fragment could
+    only ever come back UNKNOWN.
+
+    A closed turn is therefore held as *pending* and merged with the next turn
+    on the same channel when the pause is shorter than ``merge_gap_sec`` and
+    the merged span stays under ``max_merge_sec``.  :meth:`poll` releases it
+    once that window has elapsed, so a sentence followed by a real pause (or
+    by nothing at all) is still sent promptly -- the added latency is bounded
+    by ``merge_gap_sec``, and the server's ASR queue (~3 s per turn here) is
+    the real bottleneck anyway.
+    """
+
+    def __init__(self, cfg=None, sample_rate=SAMPLE_RATE, clock=None):
+        self.cfg = dict(DETECTOR_DEFAULTS)
+        self.cfg.update(cfg or {})
+        self.sample_rate = sample_rate
+        self._clock = clock or time.monotonic
+        self._pending = None
+        self._due = None
+        self.merged = 0
+        self.released = 0
+
+    @property
+    def pending_sec(self):
+        return (self._pending.end_sample - self._pending.start_sample) / self.sample_rate \
+            if self._pending is not None else 0.0
+
+    def _defer(self, now):
+        self._due = (now if now is not None else self._clock()) + float(
+            self.cfg["merge_gap_sec"])
+
+    def submit(self, turn, now=None):
+        """Offer a completed turn; return the turns that are ready to send."""
+        if turn is None:
+            return []
+        pending = self._pending
+        if pending is None:
+            self._pending = turn
+            self._defer(now)
+            return []
+
+        gap = turn.start_sample - pending.end_sample
+        span = (turn.end_sample - pending.start_sample) / self.sample_rate
+        if (0 <= gap <= float(self.cfg["merge_gap_sec"]) * self.sample_rate
+                and span <= float(self.cfg["max_merge_sec"])):
+            self._pending = Turn(
+                pending.start_sample, turn.end_sample,
+                pending.pcm + turn.pcm, reason="merged",
+                peak_rms=max(pending.peak_rms, turn.peak_rms),
+            )
+            self.merged += 1
+            self._defer(now)
+            return []
+
+        self.released += 1
+        self._pending = turn
+        self._defer(now)
+        return [pending]
+
+    def poll(self, now=None):
+        """Release the held turn once the merge window has elapsed."""
+        if self._pending is None or self._due is None:
+            return []
+        if (now if now is not None else self._clock()) < self._due:
+            return []
+        pending, self._pending, self._due = self._pending, None, None
+        self.released += 1
+        return [pending]
+
+    def flush(self):
+        """Release the held turn (end of stream / shutdown)."""
+        pending, self._pending = self._pending, None
+        self._due = None
+        if pending is None:
+            return []
+        self.released += 1
+        return [pending]
+
+    def stats(self):
+        return {"merged": self.merged, "released": self.released,
+                "pending": self.pending_sec > 0}
 
 
 # ── Audio capture ──────────────────────────────────────────────────────────
@@ -953,6 +1048,7 @@ class LiveSession:
 
         self.items = []          # live ASR items -> the re-attribution input
         self.gaps = []           # server-reported drops
+        self.skipped = []        # turns the server's speech gate rejected
         # Turns the client cut and handed to the transport. Distinct from
         # transcripts received back: a session can send 24 turns and get 0
         # replies (server error, or a backend that returns nothing), and
@@ -961,10 +1057,14 @@ class LiveSession:
         self.turns_sent = 0
         self.transcript_count = 0
         self.drop_count = 0
+        self.skip_count = 0
         self.sequence = 0
         self.covered_sec = 0.0
         self.server_stats = None
         self.streaming_failed = None
+        # Set by run_live(): {channel: TurnCoalescer}. Kept on the session so
+        # the summary can report how many fragments were merged.
+        self.coalescers = {}
         self._lock = threading.Lock()
 
     @property
@@ -1019,7 +1119,20 @@ class LiveSession:
             print(f"[{stamp}] {speaker}{conf_s}: {(msg.get('text') or '').strip()}",
                   flush=True)
         elif kind == "empty":
-            pass  # a detected turn the decoder produced no words for
+            # A detected turn the decoder produced no words for. When the
+            # server's speech gate rejected it, `skipped` says why -- worth
+            # counting, because "the server discarded 31 of my turns" and
+            # "the server transcribed 31 turns that were noise" look identical
+            # in the transcript otherwise.
+            if msg.get("skipped"):
+                with self._lock:
+                    self.skipped.append({
+                        "start": msg.get("start"), "end": msg.get("end"),
+                        "channel": msg.get("channel"),
+                        "reason": msg.get("skipped"),
+                        "speech_score": msg.get("speech_score"),
+                    })
+                    self.skip_count += 1
         elif kind == "dropped":
             with self._lock:
                 self.gaps.append({
@@ -1054,6 +1167,8 @@ class LiveSession:
                 "asr_source": "live_stream",
                 "turns_sent": self.turns_sent,
                 "transcripts_received": self.transcript_count,
+                "turns_skipped_non_speech": self.skip_count,
+                "skipped": self.skipped,
                 "gaps": self.gaps,
                 "server_stats": self.server_stats,
                 "items": self.items,
@@ -1220,6 +1335,11 @@ def run_live(args):
     spk_rec = ChannelRecorder(session.speaker_path) if loop_dev else None
     mic_det = TurnDetector()
     spk_det = TurnDetector() if spk_rec is not None else None
+    # One coalescer per channel: merging across channels would attribute one
+    # person's audio to the other.
+    coalescers = {CHANNEL_MIC: TurnCoalescer(mic_det.cfg),
+                  CHANNEL_SPEAKER: TurnCoalescer(mic_det.cfg)}
+    session.coalescers = coalescers
     mic_res = Resampler(mic_rate)
     spk_res = Resampler(loop_rate) if spk_rec is not None else None
 
@@ -1288,6 +1408,22 @@ def run_live(args):
             # only on an empty queue meant the meter never drew while audio
             # was flowing -- which is exactly when it matters.
             levels.tick()
+            # Release any turn whose merge window has elapsed. This is what
+            # keeps the coalescer's added latency bounded: without it a turn
+            # waits for the NEXT turn, so the last sentence of a session (and
+            # the only sentence of a short one) would not be sent at all.
+            for ready in coalescers[CHANNEL_MIC].poll():
+                session.sequence += 1
+                try:
+                    transport.send_turn(CHANNEL_MIC, ready, session.sequence)
+                    session.turns_sent += 1
+                except Exception as e:
+                    send_error = e
+                    print(f"\nSend failed: {e}", file=sys.stderr)
+                    stop.set()
+                    break
+            if send_error:
+                break
             try:
                 channel, pcm = out_q.get(timeout=0.2)
             except queue.Empty:
@@ -1302,14 +1438,21 @@ def run_live(args):
                 spk_rec.write(pcm)
                 turns = spk_det.feed(pcm)
             for turn in turns:
-                session.sequence += 1
-                try:
-                    transport.send_turn(channel, turn, session.sequence)
-                    session.turns_sent += 1
-                except Exception as e:
-                    send_error = e
-                    print(f"\nSend failed: {e}", file=sys.stderr)
-                    stop.set()
+                # Coalesce before sending: a 0.4s fragment is a Whisper
+                # hallucination generator ("Thank you.") and is far too short
+                # for ECAPA to name anybody. Coalescer.submit returns only the
+                # turns that are actually ready; the rest stay held.
+                for ready in coalescers[channel].submit(turn):
+                    session.sequence += 1
+                    try:
+                        transport.send_turn(channel, ready, session.sequence)
+                        session.turns_sent += 1
+                    except Exception as e:
+                        send_error = e
+                        print(f"\nSend failed: {e}", file=sys.stderr)
+                        stop.set()
+                        break
+                if send_error:
                     break
     except KeyboardInterrupt:
         print("\nStopping ...")
@@ -1339,14 +1482,18 @@ def run_live(args):
             tail = det.flush()
             if tail is not None:
                 rec.write(tail.pcm)
+            rec.write(res.flush())
+            # Release whatever the coalescer is still holding, so the last
+            # sentence of the session is not lost.
+            for ready in coalescers[channel].flush():
+                rec.write(ready.pcm)
                 session.sequence += 1
                 if transport is not None and not send_error:
                     try:
-                        transport.send_turn(channel, tail, session.sequence)
+                        transport.send_turn(channel, ready, session.sequence)
                         session.turns_sent += 1
                     except Exception:
                         pass
-            rec.write(res.flush())
 
         if transport is not None:
             transport.send_flush()
@@ -1434,12 +1581,22 @@ def main(argv=None):
     if session.gaps:
         print(f"WARNING: {len(session.gaps)} turn(s) dropped under decoder lag — "
               "the sidecar records them as gaps.", file=sys.stderr)
+    if session.skip_count:
+        print(f"Filtered : {session.skip_count} turn(s) contained no speech "
+              "(sniff / noise) and were not transcribed.", file=sys.stderr)
     uncertain = sum(1 for r in result.get("results", []) if r.get("uncertain"))
     if uncertain:
         print(f"WARNING: {uncertain} segment(s) have an UNKNOWN speaker "
               "(text kept, identity withheld).", file=sys.stderr)
     if session.speaker_path.exists():
         print(f"Speaker rec: {session.speaker_path}")
+    coalescers = getattr(session, "coalescers", None) or {}
+    if coalescers:
+        merged = sum(c.merged for c in coalescers.values())
+        if merged:
+            print(f"Coalesced  : {merged} turn(s) merged across pauses "
+                  f"(gap <= {next(iter(coalescers.values())).cfg['merge_gap_sec']}s) "
+                  "before sending")
     return 0
 
 

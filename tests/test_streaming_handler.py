@@ -185,8 +185,11 @@ def test_open_turn_is_flushed_on_disconnect(patched):
 def test_turns_are_sent_with_sample_timestamps(patched):
     ws = _run([
         {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
-        # > hangover (320ms) of silence closes the first turn.
-        {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(0.6) + _pcm(0.6), 1)},
+        # A pause LONGER than streaming.merge_gap_sec (1.0s) closes the first
+        # turn and keeps the second one separate. A shorter pause now merges --
+        # see test_short_pause_turns_are_coalesced.
+        {"type": "websocket.receive",
+         "bytes": _frame(hd.CHANNEL_MIC, _silence(2.0) + _pcm(0.6), 1)},
     ])
     msgs = [m for m in ws.sent if m.get("type") == "transcript"]
     assert len(msgs) == 2
@@ -196,6 +199,38 @@ def test_turns_are_sent_with_sample_timestamps(patched):
     assert msgs[0]["start"] == pytest.approx(1.0, abs=0.2)
     for m in msgs:
         assert m["end"] - m["start"] == pytest.approx(m["duration"], abs=0.02)
+
+
+def test_short_pause_turns_are_coalesced(patched):
+    """A 0.6s pause used to cut an utterance in two.
+
+    Both fragments are useless on their own -- Whisper hallucinates on 0.4s of
+    speech-free audio and ECAPA cannot name anyone from it -- so the server
+    holds a closed turn for up to streaming.merge_gap_sec and merges the next
+    one into it.
+    """
+    ws = _run([
+        {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.8))},
+        {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(0.6) + _pcm(0.8), 1)},
+    ])
+    msgs = [m for m in ws.sent if m.get("type") == "transcript"]
+    assert len(msgs) == 1, [m["start"] for m in msgs]
+    assert msgs[0]["start"] == pytest.approx(0.9, abs=0.2)
+
+
+def test_coalesced_turn_reaches_the_client_in_chronological_order(patched):
+    """The held turn must be released BEFORE the one that displaced it.
+
+    Releasing the coalescer's flush tail straight to the queue (skipping
+    submit) enqueued them backwards: tail at 2.08s, then the merged turn
+    starting at 0.90s.
+    """
+    ws = _run([
+        {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
+        {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(2.0) + _pcm(0.6), 1)},
+    ])
+    starts = [m["start"] for m in ws.sent if m.get("type") == "transcript"]
+    assert starts == sorted(starts), starts
 
 
 def test_pre_segmented_is_passed_to_backend(patched):
@@ -231,6 +266,48 @@ def test_backend_error_does_not_break_the_stream(patched, monkeypatch):
         {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
     ])
     assert any(m.get("type") == "error" for m in ws.sent)
+
+
+def test_non_speech_turn_never_reaches_the_decoder(patched, monkeypatch):
+    """The gate's whole point: no decode, no hallucinated sentence.
+
+    Whisper answers a sniff with a fluent "Thank you." and no signal in its
+    output reveals it -- measured against the real backend, no_speech_prob is
+    0.0000 for noise and for speech alike, and silence decodes at avg_logprob
+    -0.29 vs real speech at -0.30 (see transcribers/whisper.py). So the Silero
+    gate in front of the decoder is the only thing standing between a chair
+    creak and a line in the transcript.
+    """
+    from asr_mcp.core import model_state
+
+    # the handler only builds a probe when a VAD session exists
+    monkeypatch.setattr(model_state.state, "vad_session", object(),
+                        raising=False)
+    monkeypatch.setattr(hd, "probe_speech", lambda *a, **k: (0.04, 0.0),
+                        raising=False)
+
+    ws = _run([
+        {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
+    ])
+    assert patched == [], "the decoder was called for a non-speech turn"
+    kinds = [m["type"] for m in ws.sent]
+    assert "transcript" not in kinds
+    empty = [m for m in ws.sent if m["type"] == "empty"]
+    assert empty and empty[0]["skipped"] == "no_speech_low_prob"
+    stats = [m for m in ws.sent if m["type"] == "stats"][0]
+    assert stats["non_speech_turns"] == 1
+
+
+def test_a_missing_vad_session_lets_the_turn_through(patched, monkeypatch):
+    """Fail-open: with models unloaded there is no gate, and a real speaker
+    must still be transcribed rather than silently dropped."""
+    from asr_mcp.core import model_state
+
+    monkeypatch.setattr(model_state.state, "vad_session", None, raising=False)
+    _run([
+        {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
+    ])
+    assert len(patched) == 1
 
 
 @pytest.mark.skipif(

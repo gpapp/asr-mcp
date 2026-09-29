@@ -44,6 +44,27 @@ STYLE_ANCHOR = (
 # Compute types that need GPU fp16 arithmetic (CT2 rejects them on CPU).
 _GPU_ONLY_COMPUTE = {"int8_float16", "int4_float16"}
 
+# There is deliberately NO speech filter in this backend. The obvious candidate
+# is the segment's ``no_speech_prob``, and it was implemented and then removed
+# because it does not work in this stack: measured in-container against the real
+# backend (faster-whisper 1.2.1 / CTranslate2 4.8.2 / large-v3-turbo),
+# ``no_speech_prob`` came back 0.0000 for EVERY segment -- real speech, white
+# noise at -40 and -30 dBFS, and digital silence -- at beam sizes 1 and 5.
+# faster-whisper's own ``no_speech_threshold`` (default 0.6) is applied to the
+# same value and is equally inert, so its built-in filter does not help either.
+# ``avg_logprob`` is not a substitute: digital silence decodes to "Thank you."
+# at avg_logprob -0.29, as healthy as real speech at -0.30. The only signal that
+# separated the two in that measurement was ``compression_ratio`` (speech
+# 0.89-1.00 vs noise 0.27-0.56), and openai-whisper only uses it as a repetition
+# guard (default 2.4), never as a speech test.
+#
+# So the single effective non-speech filter is upstream of the decoder:
+#   * live turns -- ``streaming/handler.py`` -> ``turn_has_speech()`` (Silero,
+#     verified: speech mean 0.46-0.56, noise/hiss/sniff/silence 0.04-0.23);
+#   * file transcription -- faster-whisper's own ``vad_filter=True``, which runs
+#     Silero over the file and keeps only speech chunks.
+# Re-check ``no_speech_prob`` with a real backend before trusting it again.
+
 
 def _device_index(cuda_device) -> int:
     """Ordinal from a 'cuda:N' / 'N' style setting (default 0)."""
@@ -363,6 +384,12 @@ class WhisperBackend(ASRBackend):
             end = float(seg.end or start)
             cursor = end
             if txt:
+                # No non-speech check here -- see the module comment. Whisper's
+                # documented failure mode on non-speech is to answer with a
+                # fluent, confident sentence ("Thank you." for half a second of
+                # room noise), and neither avg_logprob nor no_speech_prob
+                # exposes it in this stack. Non-speech is filtered upstream, by
+                # the caller's speech gate or by vad_filter.
                 conf = None
                 alp = getattr(seg, "avg_logprob", None)
                 if alp is not None:
@@ -405,7 +432,11 @@ class WhisperBackend(ASRBackend):
             float(getattr(info, "duration_after_vad", audio_duration) or 0.0),
             audio_duration, len(segments_out), self._device, self._compute_type,
         )
-        return {"text": text, "segments": segments_out, "errors": errors}
+        return {
+            "text": text,
+            "segments": segments_out,
+            "errors": errors,
+        }
 
     @staticmethod
     def _error_result(message: str, audio_duration: float, start_time: float) -> dict:

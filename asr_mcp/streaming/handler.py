@@ -39,8 +39,13 @@ from typing import Optional
 from fastapi import WebSocket, WebSocketDisconnect
 
 from asr_mcp.streaming import protocol as proto
-from asr_mcp.streaming.attribution import CHANNEL_MIC, attribute_live_turn
-from asr_mcp.streaming.turn_detector import Turn, TurnDetector, config as detector_config
+from asr_mcp.streaming.attribution import (
+    CHANNEL_MIC, attribute_live_turn, unattributed as _unknown_attribution,
+)
+from asr_mcp.streaming.speech_gate import probe_speech, turn_has_speech
+from asr_mcp.streaming.turn_detector import (
+    Turn, TurnCoalescer, TurnDetector, config as detector_config,
+)
 
 logger = logging.getLogger("asr_mcp.streaming.handler")
 
@@ -171,6 +176,35 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
             voiceprints = None
 
     detector = TurnDetector()
+    # Speech gate. Silero is already loaded for the file pipeline, so this
+    # costs nothing extra; if the model is not there the gate fails OPEN
+    # (turn_has_speech returns True for probe=None) rather than silently
+    # dropping real speech.
+    def _speech_probe(turn):
+        # Resolve the session at CALL time, never pin it: the idle-TTL monitor
+        # can unload the VAD between two turns (lesson 26).
+        import numpy as np
+
+        session = state.vad_session
+        if session is None:
+            return 0.0, 0.0
+        audio = turn.audio
+        if isinstance(audio, (bytes, bytearray, memoryview)):
+            audio = np.frombuffer(audio, dtype=np.int16)
+        return probe_speech(
+            audio, session,
+            threshold=float(cfg.get("vad_frame_threshold", 0.5)),
+        )
+
+    speech_probe = _speech_probe if state.vad_session is not None else None
+    if speech_probe is None:
+        logger.info("No VAD session loaded: live turns are transcribed "
+                    "unfiltered (set streaming.min_speech_prob to enable)")
+    # Only the legacy raw-PCM path endpointing happens here; turn frames
+    # arrive already cut (and already coalesced) from the client, so they must
+    # NOT go through this -- a second coalescer would re-merge the client's
+    # turns and the two would never agree on a boundary.
+    coalescer = TurnCoalescer()
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
     stats = {
@@ -182,6 +216,7 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
         "raw_frames": 0,
         "queued_turns": 0,
         "dropped_turns": 0,
+        "non_speech_turns": 0,
     }
     # Highest audio sample seen, whichever path produced it.  Reported to the
     # client so it knows how much of its recording the server actually covered.
@@ -244,6 +279,26 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
 
     def _transcribe_turn(turn: Turn, channel: int) -> dict:
         state.touch()
+        # Speech gate FIRST. The endpointing detector cuts on energy, so a
+        # sniff or a chair creak arrives here as a perfectly good 0.5s turn and
+        # Whisper answers it with its standard hallucination ("Thank you.").
+        # Silero already knows the difference and costs microseconds here.
+        ok, score, reason = turn_has_speech(turn, probe=speech_probe,
+                                            cfg=detector_config())
+        if not ok:
+            stats["non_speech_turns"] += 1
+            logger.debug("Skipped non-speech turn %.2f-%.2fs (prob=%.2f)",
+                         turn.start_sec, turn.end_sec, score)
+            return {
+                "type": "empty",
+                "skipped": reason,
+                "speech_score": round(score, 3),
+                "start": round(turn.start_sec, 2),
+                "end": round(turn.end_sec, 2),
+                "duration": round(turn.duration_sec, 2),
+                "channel": int(channel),
+                **_unknown_attribution("live_no_speech"),
+            }
         result = transcribe_audio_sync(
             audio=turn.audio,
             # pre_segmented: no second VAD pass, no previous-text carry-over
@@ -382,7 +437,10 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
 
             stats["mic_packets"] += 1
             for turn in detector.feed(chunk):
-                _submit(turn, CHANNEL_MIC)
+                for ready in coalescer.submit(turn):
+                    _submit(ready, CHANNEL_MIC)
+            for ready in coalescer.poll():
+                _submit(ready, CHANNEL_MIC)
 
     except WebSocketDisconnect:
         logger.info("WebSocket stream disconnected")
@@ -400,7 +458,14 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
     if not remote_flushed:
         tail = detector.flush()
         if tail is not None:
-            _submit(tail, CHANNEL_MIC)
+            # Through the coalescer, NOT straight to _submit: releasing the
+            # tail first and the held turn second enqueued them backwards
+            # (tail at 2.08s, merged turn starting at 0.90s), so the client
+            # received transcripts out of chronological order.
+            for ready in coalescer.submit(tail):
+                _submit(ready, CHANNEL_MIC)
+    for ready in coalescer.flush():
+        _submit(ready, CHANNEL_MIC)
     try:
         await asyncio.wait_for(queue.join(), timeout=30)
     except asyncio.TimeoutError:

@@ -265,7 +265,10 @@ asr-mcp/
 │   ├── sessions/
 │   │   └── manager.py         # SessionManager (SQLite-backed)
 │   ├── streaming/
-│   │   ├── turn_detector.py   # Adaptive energy turn detector (streaming)
+│   │   ├── turn_detector.py   # Adaptive energy turn detector + turn coalescer
+│   │   ├── speech_gate.py    # Silero speech gate before ASR (fail-open)
+│   │   ├── protocol.py       # Turn-frame wire format (LVT1)
+│   │   ├── attribution.py    # Channel-aware live speaker attribution
 │   │   └── handler.py         # WebSocket dual-channel handler
 │   ├── config/
 │   │   ├── settings.py        # Pydantic BaseSettings (TRANSCRIBE_ prefix)

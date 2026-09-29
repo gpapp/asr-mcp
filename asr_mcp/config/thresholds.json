@@ -83,6 +83,12 @@
     "post_roll_ms": 200,
     "min_voiced_ms": 120,
     "max_turn_sec": 30.0,
+    "merge_gap_sec": 1.0,
+    "max_merge_sec": 15.0,
+    "speech_gate_enabled": true,
+    "min_speech_prob": 0.3,
+    "min_speech_ratio": 0.35,
+    "vad_frame_threshold": 0.5,
     "queue_size": 32,
     "drop_on_overflow": true
   },

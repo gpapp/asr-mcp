@@ -79,8 +79,7 @@ def _unknown(reason: str, conf: float = 0.0, margin: float = 0.0,
 
 
 def _identified(name: str, conf: float, margin: float, match_dist: float,
-                source: str = "known_voiceprint"):
-    return {
+                source: str = "known_voiceprint"):    return {
         "speaker": name,
         "speaker_source": source,
         "speaker_confidence": round(float(conf), 3),
@@ -89,6 +88,16 @@ def _identified(name: str, conf: float, margin: float, match_dist: float,
         "uncertain": False,
         "attribution_reason": None,
     }
+
+
+def unattributed(reason: str) -> dict:
+    """The uncertain-identity payload, for callers that skip attribution.
+
+    Used when a turn is rejected before it is ever offered an identity (e.g.
+    the non-speech gate) and therefore never reaches the gating logic in
+    :func:`attribute_live_turn`.
+    """
+    return _unknown(reason)
 
 
 def attribute_live_turn(

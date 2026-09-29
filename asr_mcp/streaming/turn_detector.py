@@ -26,6 +26,7 @@ All timings come from the config (``thresholds.json`` -> ``streaming``).
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -51,6 +52,10 @@ _DEFAULTS = {
     "post_roll_ms": 200,
     "min_voiced_ms": 120,
     "max_turn_sec": 30.0,
+    # Turn coalescing (see TurnCoalescer): a closed turn is held briefly and
+    # merged with the next one when the pause between them is short.
+    "merge_gap_sec": 1.0,
+    "max_merge_sec": 15.0,
 }
 
 
@@ -343,4 +348,154 @@ class TurnDetector:
             "dropped_turns": self._dropped_turns,
             "noise_floor": round(self._noise_floor, 5),
             "in_speech": self._in_speech,
+        }
+
+
+def _rebuild_turn(turn, start_sample: int, end_sample: int, audio, peak_rms: float):
+    """Build a merged turn of the same class as ``turn``.
+
+    The server's :class:`Turn` carries a float32 numpy array in ``audio`` while
+    the client's mirror carries raw ``bytes`` in ``pcm``; the two constructors
+    are otherwise identical, so try the server shape first and fall back.  A
+    single implementation therefore serves both endpoints and the two can never
+    disagree about what was merged.
+    """
+    try:
+        return type(turn)(
+            start_sample=start_sample, end_sample=end_sample,
+            audio=audio, reason="merged", peak_rms=peak_rms,
+        )
+    except TypeError:
+        return type(turn)(
+            start_sample=start_sample, end_sample=end_sample,
+            pcm=audio, reason="merged", peak_rms=peak_rms,
+        )
+
+
+def _turn_payload(turn):
+    """The turn's audio, whatever the concrete Turn class calls it.
+
+    Never use ``a or b`` on these: a numpy array has no single truth value.
+    """
+    payload = getattr(turn, "audio", None)
+    if payload is None:
+        payload = getattr(turn, "pcm", None)
+    if payload is None:
+        return b""
+    return payload
+
+
+class TurnCoalescer:
+    """Hold a closed turn briefly and merge it into the next one.
+
+    ``hangover_ms`` is deliberately short (320 ms) so a live turn closes
+    promptly, but natural speech contains 300-800 ms pauses in the middle of a
+    sentence.  Every one of those closes a turn, and a 0.4 s fragment is
+    useless twice over:
+
+    * Whisper *hallucinates* on it -- a 0.5 s sniff reliably decodes to
+      "Thank you." with ``avg_logprob`` high enough to look confident;
+    * ECAPA cannot identify anyone from 0.4 s of audio, so the fragment can
+      only ever come back ``UNKNOWN``.
+
+    So a closed turn is not submitted immediately.  It is held as *pending* and
+    merged with the next turn on the same channel when the pause between them
+    is shorter than ``merge_gap_sec`` and the merged span stays under
+    ``max_merge_sec``.  Otherwise the pending turn is released.
+
+    The latency this adds is bounded by ``merge_gap_sec`` and only applies to
+    pauses shorter than that.  A real conversational pause is longer, so it
+    still submits at once and the live feel is unchanged -- and the ASR queue
+    is the bottleneck anyway (~3 s per turn on this hardware), not this delay.
+    """
+
+    def __init__(self, cfg: Optional[dict] = None, sample_rate: int = SAMPLE_RATE,
+                 clock=None):
+        self.cfg = dict(_DEFAULTS)
+        self.cfg.update(cfg or {})
+        self.sample_rate = sample_rate
+        self._clock = clock or time.monotonic
+        self._pending = None
+        self._due = None
+        self._merged = 0
+        self._released = 0
+
+    @property
+    def pending_sec(self) -> float:
+        return float(getattr(self._pending, "duration_sec", 0.0) or 0.0)
+
+    def _defer(self, now) -> None:
+        self._due = (now if now is not None else self._clock()) + float(
+            self.cfg["merge_gap_sec"])
+
+    def submit(self, turn, now=None) -> List[Turn]:
+        """Offer a completed turn; return the turns that are ready to send."""
+        if turn is None:
+            return []
+        pending = self._pending
+        if pending is None:
+            self._pending = turn
+            self._defer(now)
+            return []
+
+        gap = int(turn.start_sample) - int(pending.end_sample)
+        span = (int(turn.end_sample) - int(pending.start_sample)) / self.sample_rate
+
+        if (0 <= gap <= float(self.cfg["merge_gap_sec"]) * self.sample_rate
+                and span <= float(self.cfg["max_merge_sec"])):
+            head = _turn_payload(pending)
+            tail = _turn_payload(turn)
+            if isinstance(head, np.ndarray) or isinstance(tail, np.ndarray):
+                audio = np.concatenate([
+                    head if isinstance(head, np.ndarray) else np.frombuffer(
+                        head, dtype=np.int16).astype(np.float32) / 32768.0,
+                    tail if isinstance(tail, np.ndarray) else np.frombuffer(
+                        tail, dtype=np.int16).astype(np.float32) / 32768.0,
+                ])
+            else:
+                audio = head + tail
+            self._pending = _rebuild_turn(
+                pending, int(pending.start_sample), int(turn.end_sample), audio,
+                max(float(getattr(pending, "peak_rms", 0.0) or 0.0),
+                    float(getattr(turn, "peak_rms", 0.0) or 0.0)),
+            )
+            self._merged += 1
+            self._defer(now)
+            return []
+
+        self._released += 1
+        self._pending = turn
+        self._defer(now)
+        return [pending]
+
+    def poll(self, now=None) -> List[Turn]:
+        """Release the held turn once the merge window has elapsed.
+
+        Without this a turn is only ever released by the *next* turn or by
+        end-of-stream, so a session that ends after one sentence would send
+        nothing until shutdown. The deadline is what makes the extra latency
+        bounded by ``merge_gap_sec`` rather than by the pause length.
+        """
+        if self._pending is None or self._due is None:
+            return []
+        if (now if now is not None else self._clock()) < self._due:
+            return []
+        pending, self._pending, self._due = self._pending, None, None
+        self._released += 1
+        return [pending]
+
+    def flush(self) -> List[Turn]:
+        """Release the held turn (end of stream / shutdown)."""
+        pending, self._pending = self._pending, None
+        self._due = None
+        if pending is None:
+            return []
+        self._released += 1
+        return [pending]
+
+    def stats(self) -> dict:
+        return {
+            "merged": self._merged,
+            "released": self._released,
+            "pending": self.pending_sec > 0,
         }

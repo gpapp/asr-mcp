@@ -131,3 +131,26 @@ live attribution is used and the header line says so.
 `Write JSON` is not needed for live mode; the `.asr.json` sidecar is always
 written. Set `TRANSCRIBE_LIVE_LOCAL_LABEL` on the server to change the
 microphone speaker label.
+
+#### What gets sent to the server
+
+The client cuts turns with an energy detector, which cannot tell a breath from
+a syllable — a sniff, a keyboard click or a chair creak is a perfectly good
+turn as far as it knows. Two filters keep that out of the transcript:
+
+1. **Turn coalescing.** A closed turn is held for up to
+   `streaming.merge_gap_sec` (1 s on the server) and merged with the next one on
+   the same channel, so a 300–800 ms pause in the middle of a sentence no longer
+   splits it into two. Real conversational pauses are longer and still submit
+   immediately; the added latency is bounded by the merge window. The client
+   prints how many turns were merged when the session ends.
+2. **A server-side speech gate.** Silero VAD runs on the turn before the
+   decoder. A turn with no speech is reported as skipped, never transcribed, and
+   the summary ends with `Filtered: N turn(s) contained no speech`. This is the
+   *only* effective non-speech filter on the live path — Whisper's own
+   `no_speech_prob` was measured at 0.0000 for speech and for noise alike in
+   this stack, so it cannot be used. See `asr_mcp/transcribers/whisper.py`.
+
+If the mic level column stays flat, capture is broken. If both levels look right
+but nothing arrives, raise `streaming.min_speech_prob` only after checking the
+`Filtered:` count — that number is the direct measure of what the gate rejected.

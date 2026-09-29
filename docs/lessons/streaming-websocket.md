@@ -52,3 +52,64 @@ Lesson 31 of `AGENTS.md`. Wire format, turn detection, bounded queue and the unc
   `SessionMiddleware` does populate `scope["session"]` for websockets — verify
   in its source before changing `_websocket_user`, do not guess a cookie path.
 - `language` is threaded into the live `transcribe_audio_sync` call (lesson 28).
+
+### Turn coalescing and the pre-ASR speech gate
+
+Both exist because a live turn arrives too small to be useful, and the failure
+was visible as `UNKNOWN: Thank you` in the transcript.
+
+- **Never concatenate audio with `a or b`** when one side is a numpy array —
+  it raises `ValueError: truth value of an array ... is ambiguous`. This bit
+  `TurnCoalescer._turn_payload` on the first run.
+- **Coalesce, don't just lengthen the hangover.** Natural speech has 300–800 ms
+  pauses mid-sentence and `hangover_ms` is 320 ms, so *every* one of them cut a
+  turn. Raising the hangover trades latency for the same result; holding a
+  closed turn for `streaming.merge_gap_sec` (1.0 s) and merging the next one
+  into it costs the same latency only for pauses shorter than that, and leaves
+  real conversational pauses submitting immediately.
+- **The coalescer needs a deadline (`poll()`), not just a next-turn trigger.**
+  Releasing only on the *next* turn means a session that ends after one sentence
+  sends nothing until shutdown. `poll()` is called every main-loop iteration
+  (client) and every received packet (server) and releases the held turn once
+  `merge_gap_sec` of wall time has passed.
+- **Release order is observable.** The server's `detector.flush()` tail must go
+  through `coalescer.submit()`, not straight to `_submit()` — releasing the tail
+  first and the held turn second enqueued them backwards (2.08 s before 0.90 s)
+  and the client printed transcripts out of order.
+- **One coalescer per channel.** Merging across channels would hand one person's
+  audio to the other. Turn frames from the client are already coalesced and must
+  not pass through a second server-side coalescer.
+- **The gate is fail-open.** `turn_has_speech()` returns "transcribe" when the
+  VAD is missing, disabled or throws. Refusing to transcribe real speech is a
+  worse failure than transcribing a noise fragment.
+- **`probe_speech` is not `run_vad_onnx`.** The file path's VAD applies a 250 ms
+  minimum-duration filter, which discards exactly the 0.3–1 s replies that matter
+  live. The gate scores every 512-sample frame and reports `(mean_prob,
+  speech_ratio)` so either can gate.
+- **Resolve `state.vad_session` at call time, never pin it** — the idle-TTL
+  monitor unloads models between turns (lesson 26).
+- **Whisper's `no_speech_prob` does not work — do not build a gate on it.** It
+  was implemented (`is_hallucination`, `whisper.no_speech_max` = 0.6) and then
+  removed after measuring the real backend in-container (faster-whisper 1.2.1 /
+  CTranslate2 4.8.2 / large-v3-turbo): `no_speech_prob` came back **0.0000 for
+  every segment** — real speech, white noise at −40 and −30 dBFS, and digital
+  silence — at beam sizes 1 and 5. faster-whisper's own `no_speech_threshold`
+  (default 0.6) is applied to that same value, so its built-in filter is inert
+  too. `avg_logprob` is not a substitute: silence decodes to "Thank you." at
+  −0.29, real speech at −0.30. Only `compression_ratio` separated them (speech
+  0.89–1.00 vs noise 0.27–0.56) and openai-whisper only uses it as a repetition
+  guard (default 2.4), never as a speech test. Dead configuration that reads as
+  protection is worse than none: the Silero gate is the single filter, and the
+  file path relies on faster-whisper's own Silero `vad_filter`.
+- Measured with the shipped thresholds on real audio: speech mean 0.46–0.57
+  (pass), white noise 0.08–0.23, 3 kHz hiss 0.14, sniff 0.04, silence 0.04
+  (all reject) — a wide margin around `min_speech_prob` 0.30.
+- End-to-end through the real handler with the real Whisper and the real
+  Silero (7 turn frames: silence, sniff, speech, silence, speech, hiss,
+  silence): both speech turns decoded correctly and were labelled `You`, all
+  five non-speech turns were skipped with zero decodes (`non_speech_turns: 5`,
+  `dropped_turns: 0`), and no "Thank you." appeared. That run is the evidence
+  that the gate is the filter — the unit tests alone could not have shown it.
+- A rejected turn is reported to the client as `{"type": "empty", "skipped":
+  ...}` so the sidecar can distinguish "discarded as noise" from "transcribed to
+  nothing". Otherwise the two are indistinguishable in the output.

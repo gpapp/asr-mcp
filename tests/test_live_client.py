@@ -21,13 +21,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLIENT_DIR = REPO_ROOT / "asr-client"
 
+from conftest import client_missing as client_missing  # noqa: F401  (fixture)
+
 # The server image excludes asr-client/ (.dockerignore) — the client ships as a
 # standalone zip, not as part of the image. These tests compare the client
 # against the server, so they only make sense where both are present.
-pytestmark = pytest.mark.skipif(
-    not (CLIENT_DIR / "live_client.py").is_file(),
-    reason="asr-client/live_client.py not present (excluded from the server image)",
-)
+pytestmark = client_missing
 
 
 def _load_live_client():
@@ -38,11 +37,6 @@ def _load_live_client():
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
-
-
-@pytest.fixture(scope="module")
-def live():
-    return _load_live_client()
 
 
 # ── Protocol must match the server byte for byte ───────────────────────────
@@ -1141,3 +1135,42 @@ def test_live_attribution_log_comes_after_the_gates(caplog, live):
         f"{out.get('attribution_reason')!r} -- the gate was never reached")
     assert "Live match" not in caplog.text, (
         "a rejected match must not log 'Live match': " + caplog.text)
+
+
+# ── The server's speech gate is visible to the client ──────────────────────
+
+def test_skipped_turn_is_counted_not_printed(tmp_path, monkeypatch, live):
+    """A turn the server rejected must be visible in the sidecar, not as text.
+
+    Without this the client shows nothing at all for a rejected turn, and
+    "the server discarded 31 of my turns" is indistinguishable from "the
+    server transcribed 31 turns that were silence".
+    """
+    session = _session(tmp_path, monkeypatch, live)
+    session.on_message({"type": "empty", "skipped": "no_speech_low_prob",
+                        "speech_score": 0.04, "start": 3.0, "end": 3.5,
+                        "channel": 1})
+    assert session.skip_count == 1
+    assert session.skipped[0]["reason"] == "no_speech_low_prob"
+    assert session.transcript_count == 0
+    assert session.items == []
+
+    sidecar = session.write_sidecar({})
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["turns_skipped_non_speech"] == 1
+    assert data["skipped"][0]["start"] == 3.0
+
+
+def test_plain_empty_turn_is_not_counted_as_skipped(tmp_path, monkeypatch, live):
+    session = _session(tmp_path, monkeypatch, live)
+    session.on_message({"type": "empty", "start": 1.0, "end": 1.4})
+    assert session.skip_count == 0 and session.skipped == []
+
+
+def test_session_exposes_its_coalescers(tmp_path, monkeypatch, live):
+    """run_live() hangs them on the session so the summary can report merges."""
+    session = _session(tmp_path, monkeypatch, live)
+    assert session.coalescers == {}
+    session.coalescers = {0: live.TurnCoalescer()}
+    session.coalescers[0].merged = 3
+    assert sum(c.merged for c in session.coalescers.values()) == 3

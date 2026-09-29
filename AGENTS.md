@@ -184,7 +184,10 @@ asr-mcp/
 │   ├── sessions/
 │   │   └── manager.py         # SessionManager (SQLite-backed)
 │   ├── streaming/
-│   │   ├── turn_detector.py   # Adaptive energy turn detector (lesson 31)
+│   │   ├── turn_detector.py   # Adaptive energy turn detector + turn coalescer (lesson 31)
+│   │   ├── speech_gate.py    # Silero speech gate before ASR (fail-open)
+│   │   ├── protocol.py       # Turn-frame wire format (LVT1)
+│   │   ├── attribution.py    # Channel-aware live speaker attribution
 │   │   └── handler.py         # WebSocket dual-channel real-time transcription
 │   ├── config/
 │   │   ├── settings.py        # Pydantic BaseSettings (TRANSCRIBE_ prefix)
@@ -397,7 +400,7 @@ anything the rule covers.
 | 23 | Progress UI needs per-window time interpolation | [frontend](docs/lessons/frontend-and-client.md) |
 | 24 | Paragraph breaks at pauses snap to a sentence end within 40 chars | [frontend](docs/lessons/frontend-and-client.md) |
 | 26 | Never pin `state.*_session`; resolve it live at call time | [frontend](docs/lessons/frontend-and-client.md) |
-| 31 | Streaming: one speech state per turn, validate `len(data) >= 8`, bounded queue, flush on disconnect | [streaming](docs/lessons/streaming-websocket.md) |
+| 31 | Streaming: one speech state per turn, validate `len(data) >= 8`, bounded queue, coalesce short turns, gate non-speech, flush on disconnect | [streaming](docs/lessons/streaming-websocket.md) |
 | 34 | Live: the mic channel IS the identity evidence — never voiceprint-match it; WS auth precedes `accept()` | [live design](docs/lessons/live-client-design.md) |
 
 ### Reference documents

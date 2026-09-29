@@ -59,3 +59,35 @@ def segment_ops():
 @pytest.fixture
 def turn_detector():
     return load_module("_t_turn_detector", "asr_mcp/streaming/turn_detector.py")
+
+
+CLIENT_DIR = REPO_ROOT / "asr-client"
+CLIENT_MISSING_REASON = "asr-client/live_client.py not present (excluded from the server image)"
+
+# The server image excludes asr-client/ (.dockerignore) — the client ships as a
+# standalone zip. Tests that compare the client against the server can only run
+# where both are present.
+client_missing = pytest.mark.skipif(
+    not (CLIENT_DIR / "live_client.py").is_file(),
+    reason=CLIENT_MISSING_REASON,
+)
+
+
+@pytest.fixture(scope="module")
+def live():
+    """live_client.py imported by path (it lives outside the asr_mcp package).
+
+    Skips rather than errors when the file is absent, so a test module can mix
+    server-side and client-side cases without a module-wide skip mark that would
+    also silence the server tests in the image.
+    """
+    import importlib.util
+
+    path = CLIENT_DIR / "live_client.py"
+    if not path.is_file():
+        pytest.skip(CLIENT_MISSING_REASON)
+    spec = importlib.util.spec_from_file_location("live_client_undertest", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
