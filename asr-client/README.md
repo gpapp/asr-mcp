@@ -88,3 +88,39 @@ established; the text was kept). Re-run if you need clean labels.
   works).
 - `.env`, `.venv/`, and `__pycache__/` are ignored by git and are
   never included in the distributed zip.
+
+## Live mode (`transcribe.bat live`)
+
+Real-time transcription of a meeting. Requires `sounddevice`, `numpy`, `soxr`
+and `websockets` (installed automatically from `requirements-live.txt`).
+
+```
+transcribe.bat live
+transcribe.bat live --language hu --outdir C:\meetings
+transcribe.bat live --devices
+```
+
+It captures the **default microphone** and the **default sound device**
+(WASAPI loopback) as two channels, cuts turns locally, and streams them to
+`WS /asr/ws/stream`. Microphone turns are labelled `You`
+(`speaker_source: "input_device"`); loopback turns are matched against your
+registered voiceprints, and stay `UNKNOWN` when the match is weak or ambiguous —
+the text is always kept, only the name is withheld.
+
+Press Ctrl-C to stop. On shutdown the client writes:
+
+| File | Contents |
+|---|---|
+| `<timestamp>.wav` | microphone channel, 16 kHz mono |
+| `<timestamp>-speaker.wav` | loopback channel |
+| `<timestamp>.txt` | final transcript, `[HH:MM:SS] <speaker> (NN%):` format |
+| `<timestamp>.asr.json` | every ASR item, gaps, server stats, `asr_source` |
+
+The final `.txt` re-runs diarization on the recording and re-attributes the
+**cached** ASR items — it never re-transcribes, so the text is exactly what you
+watched appear live. If re-diarization fails (or `--no-rediag` is passed), the
+live attribution is used and the header line says so.
+
+`Write JSON` is not needed for live mode; the `.asr.json` sidecar is always
+written. Set `TRANSCRIBE_LIVE_LOCAL_LABEL` on the server to change the
+microphone speaker label.

@@ -84,5 +84,13 @@
     "queue_size": 8,
     "drop_on_overflow": true
   },
-  "debug": false
+  "debug": false,
+  "live_attribution": {
+    "_comment": "Live (WebSocket) turn attribution. Live turns are 1-3s, so the bar is higher than the offline path; a mic turn is labelled from its input device and never embedding-matched against its own user's voiceprint.",
+    "min_match_confidence": 0.6,
+    "min_match_margin": 0.05,
+    "min_turn_sec": 0.5,
+    "max_turn_sec": 30.0,
+    "match_voiceprints": true
+  }
 }

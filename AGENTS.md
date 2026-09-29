@@ -248,8 +248,10 @@ asr-mcp/
 | `/api/asr/activity/stream` | GET | Session/API key | SSE push of job start/finish (snapshot on connect + keep-alive pings; replaces polling `/active`) |
 | `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
 | `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
-| `/api/asr/ws/stream` | WS | No | Real-time streaming transcription |
+| `/api/asr/ws/stream` | WS | Session/API key | Real-time streaming transcription (auth: session, `X-API-Key` header or `?token=`; closes 1008 *before* `accept()`) |
 | `/api/asr/stream` | POST | No | Always 501 — a stub that points at the WebSocket endpoint |
+| `/api/asr/attribution` | POST | Session/API key | Re-attribute cached ASR items to speakers from a server-side `wav_path` — **no ASR** (`items` is a list of `{start, end, text, confidence}`) |
+| `/api/asr/attribution/upload` | POST | Session/API key | Same, for a client-recorded upload: `file` + `items` (JSON array form field) |
 | `/api/speaker/register` | POST | API key | Register voiceprint |
 | `/api/speaker/register/upload` | POST | API key | Register voiceprint from upload |
 | `/api/speaker/identify` | POST | API key | Identify speaker from audio |
@@ -396,6 +398,7 @@ anything the rule covers.
 | 24 | Paragraph breaks at pauses snap to a sentence end within 40 chars | [frontend](docs/lessons/frontend-and-client.md) |
 | 26 | Never pin `state.*_session`; resolve it live at call time | [frontend](docs/lessons/frontend-and-client.md) |
 | 31 | Streaming: one speech state per turn, validate `len(data) >= 8`, bounded queue, flush on disconnect | [streaming](docs/lessons/streaming-websocket.md) |
+| 34 | Live: the mic channel IS the identity evidence — never voiceprint-match it; WS auth precedes `accept()` | [live design](docs/lessons/live-client-design.md) |
 
 ### Reference documents
 - [docs/uncertain-speakers.md](docs/uncertain-speakers.md) — user-facing description of the
@@ -403,3 +406,6 @@ anything the rule covers.
   known limitation on short recordings.
 - [docs/lessons/](docs/lessons/) — one file per subsystem with the full evidence behind
   each rule above.
+- [docs/lessons/live-client-design.md](docs/lessons/live-client-design.md) — why the
+  live client's final text comes from the live ASR cache rather than a re-transcription,
+  the two rejected alternatives, and the trigger for revisiting the decision.

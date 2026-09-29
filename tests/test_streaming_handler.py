@@ -6,6 +6,7 @@ monkeypatched out, so no GPU/model download is required.
 """
 
 import asyncio
+import importlib.util
 import struct
 
 import numpy as np
@@ -14,6 +15,7 @@ import pytest
 pytest.importorskip("fastapi", reason="handler needs the web dependencies")
 pytest.importorskip("onnxruntime", reason="handler touches ModelState")
 
+from asr_mcp.streaming import attribution  # noqa: E402
 from asr_mcp.streaming import handler as hd  # noqa: E402
 
 SR = 16000
@@ -31,6 +33,13 @@ def _silence(seconds):
 
 def _frame(channel, payload, sequence=0):
     return struct.pack("<II", channel, sequence) + payload
+
+
+def _turn_frame(channel, payload, start_sample=0):
+    """A client-framed turn (magic-prefixed), as live_client.py sends it."""
+    from asr_mcp.streaming import protocol as proto
+
+    return proto.pack_turn(channel, start_sample, payload)
 
 
 class FakeWebSocket:
@@ -114,16 +123,37 @@ def test_speaker_channel_never_opens_a_turn(patched):
 # --- policy ----------------------------------------------------------------
 
 
-def test_live_turn_has_no_speaker(patched):
+def test_mic_turn_is_labelled_from_the_channel_not_a_voiceprint(patched):
+    """Lesson 34: the mic channel IS the identity evidence.
+
+    The default input device is the local user, who is in their own
+    voiceprints; embedding-matching it would return a confident wrong answer.
+    """
     ws = _run([
         {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
     ])
     msg = next(m for m in ws.sent if m.get("type") == "transcript")
+    assert msg["speaker"] == attribution.LOCAL_SPEAKER_LABEL
+    assert msg["speaker_source"] == "input_device"
+    assert msg["uncertain"] is False
+    assert msg["text"] == "hello"
+
+
+def test_speaker_channel_turn_without_voiceprints_is_unknown(patched):
+    """No voiceprints loaded -> withhold the name, keep the text.
+
+    Uses a client-framed turn: on the legacy raw-PCM path the server only ever
+    feeds its own detector with the mic channel, so a speaker-channel turn can
+    only arrive as an explicit turn frame.
+    """
+    ws = _run([
+        {"type": "websocket.receive",
+         "bytes": _turn_frame(attribution.CHANNEL_SPEAKER, _pcm(0.6), 0)},
+    ])
+    msg = next(m for m in ws.sent if m.get("type") == "transcript")
     assert msg["speaker"] is None
-    assert msg["speaker_source"] == "unknown"
-    assert msg["speaker_confidence"] == 0.0
     assert msg["uncertain"] is True
-    assert msg["attribution_reason"] == "live_turn_unattributed"
+    assert msg["attribution_reason"] == "no_voiceprints"
     assert msg["text"] == "hello"
 
 
@@ -170,7 +200,9 @@ def test_empty_transcript_is_reported_as_empty(patched, monkeypatch):
     ws = _run([
         {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
     ])
-    assert [m["type"] for m in ws.sent] == ["empty"]
+    # The trailing stats frame is sent before close so the client can tell how
+    # much of its recording the server actually covered.
+    assert [m["type"] for m in ws.sent] == ["empty", "stats"]
 
 
 def test_backend_error_does_not_break_the_stream(patched, monkeypatch):
@@ -184,3 +216,109 @@ def test_backend_error_does_not_break_the_stream(patched, monkeypatch):
         {"type": "websocket.receive", "bytes": _frame(hd.CHANNEL_MIC, _silence(1.0) + _pcm(0.6))},
     ])
     assert any(m.get("type") == "error" for m in ws.sent)
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="needs torch (server-only path)")
+def test_live_embedding_hooks_call_the_real_functions_correctly(patched, monkeypatch):
+    """Regression: embed_fn must pass sample_rate positionally.
+
+    extract_embedding(waveform, sample_rate) takes sample_rate as a required
+    positional argument. Omitting it raises TypeError, which attribute_live_turn
+    catches and reports as "live_match_failed" — silently downgrading every
+    speaker turn to UNKNOWN instead of naming anyone.
+    """
+    from asr_mcp.core import model_state
+    from asr_mcp.speaker import embedding as emb_mod
+
+    seen = {}
+
+    def fake_extract(waveform, sample_rate, *a, **kw):
+        seen["sample_rate"] = sample_rate
+        seen["n"] = int(waveform.numel())
+        return np.zeros(192, dtype=np.float32)
+
+    def fake_pitch(waveform, sample_rate=16000):
+        seen["pitch_sr"] = sample_rate
+        return (120.0, 0.9)
+
+    def fake_energy(waveform):
+        seen["energy_n"] = int(waveform.numel())
+        return 0.2
+
+    monkeypatch.setattr(emb_mod, "extract_embedding", fake_extract)
+    monkeypatch.setattr(emb_mod, "compute_pitch", fake_pitch)
+    monkeypatch.setattr(emb_mod, "compute_energy", fake_energy)
+
+    # Force the handler down the voiceprint branch and capture the built hooks.
+    captured = {}
+    import asr_mcp.streaming.handler as handler_mod
+    real_attr = handler_mod.attribute_live_turn
+
+    def spy(turn, channel, voiceprints=None, embed_fn=None, pitch_fn=None,
+            energy_fn=None):
+        captured.update(embed_fn=embed_fn, pitch_fn=pitch_fn, energy_fn=energy_fn)
+        return real_attr(turn, channel, voiceprints=voiceprints,
+                         embed_fn=embed_fn, pitch_fn=pitch_fn, energy_fn=energy_fn)
+
+    monkeypatch.setattr(handler_mod, "attribute_live_turn", spy)
+    # _load_known_speakers is imported inside the function body, so patch it
+    # where it is defined, not on the handler module.
+    from asr_mcp.api import asr_router
+    monkeypatch.setattr(asr_router, "_load_known_speakers",
+                        lambda *a, **k: {"Someone": {"embedding": [0.0] * 192}})
+
+    ws = _run([
+        {"type": "websocket.receive",
+         "bytes": _turn_frame(attribution.CHANNEL_SPEAKER, _pcm(0.6), 0)},
+    ])
+
+    assert captured.get("embed_fn") is not None, "embedding hooks were not built"
+    turn = type("T", (), {"audio": _pcm(0.6), "duration_sec": 0.6})()
+    emb = captured["embed_fn"](turn)          # must not raise
+    assert emb.shape == (192,)
+    assert seen["sample_rate"] == 16000
+    assert seen["n"] == int(0.6 * SR)          # int16 -> float32, 1 sample per frame
+    assert captured["pitch_fn"](turn) == 120.0
+    assert captured["energy_fn"](turn) == 0.2
+    # 0.6s of audio = 9600 float samples, not 9600 bytes
+    assert seen["energy_n"] == int(0.6 * SR)
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None, reason="needs torch (server-only path)")
+def test_cpu_embedding_session_does_not_receive_gpu_arena_options():
+    """Regression: GPU_SHRINK_RUN_OPTIONS names gpu:0.
+
+    A CPU session has no such arena, so passing the options to it raises
+    INVALID_ARGUMENT "Did not find an arena based allocator ... gpu:0". That
+    message is not recognised by is_gpu_oom(), so the CPU fallback did not
+    catch it and every live embedding failed -> all turns UNKNOWN.
+    """
+    from asr_mcp.core.model_state import GPU_SHRINK_RUN_OPTIONS
+    from asr_mcp.speaker import embedding as emb
+
+    class FakeSession:
+        def __init__(self, providers):
+            self._providers = providers
+            self.calls = []
+
+        def get_providers(self):
+            return self._providers
+
+        def run(self, names, feed, run_options=None):
+            self.calls.append(run_options)
+            if run_options is not None and "gpu:0" in str(run_options):
+                raise RuntimeError(
+                    "[ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Did not find "
+                    "an arena based allocator registered for device-id "
+                    "combination in the memory arena shrink list: gpu:0")
+            return ["ok"]
+
+    cpu = FakeSession(["CPUExecutionProvider"])
+    assert emb._run_with_cpu_fallback(cpu, {}, ["out"]) == ["ok"]
+    assert cpu.calls == [None], "CPU session must not get GPU arena options"
+
+    gpu = FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert emb._run_with_cpu_fallback(gpu, {}, ["out"]) == ["ok"]
+    assert gpu.calls == [GPU_SHRINK_RUN_OPTIONS], "GPU session must still shrink"

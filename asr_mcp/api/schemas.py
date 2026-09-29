@@ -78,6 +78,43 @@ class TranscribeResponse(BaseModel):
     total_time_sec: float
 
 
+class AttributionItem(BaseModel):
+    """One already-transcribed span on the file timeline.
+
+    Supplied by the live client so the server can re-attribute text it has
+    already decoded (see ``POST /api/asr/attribution``). Only the timings and
+    the text matter — the speaker is always recomputed.
+    """
+    start: float
+    end: float
+    text: str
+    confidence: Optional[float] = None
+
+
+class AttributionRequest(BaseModel):
+    wav_path: str
+    items: list[AttributionItem]
+    num_speakers: Optional[int] = None
+    diarization_threshold: Optional[float] = None
+    vad_threshold: Optional[float] = None
+    known_speakers: Optional[dict[str, dict]] = None
+    #: Free-form provenance echoed back to the client (asr source, gaps, ...).
+    metadata: Optional[dict] = None
+
+
+class AttributionResponse(BaseModel):
+    results: list[TranscribeResult]
+    total_time_sec: float
+    audio_duration_sec: float = 0.0
+    total_speakers: int = 0
+    uncertain_segments: int = 0
+    #: Seconds spent in diarization. Transcription is not run, so this is the
+    #: whole cost of the request.
+    processing_time_sec: float = 0.0
+    metadata: Optional[dict] = None
+    error: Optional[str] = None
+
+
 class SpeakerRegisterRequest(BaseModel):
     name: str
     wav_path: Optional[str] = None

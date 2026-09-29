@@ -69,6 +69,24 @@ def _install_fake_embedding(emb_by_level):
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _restore_embedding_module():
+    """Undo the sys.modules stub after every test in this module.
+
+    Without this the fake leaks into every later test that imports
+    asr_mcp.speaker.embedding (e.g. the live handler's embedding hooks fail to
+    import and silently degrade all speaker turns to UNKNOWN).
+    """
+    before = sys.modules.get("asr_mcp.speaker.embedding")
+    yield
+    after = sys.modules.get("asr_mcp.speaker.embedding")
+    if after is not before:
+        if before is None:
+            sys.modules.pop("asr_mcp.speaker.embedding", None)
+        else:
+            sys.modules["asr_mcp.speaker.embedding"] = before
+
+
 def _run(clustering, emb_a, emb_b, *, spk_a, spk_b, level_a=1.0, level_b=2.0):
     """Run the second pass with two unknown clusters and ONE known voiceprint."""
     _install_fake_embedding({level_a: emb_a, level_b: emb_b})

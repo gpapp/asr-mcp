@@ -30,9 +30,25 @@ def _get_cpu_embedding_session() -> ort.InferenceSession:
     return _cpu_embedding_session
 
 
-def _run_with_cpu_fallback(session, feed, output_names):
+def _session_is_gpu(session) -> bool:
+    """True when the session actually has a CUDA execution provider."""
     try:
-        return session.run(output_names, feed, run_options=GPU_SHRINK_RUN_OPTIONS)
+        return any("CUDA" in str(p) for p in session.get_providers())
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _run_with_cpu_fallback(session, feed, output_names):
+    # GPU_SHRINK_RUN_OPTIONS names `gpu:0` in its memory arena shrink list. A
+    # CPU session has no such arena, so passing the options to it fails with
+    # INVALID_ARGUMENT "Did not find an arena based allocator ... gpu:0" —
+    # which is_gpu_oom() does not recognise, so it re-raised instead of
+    # falling back. Only send the options to a session that has CUDA.
+    options = GPU_SHRINK_RUN_OPTIONS if _session_is_gpu(session) else None
+    try:
+        if options is None:
+            return session.run(output_names, feed)
+        return session.run(output_names, feed, run_options=options)
     except Exception as e:
         if is_gpu_oom(e):
             logger.warning("GPU OOM on embedding, falling back to CPU: %s", e)

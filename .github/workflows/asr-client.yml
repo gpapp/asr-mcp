@@ -18,23 +18,43 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Syntax check
-        run: python3 -m py_compile asr-client/transcribe_client.py
+        run: |
+          python3 -m py_compile asr-client/transcribe_client.py
+          python3 -m py_compile asr-client/live_client.py
 
-      - name: Verify standalone (stdlib-only, no server cross-dependencies)
+      - name: Verify standalone (no server cross-dependencies)
         run: |
           python3 - <<'EOF'
           import ast
           import pathlib
+          import re
           import sys
 
           client_dir = pathlib.Path('asr-client')
           stdlib = set(sys.stdlib_module_names)
           errors = []
 
+          # The file client is stdlib-only. live_client.py is the one exception:
+          # it needs real audio I/O, so it declares third-party deps in
+          # requirements-live.txt and is checked against that file instead.
+          THIRD_PARTY = {'live_client.py'}
+
+          def declared_requirements():
+              reqs = client_dir / 'requirements-live.txt'
+              mods = set()
+              for line in reqs.read_text(encoding='utf-8').splitlines():
+                  line = line.split('#', 1)[0].strip()
+                  if not line:
+                      continue
+                  mods.add(re.split(r'[<>=!~\[ ]', line, 1)[0].strip().lower())
+              return mods
+
           for py in sorted(client_dir.glob('*.py')):
               if py.name.startswith('.'):
                   continue
               tree = ast.parse(py.read_text(encoding='utf-8'), filename=str(py))
+              local = {p.stem for p in client_dir.glob('*.py')}
+              allowed = stdlib | (declared_requirements() if py.name in THIRD_PARTY else set())
               for node in ast.walk(tree):
                   if isinstance(node, ast.Import):
                       mods = [alias.name.split('.')[0] for alias in node.names]
@@ -46,11 +66,17 @@ jobs:
                   else:
                       continue
                   for mod in mods:
-                      if mod and mod not in stdlib:
-                          errors.append(f'{py.name}:{node.lineno}: non-stdlib import {mod!r}')
+                      # Sibling client modules are shipped in the same zip.
+                      if mod and mod not in allowed and mod not in local:
+                          errors.append(f'{py.name}:{node.lineno}: import {mod!r} '
+                                        'is neither stdlib, a sibling client module, '
+                                        'nor declared in requirements-live.txt')
 
-          # No textual references to server modules/paths either
+          # No textual references to server modules/paths either. live_client.py
+          # documents which server module each mirrored constant came from, so
+          # only flag references that look like an actual import.
           skip = {'.venv', '__pycache__'}
+          import_re = re.compile(r'^\s*(?:from\s+asr_mcp|import\s+asr_mcp)', re.M)
           for path in sorted(client_dir.rglob('*')):
               if not path.is_file() or skip & set(path.parts):
                   continue
@@ -58,16 +84,20 @@ jobs:
                   text = path.read_text(encoding='utf-8')
               except (UnicodeDecodeError, OSError):
                   continue
-              for token in ('asr_mcp', 'from server', 'import server'):
+              for token in ('from server', 'import server'):
                   if token in text:
                       errors.append(f'{path.name}: contains {token!r}')
+              for match in import_re.finditer(text):
+                  errors.append(f'{path.name}:{text[:match.start()].count(chr(10)) + 1}: '
+                                f'server import {match.group(0).strip()!r}')
 
           if errors:
               print('Standalone violation(s):')
               for e in errors:
                   print(f'  {e}')
               sys.exit(1)
-          print('OK: stdlib-only, no server cross-dependencies')
+          print('OK: stdlib-only (live_client.py deps declared in requirements-live.txt), '
+                'no server cross-dependencies')
           EOF
 
       - name: Build zip
@@ -76,8 +106,10 @@ jobs:
           STAGE="dist/asr-client"
           mkdir -p "$STAGE"
           cp asr-client/transcribe_client.py \
+             asr-client/live_client.py \
              asr-client/transcribe.bat \
              asr-client/requirements.txt \
+             asr-client/requirements-live.txt \
              asr-client/README.md \
              asr-client/.env.example \
              "$STAGE/"

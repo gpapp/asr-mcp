@@ -5,12 +5,17 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter, Depends, File, Form, Query, Request, UploadFile, WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
 from asr_mcp.api.schemas import (
+    AttributionItem, AttributionRequest, AttributionResponse,
     DiarizeRequest, DiarizeResponse, DiarizeResult,
     TranscribeResponse, TranscribeResult,
 )
@@ -1525,7 +1530,269 @@ async def stream_placeholder():
     )
 
 
+async def _attribute_items_against_audio(
+    audio_path: str,
+    items: list[dict],
+    settings: Settings,
+    user: str,
+    *,
+    num_speakers: int = None,
+    diarization_threshold: float = None,
+    vad_threshold: float = None,
+    known_speakers: Optional[dict] = None,
+    metadata: Optional[dict] = None,
+) -> AttributionResponse:
+    """Diarize ``audio_path``, then map already-transcribed ``items`` onto turns.
+
+    Shared by ``POST /attribution`` (server-side path) and
+    ``POST /attribution/upload`` (the client uploads its local recording) so
+    both routes share exactly one attribution implementation.
+    """
+    import numpy as np
+
+    from asr_mcp.core.model_state import state
+    from asr_mcp.diarization.pipeline import Diarizer
+    from asr_mcp.voiceprint.utils import load_audio
+
+    t0 = time.monotonic()
+    items = [it for it in items if (it.get("text") or "").strip()]
+    if not items:
+        return AttributionResponse(
+            results=[], total_time_sec=0.0,
+            error="No text supplied — nothing to attribute",
+            metadata=metadata,
+        )
+
+    state.ensure_diarize_ready()
+    if not state.ready_for_diarize:
+        return AttributionResponse(
+            results=[], total_time_sec=0.0,
+            error="Models not loaded. CUDA GPU required.",
+            metadata=metadata,
+        )
+
+    diarizer = Diarizer(state, settings)
+    known_speakers = known_speakers or _load_known_speakers(settings, user)
+    try:
+        diarization = await diarizer.run(
+            audio_path=audio_path,
+            num_speakers=num_speakers,
+            diarization_threshold=diarization_threshold,
+            vad_threshold=vad_threshold,
+            known_speakers=known_speakers or None,
+        )
+    except Exception as e:
+        logger.exception("Diarization failed during re-attribution")
+        return AttributionResponse(
+            results=[], total_time_sec=round(time.monotonic() - t0, 2),
+            error=f"Diarization failed: {e}",
+            metadata=metadata,
+        )
+
+    audio_dur = float(diarization.get("audio_duration_sec", 0.0) or 0.0)
+    segments = diarization.get("segments", [])
+
+    # No turns: fall back to one unknown turn over the whole timeline, so the
+    # text survives with an explicit uncertain identity (uncertainty policy:
+    # suppress identity, never discard content).
+    if segments:
+        try:
+            waveform, sr = load_audio(audio_path)
+            audio_np = waveform.numpy().squeeze().astype(np.float32)
+        except Exception as e:
+            logger.warning("Could not load audio for turn refinement: %s", e)
+            audio_np = None
+        turns = _prepare_turns(
+            segments,
+            audio_duration_sec=audio_dur or (len(audio_np) / sr if audio_np is not None else 0.0),
+            audio=audio_np,
+            sample_rate=sr if audio_np is not None else 16000,
+            known_speakers=known_speakers,
+        )
+    else:
+        turns = [{"start": 0.0, "end": audio_dur, "speaker": None}]
+
+    starts = [float(t["start"]) for t in turns]
+    runs = attribute_items(items, turns, starts)
+
+    results: list[TranscribeResult] = []
+    for run in runs:
+        text = " ".join((it.get("text") or "").strip() for it in run["items"]).strip()
+        if not text:
+            continue
+        results.append(TranscribeResult(
+            start=round(float(run["items"][0]["start"]), 2),
+            end=round(float(run["items"][-1]["end"]), 2),
+            text=text,
+            speaker=run["speaker"],
+            speaker_confidence=run["confidence"],
+            speaker_source=run["source"],
+            uncertain=run["speaker"] is None,
+            attribution_reason=run["reason"],
+            audio_duration_sec=audio_dur,
+            segments=[{
+                "start": round(float(it["start"]), 3),
+                "end": round(float(it["end"]), 3),
+                "text": (it.get("text") or "").strip(),
+            } for it in run["items"]],
+        ))
+    results = _merge_consecutive_same_speaker_results(results)
+
+    n_uncertain = sum(1 for r in results if r.uncertain)
+    processing = round(time.monotonic() - t0, 2)
+    speakers = {r.speaker for r in results if r.speaker}
+    logger.info(
+        "Re-attributed %d item(s) onto %d turn(s) in %.1fs (no transcription): "
+        "%d result(s), %d speaker(s), %d uncertain",
+        len(items), len(turns), processing, len(results), len(speakers), n_uncertain,
+    )
+    return AttributionResponse(
+        results=results,
+        total_time_sec=processing,
+        audio_duration_sec=audio_dur,
+        total_speakers=len(speakers),
+        uncertain_segments=n_uncertain,
+        processing_time_sec=processing,
+        metadata=metadata,
+    )
+
+
+@router.post("/attribution", response_model=AttributionResponse)
+async def attribution_endpoint(
+    req: AttributionRequest,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    user: str = Depends(get_current_user),
+):
+    """Re-attribute ALREADY-TRANSCRIBED spans to real speakers. No ASR runs.
+
+    The live client (``asr-client/live_client.py``) transcribes in real time
+    and saves each decoded turn as an item.  At shutdown it posts those items
+    here with the recorded audio: this endpoint runs the full diarization
+    pipeline and then maps the text onto the resulting turns.
+
+    Why this is a separate endpoint rather than a flag on ``transcribe/upload``
+    — ``_transcribe_file`` calls the ASR backend exactly once on the whole file
+    and then attributes its output items post-hoc, so the text is independent
+    of the turns.  Attribution is therefore a pure function of (items, turns)
+    and needs no audio decode.  On the 52-minute podcast benchmark the split
+    was ~96s diarization against ~380s transcription, so re-attributing a
+    finished live session costs roughly a fifth of a full re-transcription.
+
+    This route takes a path **on the server**.  A client whose recording lives
+    on its own machine must use ``POST /attribution/upload`` instead.
+    """
+    return await _attribute_items_against_audio(
+        req.wav_path,
+        [{"start": i.start, "end": i.end, "text": i.text} for i in req.items],
+        settings, user,
+        num_speakers=req.num_speakers,
+        diarization_threshold=req.diarization_threshold,
+        vad_threshold=req.vad_threshold,
+        known_speakers=req.known_speakers,
+        metadata=req.metadata,
+    )
+
+
+@router.post("/attribution/upload", response_model=AttributionResponse)
+async def attribution_upload_endpoint(
+    request: Request,
+    file: UploadFile = File(...),
+    items: str = Form(..., description="JSON array of {start, end, text}"),
+    num_speakers: int = None,
+    settings: Settings = Depends(get_settings),
+    user: str = Depends(get_current_user),
+):
+    """Upload variant of ``POST /attribution`` — the recording is on the caller.
+
+    ``items`` is a JSON-encoded array of the already-transcribed spans, which
+    the live client keeps in its ``.asr.json`` sidecar.  The audio arrives as
+    the ``file`` part, is converted to 16 kHz mono WAV and diarized exactly
+    like the path-based route.  No ASR backend is loaded.
+    """
+    import shutil
+
+    try:
+        parsed = json.loads(items)
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"'items' is not valid JSON: {e}"},
+        )
+    if not isinstance(parsed, list):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "'items' must be a JSON array of {start, end, text}"},
+        )
+
+    content = await file.read()
+    if len(content) > 200 * 1024 * 1024:
+        return JSONResponse(status_code=413,
+                            content={"detail": "File too large (max 200MB)"})
+    validate_upload_filename(file.filename)
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        tmp_path = tmp_dir / (file.filename or "live.wav")
+        tmp_path.write_bytes(content)
+
+        from asr_mcp.voiceprint.utils import convert_to_wav
+        wav_path = convert_to_wav(str(tmp_path), tmp_dir)
+
+        return await _attribute_items_against_audio(
+            wav_path, parsed, settings, user,
+            num_speakers=num_speakers,
+            metadata={"uploaded_filename": file.filename, "item_count": len(parsed)},
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @router.websocket("/ws/stream")
-async def ws_stream(websocket: WebSocket):
+async def ws_stream(
+    websocket: WebSocket,
+    language: str = Query("auto", description="ISO 639-1 code (e.g. hu) or 'auto'"),
+    settings: Settings = Depends(get_settings),
+):
+    """Live transcription over a WebSocket.
+
+    Authenticated like the other endpoints: an ``X-API-Key`` header (static key
+    or a DB token) resolves the user, whose stored voiceprints are what live
+    turns are matched against.  The route previously had no auth at all, so
+    anyone who could reach the port could stream audio and read transcripts
+    back.
+    """
     from asr_mcp.streaming.handler import handle_ws_stream
-    await handle_ws_stream(websocket)
+
+    user_id = await _websocket_user(websocket, settings)
+    if user_id is None:
+        # Close before accept(): the handshake is refused, so the client gets
+        # 403 rather than a socket that immediately dies.
+        await websocket.close(code=1008, reason="Invalid or missing API key")
+        return
+    await handle_ws_stream(websocket, language=language, user_id=user_id)
+
+
+async def _websocket_user(websocket: WebSocket, settings) -> Optional[str]:
+    """Resolve the user for a WebSocket handshake, or None when refused.
+
+    WebSockets bypass the HTTP AuthMiddleware, so this is the only gate.
+    Precedence mirrors ``security.get_current_user``: session cookie (already
+    decoded into ``scope["session"]`` by SessionMiddleware, which does run for
+    websocket scopes), then a DB token, then a static key.
+    """
+    from asr_mcp.api.security import DEFAULT_USER, is_valid_api_key, lookup_db_token
+
+    session_user = (websocket.scope.get("session") or {}).get("user")
+    if session_user:
+        return session_user
+
+    key = websocket.headers.get("x-api-key") or websocket.query_params.get("token")
+    if key:
+        token_user = lookup_db_token(key)
+        if token_user:
+            return token_user
+        if is_valid_api_key(key, settings):
+            return DEFAULT_USER
+        return None
+    return DEFAULT_USER if not settings.api_keys else None

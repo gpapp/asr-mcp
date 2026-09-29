@@ -30,3 +30,25 @@ Lesson 31 of `AGENTS.md`. Wire format, turn detection, bounded queue and the unc
   `__getattr__`) so `asr_mcp.streaming.turn_detector` is importable without
   FastAPI. Same trick in `asr_mcp/speaker/__init__.py` for `uncertainty.py`
   (torch-free) — do NOT restore eager `from ... import ...` re-exports there.
+
+### Channel-aware live attribution (see [live-client-design.md](live-client-design.md))
+- The server now also accepts **turn frames** from the client (magic `LVT1`,
+  24-byte header carrying `channel` + `start_sample` + `n_samples`), so the
+  client can do its own endpointing and live/offline boundaries match. The
+  magic discriminates turn frames from the legacy 8-byte raw-PCM header — no
+  config flag, and old clients keep working.
+- **Never voiceprint-match the mic channel.** The default input device is the
+  local user, who is in their own voiceprints; matching returns a confident
+  wrong answer whenever they have more than one profile. The channel *is* the
+  evidence → `LOCAL_SPEAKER_LABEL`, `speaker_source="input_device"`.
+- Speaker-channel turns are 1–3s, the low end for ECAPA, so
+  `live_attribution.min_match_confidence` is 0.60 — deliberately higher than the
+  file path's 0.35. Separate config section so live tuning cannot move file
+  behaviour.
+- `WS /asr/ws/stream` was **completely unauthenticated**. `_websocket_user()`
+  now mirrors `get_current_user` (session → `X-API-Key`/`?token=` →
+  `is_valid_api_key` → `DEFAULT_USER`) and closes 1008 *before* `accept()` so
+  the client sees a 403 rather than a socket that dies immediately. Starlette's
+  `SessionMiddleware` does populate `scope["session"]` for websockets — verify
+  in its source before changing `_websocket_user`, do not guess a cookie path.
+- `language` is threaded into the live `transcribe_audio_sync` call (lesson 28).
