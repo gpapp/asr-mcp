@@ -157,6 +157,91 @@ def finish_progress_line():
     sys.stdout.flush()
 
 
+def _fmt_hms(sec):
+    sec = max(0, int(round(float(sec))))
+    hours, rem = divmod(sec, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _profiles_banner(result):
+    """SPEAKER VOICE PROFILES banner lines (empty list when no profiles)."""
+    profiles = result.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        return []
+    rows = []
+    for name, p in profiles.items():
+        if not isinstance(p, dict):
+            continue
+        parts = []
+        pitch = p.get("pitch_hz")
+        if isinstance(pitch, (int, float)) and pitch > 0:
+            pstd = p.get("pitch_std")
+            if isinstance(pstd, (int, float)) and pstd > 0:
+                parts.append(f"pitch={pitch:.0f}Hz (±{pstd:.0f}Hz)")
+            else:
+                parts.append(f"pitch={pitch:.0f}Hz")
+        energy = p.get("energy_rms")
+        if isinstance(energy, (int, float)):
+            parts.append(f"energy={energy:.4f}")
+        speech = p.get("total_speech_sec")
+        if isinstance(speech, (int, float)):
+            parts.append(f"speech={speech:.0f}s")
+        if parts:
+            rows.append((float(speech) if isinstance(speech, (int, float)) else 0.0,
+                         f"  {name}: " + "  ".join(parts)))
+    if not rows:
+        return []
+    rows.sort(key=lambda r: -r[0])
+    rule = "=" * 60
+    return [rule, "SPEAKER VOICE PROFILES", rule] + [r[1] for r in rows] + [rule]
+
+
+def _paragraphs_from_segments(segments):
+    """Group a run's segments into paragraphs: break on pause >=1.5s or long text."""
+    paragraphs, current, current_len = [], [], 0
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start") or 0.0)
+        end = float(seg.get("end") or start)
+        if current:
+            prev_end = float(current[-1].get("end") or current[-1].get("start") or 0.0)
+            gap = start - prev_end
+            last_text = (current[-1].get("text") or "").strip()
+            sentence_end = last_text.endswith((".", "!", "?", "\u2026"))
+            if gap >= 1.5 or current_len >= 800 and sentence_end or current_len >= 1600:
+                paragraphs.append(current)
+                current, current_len = [], 0
+        current.append(seg)
+        current_len += len(text) + 1
+    if current:
+        paragraphs.append(current)
+    return paragraphs
+
+
+def _paragraph_confidence(segs):
+    """Duration-weighted mean confidence as 0..100 int, or None if unavailable."""
+    num = den = 0.0
+    for s in segs:
+        c = s.get("confidence")
+        if c is None:
+            continue
+        try:
+            c = float(c)
+            w = float(s.get("end") or 0.0) - float(s.get("start") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if w <= 0:
+            w = 1.0
+        num += c * w
+        den += w
+    if den <= 0:
+        return None
+    return max(0, min(100, int(round(100.0 * num / den))))
+
+
 def build_transcript(filename, result, date_str):
     lines = []
     lines.append(f"Audio: {filename}")
@@ -165,17 +250,34 @@ def build_transcript(filename, result, date_str):
     lines.append(f"Duration: {result.get('audio_duration_sec', 0):.1f}s")
     lines.append("")
 
+    banner = _profiles_banner(result)
+    if banner:
+        lines.extend(banner)
+        lines.append("")
+
     results = result.get("results") or []
     for r in results:
-        text = r.get("text", "")
-        speaker = r.get("speaker", "")
-        start = r.get("start")
-        end = r.get("end")
-        if speaker and start is not None and end is not None:
-            body = text.replace("\n", "\n    ")
-            lines.append(f"[{speaker}] {start:.1f}s - {end:.1f}s: {body}")
-        else:
-            lines.append(text)
+        speaker = r.get("speaker") or ""
+        segs = [s for s in (r.get("segments") or [])
+                if isinstance(s, dict) and (s.get("text") or "").strip()]
+        if not segs:
+            text = r.get("text", "")
+            start = r.get("start")
+            end = r.get("end")
+            if speaker and start is not None and end is not None:
+                body = text.replace("\n", "\n    ")
+                lines.append(f"[{speaker}] {start:.1f}s - {end:.1f}s: {body}")
+            else:
+                lines.append(text)
+            continue
+        for para in _paragraphs_from_segments(segs):
+            p_start = float(para[0].get("start") or 0.0)
+            text = " ".join((s.get("text") or "").strip() for s in para).strip()
+            if not text:
+                continue
+            conf = _paragraph_confidence(para)
+            conf_s = f" ({conf}%)" if conf is not None else ""
+            lines.append(f"[{_fmt_hms(p_start)}] {speaker}{conf_s}: {text}")
 
     errors = [r.get("error") for r in results if r.get("error")]
     if errors:

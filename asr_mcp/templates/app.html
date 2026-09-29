@@ -436,14 +436,12 @@
                     <div class="card-title">System Status</div>
                     <div class="card-body">
                         <div class="status-grid" id="statusGrid">
-                            <div class="status-item"><div class="label">Models</div><div class="value" id="stModels">Loading...</div><div class="sub" id="stModelsSub"></div></div>
-                            <div class="status-item"><div class="label">ASR Backend</div><div class="value" id="stAsr">-</div></div>
+                            <div class="status-item"><div class="label">ASR Backend</div><div class="value" id="stAsr">-</div><div class="sub" id="stAsrSub"></div></div>
                             <div class="status-item"><div class="label">Diarization</div><div class="value" id="stDiar">-</div></div>
                             <div class="status-item"><div class="label">RAM</div><div class="value" id="stRam">-</div><div class="mini-bar" id="stRamBar"><div></div></div></div>
                             <div class="status-item"><div class="label">GPU</div><div class="value" id="stGpu">-</div><div class="sub" id="stGpuSub"></div><div class="mini-bar" id="stGpuBar"><div></div></div></div>
                             <div class="status-item"><div class="label">Disk</div><div class="value" id="stDisk">-</div><div class="mini-bar" id="stDiskBar"><div></div></div></div>
                             <div class="status-item"><div class="label">CUDA Device</div><div class="value" id="stCuda">-</div></div>
-                            <div class="status-item"><div class="label">Version</div><div class="value" id="stVersion">-</div></div>
                             <div class="status-item"><div class="label">Active Job</div><div class="value" id="stJob">-</div><div class="sub" id="stJobSub"></div></div>
                         </div>
                         <div style="margin-top:1rem;">
@@ -622,12 +620,10 @@
             try {
                 const r = await fetch(P + '/health');
                 const d = await r.json();
-                const ready = d.model_status === 'ready';
                 const m = d.models || {};
-                document.getElementById('stModels').innerHTML = ready ? '<span class="status-ok">Ready</span>' : '<span class="status-fail">Not loaded</span>';
                 let sub = m.ttl_minutes ? 'TTL ' + m.ttl_minutes + ' min' : '';
                 if (m.idle_seconds != null) sub += (sub ? ' · ' : '') + 'idle ' + Math.round(m.idle_seconds) + 's';
-                document.getElementById('stModelsSub').textContent = sub;
+                document.getElementById('stAsrSub').textContent = sub;
 
                 const asrEl = document.getElementById('stAsr');
                 const asr = m.asr;
@@ -684,15 +680,25 @@
                 }
 
                 document.getElementById('stCuda').textContent = d.cuda_device || '-';
-                document.getElementById('stVersion').textContent = d.version || '-';
                 const dot = document.getElementById('hdrStatusDot');
                 const txt = document.getElementById('hdrStatusText');
                 if (dot && txt) {
-                    dot.className = 'dot ' + (ready ? 'ok' : '');
-                    txt.textContent = ready ? 'Models ready' : 'Models loading';
+                    const asrLoaded = !!(m.asr && m.asr.loaded);
+                    const anyLoaded = asrLoaded || m.vad || m.embedding;
+                    const allLoaded = asrLoaded && m.vad && m.embedding;
+                    if (allLoaded) {
+                        dot.className = 'dot ok';
+                        txt.textContent = 'Models ready';
+                    } else if (anyLoaded) {
+                        dot.className = 'dot ok';
+                        txt.textContent = 'Models active';
+                    } else {
+                        dot.className = 'dot';
+                        txt.textContent = 'Models idle — load on first use';
+                    }
                 }
             } catch (e) {
-                document.getElementById('stModels').innerHTML = '<span class="status-fail">Error</span>';
+                document.getElementById('stAsrSub').textContent = 'Error';
                 const dot = document.getElementById('hdrStatusDot');
                 const txt = document.getElementById('hdrStatusText');
                 if (dot && txt) { dot.className = 'dot bad'; txt.textContent = 'Server unreachable'; }

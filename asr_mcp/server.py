@@ -12,6 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
+from asr_mcp import __version__
+
 logger = logging.getLogger("asr_mcp.server")
 
 
@@ -99,7 +101,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ASR MCP Server",
     description="ASR transcription with diarization, voiceprint recognition, and MCP interface",
-    version="2.0.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -219,11 +221,12 @@ async def health():
                 return None
             name, util, mem_used, mem_total, temp = parts[:5]
             mem_used_i, mem_total_i = int(mem_used), int(mem_total)
+            # nvidia-smi reports memory in MiB; expose bytes like ram/disk
             return {
                 "name": name,
                 "util": int(util),
-                "mem_used": mem_used_i,
-                "mem_total": mem_total_i,
+                "mem_used": mem_used_i * 1048576,
+                "mem_total": mem_total_i * 1048576,
                 "mem_percent": round(mem_used_i / max(mem_total_i, 1) * 100, 1),
                 "temperature": int(temp),
             }
@@ -256,7 +259,7 @@ async def health():
         "model_status": "ready" if state.is_ready else "not_ready",
         "cuda_device": settings.cuda_device,
         "voiceprint_count": app.state.speaker_service._db.count() if hasattr(app.state, "speaker_service") else 0,
-        "version": "2.0.0",
+        "version": __version__,
         "ram": ram,
         "gpu": gpu,
         "disk": disk,

@@ -32,6 +32,22 @@ dependencies are required.
 
 Supported inputs: wav, mp3, flac, ogg, m4a, webm, opus, mkv, mp4.
 
+## Output format
+
+Each `<name>.txt` contains a `SPEAKER VOICE PROFILES` banner (when the server
+reports profiles) followed by one paragraph line per run:
+
+```
+[00:00:12] Gergely Papp (77%): paragraph text
+[00:04:05] Speaker 3: paragraph without confidence suffix
+```
+
+- Lines are `[HH:MM:SS] <speaker>: text` using the absolute start time; a run
+  is broken into paragraphs on a pause >= 1.5s or at a sentence end after
+  800 characters.
+- The `(NN%)` decode confidence is included only when the ASR backend reports
+  one (whisper does; cohere/qwen3 do not).
+
 ## Notes
 
 - Client transcriptions use `?save=false` — nothing is stored in

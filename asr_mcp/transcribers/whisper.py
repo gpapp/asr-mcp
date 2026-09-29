@@ -26,6 +26,21 @@ logger = logging.getLogger("asr_mcp.transcribers.whisper")
 SAMPLE_RATE = 16000
 WINDOW_SEC = 30.0  # Whisper decodes in 30s windows — progress granularity
 
+# Default initial_prompt. Without one, long-form / room-audio decodes can lock into
+# a lowercase, unpunctuated style from the very first segment, and
+# condition_on_previous_text then perpetuates it for the whole file (observed:
+# 0/251 segments punctuated on a 34-min meeting recording). A punctuated anchor
+# fixes degraded audio (sentence density 4.6 -> 17.5 per 1000 letters) and leaves
+# clean English unchanged; Hungarian output stays 98.5% identical with MORE
+# punctuation and no English word injection (verified on a 90s hu clip).
+STYLE_ANCHOR = (
+    "The meeting started at ten o'clock and we reviewed the delivery plan first. "
+    "Anna explained that the staging environment is ready, but the migration script "
+    "still needs review. We agreed to postpone the release until Thursday so that "
+    "QA has two full days for regression testing. Marcus will update the ticket "
+    "with the new deadline and notify the support team."
+)
+
 # Compute types that need GPU fp16 arithmetic (CT2 rejects them on CPU).
 _GPU_ONLY_COMPUTE = {"int8_float16", "int4_float16"}
 
@@ -286,7 +301,8 @@ class WhisperBackend(ASRBackend):
     def _run(self, arr: np.ndarray, language: str, context: str, progress_cb) -> dict:
         from asr_mcp.core.model_state import is_gpu_oom
 
-        lang = str(language or "").strip().lower()
+        requested = str(language or "").strip().lower() or "auto"
+        lang = requested
         if lang in ("", "none", "auto", "auto-detect"):
             lang = None
 
@@ -299,8 +315,9 @@ class WhisperBackend(ASRBackend):
             condition_on_previous_text=True,
         )
         ctx = (context or "").strip()
-        if ctx:
-            kwargs["initial_prompt"] = ctx
+        # Carry-over context wins when present; otherwise anchor the style so the
+        # first segment is decoded punctuated/capitalized (see STYLE_ANCHOR).
+        kwargs["initial_prompt"] = ctx or STYLE_ANCHOR
 
         seg_iter, info = self.model.transcribe(arr, **kwargs)
 
@@ -331,10 +348,18 @@ class WhisperBackend(ASRBackend):
             end = float(seg.end or start)
             cursor = end
             if txt:
+                conf = None
+                alp = getattr(seg, "avg_logprob", None)
+                if alp is not None:
+                    try:
+                        conf = max(0.0, min(1.0, math.exp(float(alp))))
+                    except (ValueError, OverflowError):
+                        conf = None
                 segments_out.append({
                     "start": round(start, 3),
                     "end": round(end, 3),
                     "text": txt,
+                    "confidence": round(conf, 3) if conf is not None else None,
                 })
                 texts.append(txt)
 
@@ -358,7 +383,8 @@ class WhisperBackend(ASRBackend):
             segments_out = [{"start": 0.0, "end": round(audio_duration, 3), "text": text}]
 
         logger.info(
-            "Whisper finished: lang=%s p=%.2f speech=%.1fs/%.1fs segments=%d device=%s/%s",
+            "Whisper finished: requested=%s lang=%s p=%.2f speech=%.1fs/%.1fs segments=%d device=%s/%s",
+            requested,
             getattr(info, "language", "?"),
             float(getattr(info, "language_probability", 0.0) or 0.0),
             float(getattr(info, "duration_after_vad", audio_duration) or 0.0),

@@ -42,6 +42,9 @@ class TimedSegment(BaseModel):
     start: float
     end: float
     text: str
+    # 0..1 decode confidence (whisper: exp(avg_logprob)); None when the
+    # backend does not report one (cohere/qwen3)
+    confidence: Optional[float] = None
 
 
 class TranscribeResult(BaseModel):
