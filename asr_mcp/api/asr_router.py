@@ -718,7 +718,8 @@ def _merge_consecutive_same_speaker_results(results, max_gap_sec=None):
     return merged
 
 
-def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=None):
+def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=None,
+                         language="auto"):
     turns = _prepare_turns(
         segments,
         audio_duration_sec=len(audio_np) / sample_rate,
@@ -727,7 +728,8 @@ def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=N
         known_speakers=known_speakers,
     )
     _switch_to_backend_phase()
-    all_results = _transcribe_file(audio_np, turns or segments, sample_rate)
+    all_results = _transcribe_file(audio_np, turns or segments, sample_rate,
+                                   language=language)
     return _merge_consecutive_same_speaker_results(all_results)
 
 
@@ -1019,16 +1021,20 @@ async def transcribe_endpoint(
     waveform, sr = load_audio(req.wav_path)
     audio_np = waveform.numpy().squeeze().astype(np.float32)
 
+    language = str(req.language or "auto").strip().lower() or "auto"
+
     segments = diarization.get("segments", [])
     if not segments:
         _switch_to_backend_phase()
-        result = transcribe_audio_sync(audio=audio_np)
+        result = transcribe_audio_sync(audio=audio_np, language=language)
         return TranscribeResponse(
             results=[TranscribeResult(**result)],
             total_time_sec=result.get("inference_time_sec", 0),
         )
 
-    results = _transcribe_diarized(audio_np, segments, sr, known_speakers=known_speakers)
+    results = _transcribe_diarized(audio_np, segments, sr,
+                                   known_speakers=known_speakers,
+                                   language=language)
 
     total_time = sum(r.inference_time_sec for r in results)
     return TranscribeResponse(results=results, total_time_sec=total_time)

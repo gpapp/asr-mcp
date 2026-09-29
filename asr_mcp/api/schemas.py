@@ -10,6 +10,9 @@ class DiarizeRequest(BaseModel):
     vad_threshold: Optional[float] = None
     vad_min_speech_duration_ms: Optional[int] = None
     known_speakers: Optional[dict[str, dict]] = None
+    # ISO 639-1 code (e.g. "hu") or "auto" to let the backend detect it.
+    # Only used by the transcribe endpoint; diarize ignores it.
+    language: str = "auto"
 
 
 class DiarizeResult(BaseModel):

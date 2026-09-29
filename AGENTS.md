@@ -242,7 +242,7 @@ asr-mcp/
 | `/login` | GET | No | Login page |
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio (`?num_speakers=` is a query param, not form) |
-| `/api/asr/transcribe` | POST | API key | Transcribe by file path — **`DiarizeRequest` has no `language` field, so this endpoint always decodes English** (lesson 28) |
+| `/api/asr/transcribe` | POST | API key | Transcribe by file path (`"language"` in the body, ISO 639-1 or `auto`, default `auto`) |
 | `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save; `?language=hu` ISO 639-1 or `auto`, default `auto`) |
 | `/api/asr/languages` | GET | Session/API key | Static language list of the configured backend (no model load) — `{backend, supports_auto, languages:[{code,name}]}` |
 | `/api/asr/activity/stream` | GET | Session/API key | SSE push of job start/finish (snapshot on connect + keep-alive pings; replaces polling `/active`) |

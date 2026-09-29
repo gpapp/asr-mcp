@@ -137,3 +137,34 @@ def test_split_long_turn_keeps_the_identity_evidence():
     for p in parts:
         assert p["speaker_confidence"] == 0.8
         assert p["speaker_source"] == "known_voiceprint"
+
+
+def test_diarize_request_language_defaults_to_auto():
+    """The path-based /transcribe endpoint must not force English (lesson 28)."""
+    from asr_mcp.api.schemas import DiarizeRequest
+
+    assert DiarizeRequest(wav_path="/tmp/a.wav").language == "auto"
+    assert DiarizeRequest(wav_path="/tmp/a.wav", language="HU").language == "HU"
+
+
+def test_transcribe_diarized_threads_language(monkeypatch):
+    """`language` must reach _transcribe_file, not just the schema."""
+    import numpy as np
+
+    seen = {}
+
+    monkeypatch.setattr(asr_router, "_prepare_turns", lambda *a, **k: [])
+    monkeypatch.setattr(asr_router, "_switch_to_backend_phase", lambda: None)
+    monkeypatch.setattr(asr_router, "_merge_consecutive_same_speaker_results",
+                        lambda r: r)
+
+    def _fake(audio_np, turns, sample_rate=16000, progress_cb=None, language="en"):
+        seen["language"] = language
+        return []
+
+    monkeypatch.setattr(asr_router, "_transcribe_file", _fake)
+    audio = np.zeros(16000, dtype=np.float32)
+    asr_router._transcribe_diarized(audio, [{"start": 0.0, "end": 1.0,
+                                            "speaker": "Speaker 1"}],
+                                    16000, language="hu")
+    assert seen["language"] == "hu"
