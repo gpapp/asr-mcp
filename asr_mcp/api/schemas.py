@@ -15,7 +15,10 @@ class DiarizeRequest(BaseModel):
 class DiarizeResult(BaseModel):
     start: float
     end: float
-    speaker: str
+    # None when the speaker identity is uncertain (see speaker/uncertainty.py)
+    speaker: Optional[str] = None
+    uncertain: bool = False
+    attribution_reason: Optional[str] = None
 
 
 class DiarizeResponse(BaseModel):
@@ -23,6 +26,7 @@ class DiarizeResponse(BaseModel):
     total_time_sec: float
     total_speakers: int = 0
     audio_duration_sec: float = 0.0
+    uncertain_segments: int = 0
     error: Optional[str] = None
 
 
@@ -51,12 +55,19 @@ class TranscribeResult(BaseModel):
     text: str = ""
     start: Optional[float] = None
     end: Optional[float] = None
+    # None means the speaker could NOT be established — the text is still
+    # valid (uncertainty policy: suppress identity, not content).
     speaker: Optional[str] = None
     audio_duration_sec: float = 0.0
     inference_time_sec: float = 0.0
     tokens_generated: int = 0
     segments: Optional[list[TimedSegment]] = None
     error: Optional[str] = None
+    # Attribution metadata (see asr_mcp/speaker/uncertainty.py)
+    speaker_confidence: Optional[float] = None
+    speaker_source: Optional[str] = None      # known_voiceprint | diarization_cluster | unknown
+    uncertain: bool = False
+    attribution_reason: Optional[str] = None
 
 
 class TranscribeResponse(BaseModel):

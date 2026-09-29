@@ -186,6 +186,10 @@
         .tv-bars { flex: 0 0 48%; box-sizing: border-box; position: relative; padding-right: 96px; min-width: 0; }
         .tv-text { flex: 1; position: relative; max-height: 56vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fbfcfe; min-width: 0; }
         .tp-block { margin-bottom: 14px; }
+        .tp-block-uncertain { border-left: 3px solid #8b949e; padding-left: 9px; }
+        .tp-block-uncertain .tp-head { color: #6e7781; }
+        .bar-row-uncertain .bar-name { color: #6e7781; font-style: italic; }
+        .bar-seg-uncertain { opacity: .6; }
         .tp-head { font-size: .7rem; color: var(--muted); font-weight: 700; letter-spacing: .05em; margin-bottom: 3px; }
         .tp-text { font-size: .86rem; color: var(--ink); white-space: pre-wrap; line-height: 1.55; }
 
@@ -621,9 +625,6 @@
                 const r = await fetch(P + '/health');
                 const d = await r.json();
                 const m = d.models || {};
-                let sub = m.ttl_minutes ? 'TTL ' + m.ttl_minutes + ' min' : '';
-                if (m.idle_seconds != null) sub += (sub ? ' · ' : '') + 'idle ' + Math.round(m.idle_seconds) + 's';
-                document.getElementById('stAsrSub').textContent = sub;
 
                 const asrEl = document.getElementById('stAsr');
                 const asr = m.asr;
@@ -633,6 +634,9 @@
                 } else {
                     asrEl.textContent = '-';
                 }
+                let sub = m.ttl_minutes ? 'TTL ' + m.ttl_minutes + ' min' : '';
+                if (m.idle_seconds != null) sub += (sub ? ' · ' : '') + 'idle ' + Math.round(m.idle_seconds) + 's';
+                document.getElementById('stAsrSub').textContent = sub;
 
                 const diarEl = document.getElementById('stDiar');
                 if (m.vad && m.embedding) {
@@ -698,7 +702,6 @@
                     }
                 }
             } catch (e) {
-                document.getElementById('stAsrSub').textContent = 'Error';
                 const dot = document.getElementById('hdrStatusDot');
                 const txt = document.getElementById('hdrStatusText');
                 if (dot && txt) { dot.className = 'dot bad'; txt.textContent = 'Server unreachable'; }
@@ -762,7 +765,7 @@
             const audioDur = result.audio_duration_sec || (segments.length ? Math.max(...segments.map(s => s.end)) : 0);
             if (audioDur <= 0) return;
 
-            const allSpeakers = [...new Set(segments.map(s => s.speaker))].sort();
+            const allSpeakers = [...new Set(segments.map(speakerKey))].sort();
 
             const fileLabel = document.createElement('div');
             fileLabel.className = 'file-label';
@@ -773,16 +776,18 @@
             barContainer.className = 'bar-container';
 
             for (const seg of segments) {
+                const key = speakerKey(seg);
                 const left = (seg.start / audioDur * 100).toFixed(4);
                 const width = ((seg.end - seg.start) / audioDur * 100).toFixed(4);
-                const color = getSpeakerColor(seg.speaker, allSpeakers);
+                const color = getSpeakerColor(key, allSpeakers);
                 const div = document.createElement('div');
                 div.className = 'bar-seg';
+                if (isUnknownSpeaker(key)) div.classList.add('bar-seg-uncertain');
                 div.style.left = left + '%';
                 div.style.width = width + '%';
                 div.style.background = color;
-                div.title = seg.speaker + '  ' + formatTime(seg.start) + ' - ' + formatTime(seg.end) + ' (' + (seg.end - seg.start).toFixed(1) + 's)';
-                if (parseFloat(width) > 3) div.textContent = seg.speaker.replace('Speaker ', 'S');
+                div.title = speakerLabel(seg) + '  ' + formatTime(seg.start) + ' - ' + formatTime(seg.end) + ' (' + (seg.end - seg.start).toFixed(1) + 's)';
+                if (parseFloat(width) > 3) div.textContent = key.replace('Speaker ', 'S');
                 barContainer.appendChild(div);
             }
             container.appendChild(barContainer);
@@ -799,7 +804,7 @@
 
             const durations = {};
             for (const spk of allSpeakers) {
-                durations[spk] = segments.filter(s => s.speaker === spk).reduce((acc, s) => acc + (s.end - s.start), 0);
+                durations[spk] = segments.filter(s => speakerKey(s) === spk).reduce((acc, s) => acc + (s.end - s.start), 0);
             }
             container.appendChild(buildLegendTable(allSpeakers, durations));
         }
@@ -996,6 +1001,12 @@
                 st.diarProgressBar.style.width = '100%';
                 st.diarProgressBar.textContent = '100%';
                 st.diarProgressStage.textContent = 'Complete!';
+                const nUncertainDiar = data.result.uncertain_segments ||
+                    ((data.result.segments || []).filter(s => s && s.uncertain).length);
+                if (nUncertainDiar) {
+                    toast(nUncertainDiar + ' segment(s) could not be attributed to a confident speaker (' +
+                          UNKNOWN_SPEAKER + ') — text kept, identity suppressed', true);
+                }
                 if (st.mode === 'transcribe') {
                     if (st.transcriptionPointer) st.transcriptionPointer.style.left = '100%';
                     if (st.transcriptionOverlayFill) st.transcriptionOverlayFill.style.left = '100%';
@@ -1003,6 +1014,11 @@
                     if (data.processing_time_sec !== undefined && data.processing_time_sec !== null) {
                         doneText = 'Complete — processed in ' + formatElapsed(data.processing_time_sec);
                         if (data.speedup) doneText += ' · ' + data.speedup + 'x realtime';
+                    }
+                    const nUncertain = (st.finalData && st.finalData.results || [])
+                        .filter(r => r && r.uncertain).length;
+                    if (nUncertain) {
+                        doneText += ' · ' + nUncertain + ' segment(s) with ' + UNKNOWN_SPEAKER + ' speaker';
                     }
                     st.transcriptionStage.textContent = doneText;
                 }
@@ -1018,7 +1034,7 @@
                 if (data.stage === 'diarization_complete' && st.mode === 'transcribe') {
                     const segments = data.segments || [];
                     st.audioDur = data.audio_duration_sec || 0;
-                    st.allSpeakers = [...new Set(segments.map(s => s.speaker))].sort();
+                    st.allSpeakers = [...new Set(segments.map(speakerKey))].sort();
 
                     if (st.audioDur > 0 && segments.length) {
                         st.transcriptionArea.style.display = 'block';
@@ -1052,7 +1068,7 @@
                         const segStart = data.segment_start || 0;
                         const pointerPct = (segStart / st.audioDur * 100).toFixed(2);
                         st.transcriptionPointer.style.left = pointerPct + '%';
-                        st.transcriptionPointerLabel.textContent = data.segment_speaker + ' @ ' + formatTime(segStart);
+                        st.transcriptionPointerLabel.textContent = (data.segment_speaker || UNKNOWN_SPEAKER) + ' @ ' + formatTime(segStart);
                     }
                     if (data.progress !== undefined && st.transcriptionOverlayFill) {
                         st.transcriptionOverlayFill.style.left =
@@ -1196,7 +1212,7 @@
                 const turns = (res.results || []).filter(r => r && (r.text || '').trim());
                 if (turns.length) {
                     for (const t of turns) {
-                        lines.push('[' + (t.speaker || '?') + '] ' +
+                        lines.push('[' + speakerLabel(t) + '] ' +
                             formatTime(t.start || 0) + ' - ' + formatTime(t.end || 0));
                         lines.push(t.text.trim());
                         lines.push('');

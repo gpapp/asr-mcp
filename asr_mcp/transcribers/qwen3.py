@@ -421,8 +421,13 @@ class Qwen3Backend(ASRBackend):
         _no_window: bool = False,
         progress_cb=None,
         context: str = "",
+        pre_segmented: bool = False,
     ) -> dict:
         start_time = time.time()
+
+        # Qwen3 decodes the given audio as one unit; no internal VAD or
+        # previous-text conditioning to disable.
+        del pre_segmented
 
         if audio is None:
             return {"text": "", "error": "No audio provided (Qwen3 requires raw audio, not mel)"}

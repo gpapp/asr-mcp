@@ -20,8 +20,10 @@ python -m asr_mcp.server
 
 After completing any code changes:
 1. Run `python -m py_compile <file.py>` to verify syntax
-2. If running in Docker, rebuild: `docker compose up -d --build asr-mcp`
-3. Run `git diff --check` after documentation or code edits.
+2. Run `python -m pytest tests/ -q` — pure-python unit tests (uncertainty policy, attribution, turn detector, streaming handler, segment_ops). The `test_result_merge.py`, `test_clustering_linkage.py` and `test_second_pass_claim.py` modules `importorskip` torch/sklearn and are skipped outside the container; run them with `docker compose exec -T asr-mcp python3 -m pytest tests/ -q` after a rebuild
+3. For threshold work, **cache the per-window embeddings** and sweep offline — see lesson 33
+4. If running in Docker, rebuild: `docker compose up -d --build asr-mcp`
+5. Run `git diff --check` after documentation or code edits
 
 ## Architecture
 
@@ -51,6 +53,8 @@ After completing any code changes:
 - **faster-whisper / CTranslate2**, default model `large-v3-turbo`, always **quantized**: `TRANSCRIBE_WHISPER_COMPUTE_TYPE=auto` → `int8_float16` on CUDA / `int8` on CPU (~1.0GB VRAM measured on the GTX 1650; fp16 would be ~1.6GB + spikes).
 - **Load escalation**: requested compute type → `int8` on CUDA → `int8` on CPU; each failed attempt is logged and the model freed first. Runtime CUDA OOM rebuilds the model on CPU (`_fallback_to_cpu`) and retries the whole transcription once.
 - **Timestamps**: passes `without_timestamps=False` — segment-level start/end feed `_transcribe_file`'s speaker attribution (the faster-whisper default `True` yields one coarse segment per file). Progress events map segment end times onto 30s windows (`progress_cb(win, est_windows, partial_text, new_segments)`).
+- **Confidence**: each whisper segment carries `confidence = exp(avg_logprob)` clamped to 0..1 (`TimedSegment.confidence` is optional; cohere/qwen3 leave it `None` → client omits the `(NN%)` suffix). Note faster-whisper hard-sets `language_probability=1.0` when language is forced — the log line prints `requested=<x> lang=<detected>` to distinguish forced from detected.
+- **Style anchor (`STYLE_ANCHOR` initial_prompt)**: every decode gets a punctuated English meeting-style prompt unless caller `context` is non-empty. Without it, long-form/room-audio decodes can lock into a lowercase, unpunctuated style from the FIRST segment (0/251 segments punctuated on a 34-min recording) and `condition_on_previous_text=True` propagates it for the whole file. Verified: degraded-audio sentence density 4.6 → 17.6 per 1000 letters; clean English unchanged; Hungarian 98.5% identical with slightly MORE punctuation and no English word injection. Do NOT "fix" this by flipping `condition_on_previous_text=False` — it *reduces* punctuation density on clean English (15.6 → 8.2 per 1000 letters, measured).
 - **Dependency hazard**: `faster-whisper` depends on the CPU `onnxruntime` wheel; both wheels write the same `site-packages/onnxruntime/` files, so installing the CPU wheel last silently kills the CUDA EP (then `GPU_SHRINK_RUN_OPTIONS` crashes — lesson 5). Keep `onnxruntime-gpu` LAST in `requirements.txt` and the Dockerfile's `pip install --force-reinstall --no-deps onnxruntime-gpu` step as guarantee.
 - Model download lands in `models/faster-whisper/<spec>/` (mounted volume); `_ensure_local_model` skips the download once `config.json` + `model.bin` exist.
 
@@ -71,7 +75,7 @@ After completing any code changes:
 3. **Exact boundary refinement** (`_refine_boundaries_with_vad`): raw uncollapsed VAD over the full file; each VAD section spanning a gap is embedded and attributed to the better-matching adjacent speaker (known DB voiceprint, else ≤30s of that speaker's own turn audio); `_best_split` picks the ownership cut (margin-weighted); both turns move to one shared cut at the exact start of the first section owned by the incoming speaker (or gap end if the gap is entirely the left speaker's)
 4. **Fallback chain for any remaining gap**: energy-dip cut (`_gap_boundary`, quietest pause centre) → midpoint
 5. Edges extended to 0.0 / audio_duration
-6. **Transcription** (`asr_router.py::_transcribe_file`): ONE whole-file `transcribe_audio_sync()` call; the backend decodes in its own windows (Qwen `_transcribe_chunked`, Cohere `_transcribe_windowed`), then each returned item's midpoint maps onto the turns (`_speaker_for_span`, bisect) and consecutive same-speaker items group into `TranscribeResult` runs — audio is never cut at speaker boundaries
+6. **Transcription** (`asr_router.py::_transcribe_file`): ONE whole-file `transcribe_audio_sync()` call; the backend decodes in its own windows (Qwen `_transcribe_chunked`, Cohere `_transcribe_windowed`), then `speaker/attribution.py::attribute_items` maps each returned item onto the turns and groups consecutive same-speaker items into `TranscribeResult` runs — audio is never cut at speaker boundaries
 
 **Decode windowing** (`transcribers/cohere.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
 - Plans ≤30s windows (`_plan_window_bounds`), each cut snapped to the minimum frame-energy point inside a ±100-frame band (never mid-word); tails <300 frames merge into the previous window
@@ -86,23 +90,42 @@ After completing any code changes:
 
 ### Diarization Pipeline (13 steps)
 
+Numbering below matches the `# Step N` comments in
+`diarization/pipeline.py::Diarizer.run` — that file is the source of truth.
+
 ```
-1. VAD (Silero ONNX) → speech regions
-1b. Merge nearby speech (<1s silence gap)
-2. Energy-dip splitting (dip_ratio=0.35, min_dip_dur=0.5s, min_split_piece=2.0s)
-3. Sliding windows (3.0s window, 2.5s stride) → fbank features
-4. ECAPA-TDNN512 embedding per window (192-dim, ONNX CUDA)
-5. AgglomerativeClustering (distance_threshold=0.50, cosine, average linkage)
-6. Greedy merge clusters (merge_threshold=0.25)
-7. Map labels → segments ("Speaker 1", "Speaker 2", ...)
-8. Collapse same-speaker (max_gap=0.5s) + absorb islands
-9. Boundary refinement (re-embed boundary frames)
-10. Speaker profiling (pitch, energy, MFCC)
-10b. merge_similar_speakers (embed-only threshold=0.2)
-11. Relabel by pitch (highest = Speaker 1)
-12. Ghost elimination (total_dur < 5s → absorb to nearest neighbor)
-13. Known-speaker matching (multi-feature: 60% embedding + 15% pitch + 10% spectral + 10% MFCC)
+1.   VAD (Silero ONNX) → raw uncollapsed sections (kept for step 13)
+1b.  Merge sections <0.5s apart for clustering
+2.   Energy-dip splitting (min_segment_dur=3.0s, dip_ratio=0.35,
+     min_dip_dur=0.5s, min_split_piece=2.0s)
+3.   Sliding windows (2.0s window, 1.2s stride) → fbank features
+4.   ECAPA-TDNN512 embedding per window (192-dim, ONNX CUDA; MD5 LRU cache)
+5.   AgglomerativeClustering (cosine) — threshold path: average linkage at
+     `distance_threshold`; forced-k path (`num_speakers` given):
+     `n_clusters=k` with `forced_k_linkage` (default `complete`) and **no**
+     greedy merge
+5b.  Assign cluster labels to every segment, including short ones
+5c.  Overlap detection (proximity_ratio 0.08, min_distance 0.40)
+6.   Map labels → "Speaker N" and build segments (same-speaker merge,
+     max_speaker_gap 1.0s; `build_overlap_segments`)
+7.   Split single-speaker vs OVERLAP; absorb islands; boundary refinement
+8.   Speaker profiling (pitch, energy, MFCC)
+8b.  Relabel by pitch (highest = Speaker 1); inject cluster centroids
+9.   Known-speaker matching (multi-feature: 60% embedding + 15% pitch +
+     10% spectral + 10% MFCC) — BEFORE ghost elimination so it can populate
+     `alternatives`
+10.  Ghost elimination (<10s total speech → suppressed to UNKNOWN, or to a
+     matched voiceprint alternative; `ghost_max_share` rescues a large share)
+11.  Absorb/suppress minority speakers (max_utterance 5.0s, min_speaker_dur
+     8.0s; matched voiceprints protected)
+12.  Second-pass re-identification of unknown speakers (gated by
+     `second_pass.min_identity_confidence`, one-to-one claim)
+13.  Exact turn-boundary refinement from the raw VAD sections
 ```
+
+`merge_similar_speakers` and `close_match_threshold` exist in
+`clustering.py`/`thresholds.json` but are **not called** — the config keys are
+inert. Do not document them as active pipeline steps.
 
 ### Audio Format Support
 - Input: mp3, mp4, mkv, flac, ogg, m4a, wav, webm, opus
@@ -149,6 +172,8 @@ asr-mcp/
 │   │   ├── vad.py             # VAD (energy-dip splitting, chunked, ONNX)
 │   │   ├── matcher.py         # Multi-feature distance (emb+pitch+energy+spectral+MFCC)
 │   │   ├── profiling.py       # Pitch/energy/MFCC profiling, relabel by pitch
+│   │   ├── uncertainty.py     # Uncertain-speaker policy (dependency-free, lesson 30)
+│   │   ├── attribution.py     # Post-hoc span→turn attribution (pure, lesson 30)
 │   │   └── service.py         # SpeakerService (SQLite-backed CRUD)
 │   ├── voiceprint/
 │   │   ├── service.py         # VoiceprintService (snippet CRUD, auto-collect, refine, merge)
@@ -159,6 +184,7 @@ asr-mcp/
 │   ├── sessions/
 │   │   └── manager.py         # SessionManager (SQLite-backed)
 │   ├── streaming/
+│   │   ├── turn_detector.py   # Adaptive energy turn detector (lesson 31)
 │   │   └── handler.py         # WebSocket dual-channel real-time transcription
 │   ├── config/
 │   │   ├── settings.py        # Pydantic BaseSettings (TRANSCRIBE_ prefix)
@@ -167,10 +193,13 @@ asr-mcp/
 │   ├── static/
 │   └── templates/
 │       ├── _nav.html          # SPA tab bar snippet (__NAV__ + __ACT_*__ markers)
-│       ├── login.html          # Dark-themed login form
-│       └── app.html            # Unified SPA: Transcribe / Voiceprints / History / Settings tabs
+│       ├── login.html         # Dark-themed login form
+│       └── app.html           # Unified SPA: Transcribe / Voiceprints / History / Settings tabs
+├── tests/                    # Pure-python unit tests (pytest, no GPU needed)
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt output, voiceprints
+│   │                           # .txt = profiles banner + [HH:MM:SS] Speaker (NN%): paragraphs —
+│   │                           # format change ⇒ update mem-mcp process-transcription skill step 2
 │   ├── transcribe.bat          # Drop-target wrapper: bootstraps .env + private .venv, runs client
 │   ├── requirements.txt        # Empty (stdlib-only); installed into .venv when it has lines
 │   ├── README.md               # Standalone-zip setup guide
@@ -185,7 +214,10 @@ asr-mcp/
 ├── .env.example
 ├── .gitignore
 ├── AGENTS.md
-└── README.md
+├── docs/
+│   ├── uncertain-speakers.md   # User-facing policy reference (JSON shape, reasons, gates)
+│   └── lessons/                # Per-subsystem evidence behind each numbered rule
+├── README.md
 ```
 
 ## SQLite Schema
@@ -209,25 +241,30 @@ asr-mcp/
 | `/settings` | GET | Session | SPA — Settings tab (status, client token, session) |
 | `/login` | GET | No | Login page |
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
-| `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio |
-| `/api/asr/transcribe` | POST | API key | Transcribe by file path |
+| `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio (`?num_speakers=` is a query param, not form) |
+| `/api/asr/transcribe` | POST | API key | Transcribe by file path — **`DiarizeRequest` has no `language` field, so this endpoint always decodes English** (lesson 28) |
 | `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save; `?language=hu` ISO 639-1 or `auto`, default `auto`) |
 | `/api/asr/languages` | GET | Session/API key | Static language list of the configured backend (no model load) — `{backend, supports_auto, languages:[{code,name}]}` |
 | `/api/asr/activity/stream` | GET | Session/API key | SSE push of job start/finish (snapshot on connect + keep-alive pings; replaces polling `/active`) |
 | `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
 | `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
 | `/api/asr/ws/stream` | WS | No | Real-time streaming transcription |
+| `/api/asr/stream` | POST | No | Always 501 — a stub that points at the WebSocket endpoint |
 | `/api/speaker/register` | POST | API key | Register voiceprint |
 | `/api/speaker/register/upload` | POST | API key | Register voiceprint from upload |
 | `/api/speaker/identify` | POST | API key | Identify speaker from audio |
 | `/api/speaker/list` | GET | API key | List all voiceprints |
 | `/api/speaker/{name}` | DELETE | API key | Delete voiceprint |
 | `/api/voiceprint/speakers` | GET | Session | List speakers (web UI) |
-| `/api/voiceprint/snippets/{speaker}` | GET | Session | List snippets |
+| `/api/voiceprint/speakers/{speaker_name}/snippets` | GET | Session | List snippets for a speaker |
+| `/api/voiceprint/speakers/{speaker_name}/rename` | POST | Session | Rename speaker |
+| `/api/voiceprint/speakers/merge` | POST | Session | Merge speakers |
 | `/api/voiceprint/upload` | POST | Session | Register voiceprint from upload |
-| `/api/voiceprint/merge` | POST | Session | Merge speakers |
-| `/api/voiceprint/rename` | POST | Session | Rename speaker |
 | `/api/voiceprint/rescan` | POST | Session | Rescan voices directory |
+| `/api/voiceprint/rescan/stream` | POST | Session | Rescan as an SSE stream |
+| `/api/voiceprint/snippets/{snippet_id}` | DELETE | Session | Delete one snippet |
+| `/api/voiceprint/snippets/{snippet_id}/audio` | GET | Session | Stream snippet audio (FLAC) |
+| `/api/voiceprint/speakers/{speaker_name}` | DELETE | Session | Delete a voiceprint |
 | `/api/voiceprint/speakers/{name}/upload` | POST | Session/API key | Add snippet (optional `?start_sec=&end_sec=`) |
 | `/api/voiceprint/speakers/{name}/refine` | POST | Session/API key | Rebuild voiceprint from snippets |
 | `/api/token` | GET/POST | Session/API key | Client API token status / generate (one per user) |
@@ -241,13 +278,27 @@ asr-mcp/
 | `/api/mcp/tools` | GET | No | List MCP tools |
 | `/api/mcp/resources` | GET | No | List MCP resources |
 | `/api/mcp/call` | POST | No | Call MCP tool |
+| `/api/mcp/resource/{uri}` | GET | No | Read one MCP resource |
 
 ## Environment Variables
+
+**The clustering thresholds live in `asr_mcp/config/thresholds.json`, not in the
+environment.** `TRANSCRIBE_DIARIZATION_THRESHOLD` is declared in
+`config/settings.py` but never read — the pipeline reads
+`thresholds.json → diarization.distance_threshold` (or the per-request
+`diarization_threshold` field, which overrides it for one call). Editing
+`.env.example` to change clustering behaviour has no effect.
+
+`docker-compose.yml` only forwards the variables listed below; anything else
+set in `.env` stays in the host and never reaches the container. Copy
+`.env.example`, edit it, and add a `- TRANSCRIBE_X=${TRANSCRIBE_X}` line to
+`docker-compose.yml` for anything new.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TRANSCRIBE_SESSION_SECRET` | (required) | Secret key for session cookies |
-| `TRANSCRIBE_HTPASSWD_PATH` | `/app/data/.htpasswd` | Path to htpasswd file |
+| `TRANSCRIBE_HTPASSWD_PATH` | `/app/htpasswd` | Path to htpasswd file (compose sets `/app/data/.htpasswd`) |
+| `TRANSCRIBE_API_KEYS` | `[]` | JSON list of static API keys; a request with a matching `X-API-Key` runs as the `default` user |
 | `TRANSCRIBE_PREFIX` | `""` | URL prefix for reverse proxy |
 | `TRANSCRIBE_CUDA_DEVICE` | `cuda:0` | CUDA device ordinal |
 | `TRANSCRIBE_HOST` | `0.0.0.0` | Server bind host |
@@ -257,28 +308,27 @@ asr-mcp/
 | `TRANSCRIBE_VOICES_DIR` | `./voices` | Voiceprint snippets directory |
 | `TRANSCRIBE_DB_PATH` | `./data/asr_mcp.db` | SQLite database path |
 | `TRANSCRIBE_MODEL_CACHE_DIR` | `./models` | ONNX model cache |
-| `TRANSCRIBE_DIARIZATION_THRESHOLD` | `0.35` | Clustering cosine threshold |
-| `TRANSCRIBE_VAD_THRESHOLD` | `0.5` | VAD speech probability cutoff |
+| `TRANSCRIBE_VAD_THRESHOLD` | `0.5` | VAD speech probability cutoff (not forwarded by compose) |
 | `TRANSCRIBE_MODEL_TTL_MINUTES` | `5` | Idle minutes before GPU models unload (0 = disabled); skipped while a job is active |
-| `TRANSCRIBE_GPU_MEMORY_LIMIT_GB` | `4.0` | GPU size hint for CUDA arena caps (encoder = ×0.625, embedding = ÷4 capped at 768 MiB) |
+| `TRANSCRIBE_GPU_MEMORY_LIMIT_GB` | `4.0` | GPU size hint for CUDA arena caps (encoder = ×0.625, embedding = ÷4 capped at 768 MiB); not forwarded by compose |
+| `TRANSCRIBE_LOG_LEVEL` | `INFO` | Log level |
 | `TRANSCRIBE_ASR_MODEL` | `cohere` | ASR backend: `cohere` (ONNX, default), `qwen3-asr` (transformers/Qwen3-ASR) or `whisper` (faster-whisper) |
 | `TRANSCRIBE_QWEN_MODEL_NAME` | `Qwen/Qwen3-ASR-1.7B` | Qwen3-ASR model name (HF) |
 | `TRANSCRIBE_QWEN_MODEL_DIR` | `./models/qwen3-asr` | Qwen3-ASR local cache dir |
 | `TRANSCRIBE_QWEN_FORCED_ALIGNER_NAME` | `Qwen/Qwen3-ForcedAligner-0.6B` | Forced aligner model name (HF) |
-| `TRANSCRIBE_QWEN_FORCED_ALIGNER_DIR` | `./models/qwen3-forced-aligner` | Forced aligner local cache dir |
+| `TRANSCRIBE_QWEN_FORCED_ALIGNER_DIR` | `./models/qwen3-forced-aligner` | Qwen3-Forced-Aligner local cache dir |
 | `TRANSCRIBE_QWEN_TORCH_DTYPE` | `float16` | Torch dtype for Qwen3 model/aligner |
 | `TRANSCRIBE_QWEN_MAX_NEW_TOKENS` | `256` | Max decode tokens for Qwen3-ASR |
 | `TRANSCRIBE_QWEN_MAX_INFERENCE_BATCH_SIZE` | `8` | Qwen3-ASR inference batch size |
 | `TRANSCRIBE_QWEN_QUANTIZE_4BIT` | `true` | Load Qwen3-ASR via BitsAndBytes load_in_4bit |
-| `TRANSCRIBE_QWEN_ALIGNER_QUANTIZE_4BIT` | `true` | Load the Qwen3 forced aligner in 4-bit (saves ~0.9GB VRAM); falls back to fp16 automatically if the 4-bit load fails |
+| `TRANSCRIBE_QWEN_ALIGNER_QUANTIZE_4BIT` | `true` | Load the Qwen3 aligner in 4-bit (saves ~0.9GB VRAM); fp16 fallback (not forwarded by compose) |
 | `TRANSCRIBE_WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model size name or HF repo id |
 | `TRANSCRIBE_WHISPER_MODEL_DIR` | `./models/faster-whisper` | Whisper local download dir (subdir per model spec) |
-| `TRANSCRIBE_WHISPER_COMPUTE_TYPE` | `auto` | CTranslate2 compute type; `auto` = int8_float16 on CUDA / int8 on CPU (quantized to fit small GPUs) |
+| `TRANSCRIBE_WHISPER_COMPUTE_TYPE` | `auto` | CTranslate2 compute type; `auto` = int8_float16 on CUDA / int8 on CPU |
 | `TRANSCRIBE_WHISPER_BEAM_SIZE` | `5` | Whisper beam size |
-| `TRANSCRIBE_WHISPER_VAD_FILTER` | `true` | faster-whisper built-in Silero VAD filter |
-| `TRANSCRIBE_WHISPER_CPU_THREADS` | `0` | Threads for Whisper CPU decode (0 = CT2 default) |
-| `TRANSCRIBE_HF_TOKEN` | - | HuggingFace token for gated models |
-| `API_KEYS` | - | Comma-separated API keys |
+| `TRANSCRIBE_WHISPER_VAD_FILTER` | `true` | faster-whisper built-in Silero VAD filter (disabled for live turns) |
+| `TRANSCRIBE_WHISPER_CPU_THREADS` | `0` | Threads for Whisper CPU decode (0 = CT2 default; not forwarded by compose) |
+| `TRANSCRIBE_HF_TOKEN` | - | HuggingFace token for gated models (not forwarded by compose) |
 
 ## Known Issues
 
@@ -289,159 +339,67 @@ asr-mcp/
 
 ## Lessons Learned (Critical Behavior Rules)
 
-These are hard-won bugs that **will** reappear if violated. Follow these rules when modifying any code.
+These are hard-won bugs that **will** reappear if violated. The rule is stated
+here; the evidence, measurements and mechanism live in the linked detail file.
+Follow these when modifying any code — and read the detail file before changing
+anything the rule covers.
 
-### 1. Speaker Labels: ALWAYS "Speaker N" (1-indexed)
-- Every code path that creates or assigns speaker labels MUST use `f"Speaker {n}"` with 1-indexed integers.
-- NEVER use `"SPEAKER_00"`, `"SPEAKER_01"`, or any zero-indexed underscore format.
-- **Why**: The renumbering logic in `pipeline.py` parses labels with `int(name.split()[-1])`. Non-"Speaker N" labels cause `ValueError: invalid literal for int() with base 10`.
-- Affected files: `profiling.py` (`relabel_by_pitch`), `segment_ops.py` (`absorb_islands`), `clustering.py` (`match_known_speakers_full`), `pipeline.py` (renumbering block).
+### Diarization, speaker identity, uncertainty policy
+| # | Rule | Detail |
+|---|---|---|
+| 1 | Speaker labels are ALWAYS `Speaker N`, 1-indexed — never `SPEAKER_00` | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 2 | If a model is loaded into `ModelState`, every call site must pass the session through | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 3 | Segments are speech-length, not window-length; windows are for embeddings only | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 4 | Merge nearby VAD regions (<0.5s gap) before splitting | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 11 | Reordering the pipeline requires updating ALL downstream code | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 29 | Auto-collect gates on the speaker's CUMULATIVE total, not a per-chunk cap | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 30 | Uncertain speaker: suppress the IDENTITY, keep the text; one policy module, `uncertainty.enabled: false` is the rollback | [diarization](docs/lessons/diarization-and-speakers.md) · [user docs](docs/uncertain-speakers.md) |
+| 32 | `num_speakers` selects a DIFFERENT clustering path (hard k, no greedy merge) | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 33 | Verify diarization on a SHORT clip too — 52-min files hide over-clustering | [diarization](docs/lessons/diarization-and-speakers.md) |
 
-### 2. Wire Up Loaded Models — Don't Just Load Them
-- If an ONNX session is loaded into `ModelState`, every code path that uses it MUST pass the session object through.
-- **Why**: Silero VAD was loaded but `_run_vad()` never passed `state.vad_session` to `run_vad_onnx()`, silently falling back to energy-based VAD for weeks.
-- **Rule**: After loading a model in `model_loader.py`, grep for all call sites and verify the session is actually used.
+### ASR decoding internals (Cohere ONNX)
+| # | Rule | Detail |
+|---|---|---|
+| 7 | Mel must be split into overlapping ≤30s windows for the encoder | [decoding](docs/lessons/asr-decoding.md) |
+| 8 | KV cache names map `present.` → `past_key_values.` after step 0 | [decoding](docs/lessons/asr-decoding.md) |
+| 12 | Prompt tokens come from `token_to_id` lookups in a fixed exact order | [decoding](docs/lessons/asr-decoding.md) |
+| 13 | Mel features must match the reference pipeline exactly (nperseg/noverlap/mode/z-norm) | [decoding](docs/lessons/asr-decoding.md) |
+| 14 | `attention_mask` covers full past + current length; `position_ids` offset by `past_seq_len` | [decoding](docs/lessons/asr-decoding.md) |
+| 15 | Cohere timestamps are `<\|spltokenN\|>` tokens, not `<\|1.23\|>` | [decoding](docs/lessons/asr-decoding.md) |
+| 16 | Decode long audio in ≤30s windows; never swallow a partial window error | [decoding](docs/lessons/asr-decoding.md) |
 
-### 3. Diarization Segments Must Be Speech-Length, Not Window-Length
-- VAD + energy-dip splitting produces the base segments. Sliding windows are ONLY for embedding extraction, NOT for defining segment boundaries.
-- After embedding/clustering, `collapse_same_speaker_segments(max_gap=0.5)` merges same-speaker windows.
-- **Why**: 2.0s windows with 1.2s stride create overlapping segments that don't match natural speech.
-- Current params: window_sec=3.0, stride_sec=2.5, collapse max_gap=0.5s, absorb_islands gap 0.5s.
+### GPU / ONNX Runtime
+| # | Rule | Detail |
+|---|---|---|
+| 5 | ORT has no `ORTRuntimeError`; catch `Exception` and gate on `is_gpu_oom(e)` | [gpu](docs/lessons/gpu-and-onnx-runtime.md) |
+| 6 | Embedding GPU OOM → CPU fallback with fbank chunking | [gpu](docs/lessons/gpu-and-onnx-runtime.md) |
+| 27 | Arena discipline: cap at creation → shrink per run → clear the old session before reloading | [gpu](docs/lessons/gpu-and-onnx-runtime.md) |
 
-### 4. Merge Nearby VAD Regions Before Splitting
-- `_merge_nearby_speech(speech_ts, sample_rate, max_gap_sec=1.0)` merges VAD regions separated by <1s silence.
-- **Why**: Silero VAD produces many short regions during brief pauses (breaths, filler sounds) within a single speaker's turn.
+### API, SSE and auth
+| # | Rule | Detail |
+|---|---|---|
+| 9 | Long-running upload endpoints return `text/event-stream` | [api](docs/lessons/api-sse-and-auth.md) |
+| 10 | Authenticated `fetch()` needs `credentials: 'same-origin'` | [api](docs/lessons/api-sse-and-auth.md) |
+| 19 | SSE producers must yield (`sleep(0.01)`) AND run heavy work off-loop | [api](docs/lessons/api-sse-and-auth.md) |
+| 20 | Last middleware added is outermost; do not reorder Session/Auth | [api](docs/lessons/api-sse-and-auth.md) |
+| 25 | `stage: "done"` finishes the job — progress events must not use it | [api](docs/lessons/api-sse-and-auth.md) |
+| 28 | `language` must be threaded router → prompt → decode, not forced to English | [api](docs/lessons/api-sse-and-auth.md) |
 
-### 5. ONNX Runtime Error Handling
-- `onnxruntime` has NO `ORTRuntimeError` attribute. Catch `Exception` and gate on `is_gpu_oom(e)` — ORT ≥1.22 raises `onnxruntime_pybind11_state.RuntimeException` which inherits `Exception`, NOT `RuntimeError`, so `except RuntimeError` silently never fires.
-- `is_gpu_oom` (model_state.py) matches, case-lowered: `failed to allocate memory`, `out of memory`, `out_of_memory`, `available memory of`, `smaller than requested bytes` — the last two exist because arena-cap messages (`Available memory of 0 is smaller than requested bytes of 97517568`) don't contain "Failed to allocate memory".
-- Pattern: `except Exception as e: if not is_gpu_oom(e): raise` then recover.
-- **Why**: Every OOM was silently re-raised because (a) the except clause itself threw `AttributeError`, then (b) `except RuntimeError` never matched ORT's exception type, then (c) the arena-cap message didn't match the string.
+### Streaming, frontend and output
+| # | Rule | Detail |
+|---|---|---|
+| 17 | Every second of the timeline is covered by exactly one turn | [turns](docs/lessons/transcription-turns.md) |
+| 18 | Exact turn boundaries come from uncollapsed VAD + voiceprint attribution | [turns](docs/lessons/transcription-turns.md) |
+| 21 | CSS for JS-generated elements must not be scoped under classes JS never adds | [frontend](docs/lessons/frontend-and-client.md) |
+| 22 | Display the REFINED segments, not raw diarization | [frontend](docs/lessons/frontend-and-client.md) |
+| 23 | Progress UI needs per-window time interpolation | [frontend](docs/lessons/frontend-and-client.md) |
+| 24 | Paragraph breaks at pauses snap to a sentence end within 40 chars | [frontend](docs/lessons/frontend-and-client.md) |
+| 26 | Never pin `state.*_session`; resolve it live at call time | [frontend](docs/lessons/frontend-and-client.md) |
+| 31 | Streaming: one speech state per turn, validate `len(data) >= 8`, bounded queue, flush on disconnect | [streaming](docs/lessons/streaming-websocket.md) |
 
-### 6. Embedding GPU OOM → CPU Fallback with Chunking
-- ECAPA-TDNN512 embedding on CUDA can OOM after encoder has consumed VRAM.
-- `_run_with_cpu_fallback()` catches `Exception` gated by `is_gpu_oom(e)` (NOT `RuntimeError` — see lesson 5) and retries on CPU with cached sessions.
-- For long audio: `extract_embedding()` chunks fbank into 60s pieces, embeds each, averages, L2-normalizes.
-- `batch_embed_files()` uses `block_sec=60.0` (not 600.0) to prevent huge ONNX calls.
-
-### 7. Encoder Chunking for Long Audio
-- Mel spectrogram must be split into overlapping windows (MAX_ENCODER_SEC=30s, 25% overlap) for audio >30s.
-- Each window encoded independently, outputs concatenated along sequence dimension.
-- Decoder receives `encoder_hidden_states` as direct input (not just KV caches).
-
-### 8. Decoder KV Cache Name Mapping
-- HuggingFace ONNX outputs use `present.{i}.decoder.key` but decoder inputs expect `past_key_values.{i}.decoder.key`.
-- After step 0, map output names: `name.replace("present.", "past_key_values.")`.
-- Cross-attention KV caches initialized as empty (seq_len=0).
-
-### 9. SSE for Long-Running Endpoints
-- Upload endpoints that run diarization/transcription MUST use `StreamingResponse(media_type="text/event-stream")`.
-- nginx `proxy_read_timeout` defaults to 120s — set to 600s in `nginx_snippet.conf`.
-- Frontend reads SSE via `ReadableStream` + `TextDecoder()`, parses `data:` lines.
-
-### 10. Session Auth Requires `credentials: 'same-origin'`
-- All `fetch()` calls for authenticated endpoints MUST include `credentials: 'same-origin'`.
-- Without it, the session cookie isn't sent, AuthMiddleware redirects to `/login` (HTML), and frontend tries to parse HTML as JSON.
-- Use `window.location.replace()` not `window.location.href` for login redirects (avoids back-button loops).
-
-### 11. When Modifying Pipeline Order, Update ALL Downstream Code
-- The 13-step pipeline has strict ordering: profiling → merge_similar → relabel → renumber centroids → boundary refine → ghost → match.
-- After any reorder, check that centroid key formats (integer vs string "Speaker N"), segment label formats, and lookup methods all still match.
-- **Why**: Mismatched centroid keys caused silent failures where `match_known_speakers_full` received empty clusters.
-
-### 12. Cohere Prompt Tokens: Exact Order via token_to_id (Not tokenizer.encode)
-- Build the prompt with **direct `token_to_id` lookups** (`if t in token_to_id`), never `tokenizer.encode()` per token.
-- Exact order: `<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|lang|> <|lang|> <|pnc|> <|noitn|> <|timestamp|> <|nodiarize|>` — note the **duplicate language token** and startofcontext FIRST.
-- `eos_id = token_to_id["endoftext"]` — never hardcode (was wrongly `3`).
-- **Why**: Missing `<|startofcontext|>`, a single language token, or wrong order made the model emit punctuation-only garbage (`,,`, `e`, `at`) even though the encoder/decoder ran fine.
-
-### 13. Mel Features Must Match the Reference Pipeline Exactly
-- Required: `nperseg=512` hann, `noverlap=352` (hop 160), `mode='magnitude'`, `power_to_db(ref=np.max)`, NO dither, pre-emphasis, per-mel-band z-norm. Returns `[T,128]`.
-- **Why**: A 400-sample window + `np.log(mel+1e-8)` variant produced off-distribution features → same garbage-text symptom as a bad prompt. Prompt AND features must both be right; matching one hides nothing.
-- Magnitude vs power is a constant factor that cancels under z-norm — but window length and log-vs-power_to_db do NOT cancel.
-
-### 14. Decoder attention_mask = Full past + current Length
-- `attention_mask = ones(batch, past_seq_len + tokens_this_call + encoder_seq_len)`; `position_ids` offset by `past_seq_len`.
-- Masking only the current tokens while position grows desynchronizes RoPE/positions across multi-step decode.
-
-### 15. Cohere Timestamps Are `<|spltokenN|>` Tokens, Not `<|1.23|>`
-- `SPLIT_TOKEN_BASE = token_to_id["<|spltoken0|>"]`, 34 bins; segment end = `audio_duration * (token_id - BASE) / 34`.
-- The regex `<\|(\d+\.?\d*)\|>` NEVER matches these tokens → without split-token handling every result is a single segment `{start:0, end:full_duration}` (the observed symptom).
-- Skip other `<|...|>` specials during decode; map `▁` → space; run `clean_transcript` per flushed segment.
-
-### 16. Decode Long Audio in ≤30s Windows (Encoder Chunking Alone Is Not Enough)
-- One decode over a 951s turn ends in early EOS/max_new_tokens → text truncated after the first ~30s of speech even though encoder chunking ran.
-- `_transcribe_windowed` + `_plan_window_bounds` (energy-snap cuts, min 300-frame tail) fix this. Streaming/KV-bridge paths set `_no_window=True` (bridging already chunks).
-- **Never swallow partial window errors**: if window 2+ fails but window 0 has text, still set `result["error"]` — otherwise output looks like benign truncation. (`TranscribeResult.error` is optional; both text and error may be present.)
-
-### 17. Every Second Must Be Covered by Exactly One Transcription Turn
-- Inter-turn gaps (e.g. 22.6→28.0s) where speech exists are silently UNTRANSCRIBED — no error, no empty row, just missing text.
-- `_prepare_turns` must close every gap >1ms between consecutive turns AND extend edges to 0/duration. Full coverage is an invariant; keep it through any refactor.
-- Fallback chain per gap (cheap → expensive): VAD-section voiceprint attribution → energy-dip centre (`_gap_boundary`) → midpoint.
-
-### 18. Exact Turn Boundaries: Uncollapsed VAD Sections + Voiceprint Attribution
-- Use RAW VAD (`run_vad_onnx` over the full file — no `_merge_nearby_speech`, no `split_at_energy_dips`) so each speech region keeps its true edges.
-- Embed every section spanning the gap (`extract_embedding`); reference per speaker = known DB voiceprint if the turn label matches (try `name.strip("[]")`), else ≤30s of that speaker's own diarized turn audio. Both refs required — otherwise fall back to energy.
-- Ownership split via `_best_split(owners, weights)` with weights = embedding-distance margin (confident matches dominate noise). Same-speaker boundaries (from long-turn splits) are all-left → left absorbs the gap.
-- Apply ONE shared cut per gap (`left.end == right.start`), clamped into `[gap_start, gap_end]` so turns stay contiguous and can never overlap or chain-react. Cut = exact start of the first right-owned section, or `gap_end` when all-left.
-- Log `Boundary refinement N: ... cut at X.XXs` — grep this to confirm the refinement is active after a rebuild.
-
-### 19. SSE Producers Must Yield AND Run Heavy Work Off-Loop
-- `await queue.put()` on an unbounded `asyncio.Queue` NEVER suspends — the consumer doesn't run and all events flush in one burst when the job ends.
-- `_sse_put()` = `queue.put()` + `await asyncio.sleep(0.01)`. `sleep(0)` alone is insufficient: the BaseHTTPMiddleware body pump + uvicorn transport need a real tick to flush bytes.
-- Yielding is not enough for CPU-heavy work (ONNX decode, clustering): it starves the loop regardless. Run turns via `loop.run_in_executor(None, ...)`; thread-side progress uses `loop.call_soon_threadsafe(queue.put_nowait, evt)`.
-
-### 20. Starlette Middleware Order — Last Added Runs Outermost
-- `app.add_middleware()` prepends to the stack: the LAST middleware added wraps all earlier ones and runs FIRST.
-- Working order in `server.py`: AuthMiddleware added first (inner), SessionMiddleware added second (outer) → Session populates `request.scope["session"]` before Auth reads it.
-- **Why**: An attempted swap (to "fix" SSE 401s) broke auth and was reverted. SSE endpoints are not in `PUBLIC_PATHS` and depend on this order to see the session cookie. Do not reorder without tracing who populates `scope["session"]` first.
-
-### 21. CSS for JS-generated Elements Must Not Be Scoped Under Classes JS Never Adds
-- Timeline styles were scoped `.speaker-timeline .bar-seg`, but `renderTimeline()` never added that class → `position:absolute` etc. silently no-op'd: segments stacked (one visible speaker), legend swatches got zero size.
-- Rule: add the scoping class in JS OR write selectors against the real elements. Verify by inspecting computed styles, not just rendered HTML.
-
-### 22. Display REFINED Segments, Not Raw Diarization
-- `_prepare_turns()` closes inter-turn gaps (VAD voiceprint attribution + midpoint cuts) so turns cover the full timeline. Emit ITS output in `diarization_complete` and set `diarization["segments"]` to it — raw segments leave visible gaps between bands.
-- Strip the nested `segments` list before emitting (`{start, end, speaker}` only) to keep SSE payloads small.
-- `auto_collect_from_diarization()` must still receive the RAW segments (happens before replacement).
-
-### 23. Progress UI Needs Sub-Turn Time Interpolation
-- Window-progress events for one long turn all carried the same `segment_start`/`segment_end` → the caret never moved despite events arriving.
-- Interpolate per window in `_make_window_cb`: `win_start = turn.start + span * (i-1)/n`.
-- Elements shown under a bar whose container has `overflow:hidden` must live in a sibling wrapper or they are clipped (caret moved into `position:relative; padding-bottom` wrapper).
-- UI chrome (SPA tab bar) lives in `templates/_nav.html`, injected by `_render(name, active=...)` via `__NAV__` + `__ACT_*__` markers — edit the snippet, not `app.html`. All four page routes (`/gui`, `/voices`, `/transcriptions`, `/settings`) render `app.html`; tab switching is client-side (pushState + `activateTab`).
-
-### 24. Paragraph Breaks at Pauses Must Snap to Sentence Ends
-- `_apply_paragraph_breaks()` (asr_router.py): RMS interior pauses ≥ `PARAGRAPH_PAUSE_SEC` (1.5s), map each to the nearest decoder split-token segment boundary, then snap to `[.!?…]` within **40 chars**.
-- If no punctuation is close: break at the boundary anyway and append `.` (after stripping trailing `,;—`) so the break is still a sentence boundary.
-- **Why 40 chars**: a 120-char window snapped BACKWARD across the pause to an earlier sentence end, burying the pause mid-paragraph. Keep the snap window tight.
-
-### 25. `stage: "done"` in SSE Finishes the Job — Progress Events Must Not Use It
-- `_sse_put` publishes every event to `job_state.publish`, which calls `finish()` when `stage in ("done","error","cancelled")` → `_active = None`. If a mid-job progress event says `done` (pipeline used to emit final diarization progress as `stage: "done"`), the TTL monitor sees no running job and unloads models WHILE the turn loop still runs → `'NoneType' has no attribute 'get_inputs'`. `"cancelled"` is emitted ONLY by run_transcribe's `except JobCancelled` handler (cancel via `POST /api/asr/active/cancel` sets `job.cancel_requested`; `JobCancelled(BaseException)` is raised from progress callbacks so backend `except Exception` blocks cannot swallow it).
-- Pipeline final progress stage must be `"diarization_finished"` (NOT `"done"`). `job_state.publish` also guards `evt.get("phase") != "diarization"` so real terminal events (which carry NO phase key) still finish the job.
-- `state.touch()` at the start of the transcribe turn loop so idle-TTL never counts job time as idle.
-- Import rule: `from asr_mcp.core import job_state` — the MODULE (functions `start_job/get_running/publish/finish/ensure_finished`); there is NO `job_state` symbol to import.
-- **Activity channel** (replaces polling `GET /active`): `job_state.subscribe_activity()/unsubscribe_activity()` queues receive only `{"active": true/false, ...}` transitions from `start_job`/`finish`. `GET /api/asr/activity/stream` subscribes BEFORE taking its snapshot (a start/finish racing the connect lands in the queue, not lost), sends the snapshot first, then pushes changes with 20s `: ping` keep-alives. GUI keeps one long-lived `connectActivity()` reader; `POST /active/cancel` and the per-job `/active/stream` are unchanged.
-
-### 26. Never Pin Session Objects — Resolve `state.*_session` Live
-- Storing `state.embedding_session` into another object (`set_embedding_session`) leaves a stale/None reference once lazy-load/TTL/phase-unload replaces or clears it → `'NoneType' ... get_inputs` deep in a helper.
-- Rule: look up the session at call time (`VoiceprintService._emb_session()` = `self._embedding_session or state.embedding_session`). Grep for direct `state.*_session` field reads inside services before adding pins.
-
-### 27. GPU Arena Discipline: Cap → Shrink Per Run → Reload Clears First
-- Caps set at session creation (`_cuda_provider_options`): encoder `gpu_memory_limit_gb×0.625`, embedding `min(÷4, 768 MiB)`, `cudnn_conv_algo_search: HEURISTIC` (EXHAUSTIVE allocates huge workspaces).
-- Every GPU run passes `GPU_SHRINK_RUN_OPTIONS` (`memory.enable_memory_arena_shrinkage=gpu:0`) — without it the arena only releases on full session reload.
-- Cohere encoder reload (`reload_encoder` in `transcribers/cohere.py`) / embedding reload (`reload_embedding_session` in `model_loader.py`): set the field to `None` + `gc.collect()` BEFORE constructing the replacement — otherwise old arena (alive) + new session (allocating) peak together.
-- Encoder OOM escalation: reload fresh arena → retry GPU once → CPU fallback. Embedding OOM: straight to cached CPU session.
-
-### 28. Language Must Be Threaded End-to-End — Routers, Prompt, and Decode
-- `transcribe/upload` accepts `?language=` (ISO 639-1 or `auto`, default `auto`) → `_transcribe_file(language=...)` → `transcribe_audio_sync(language=...)`. Before this, routers never passed `language` and every backend silently forced English — Hungarian audio decoded as English hallucination.
-- Each backend carries a **static `LANGUAGES: list[(code, name)]` class attribute** (+ `SUPPORTS_AUTO`) — available without loading the model; `GET /api/asr/languages` serves it. GUI dropdown (Transcribe options) and the client (`LANGUAGE=` in .env / `--language` flag) both default to `auto`.
-- `auto` handling: whisper (`None` → faster-whisper detect), qwen3 (`_to_canonical_language` → `None` = detect), cohere (no `<|auto|>` vocab token → explicit English-prompt fallback, `SUPPORTS_AUTO=False`, GUI labels it "English fallback").
-- Cohere: the decoder prompt embeds language tokens (`<|hu|>` id 87, `<|en|>` id 62) — build it **per request** via `_prompt_ids_for(language)` (cached in `_prompt_cache`), NOT once at load with `language="en"`. Qwen maps via `LANGUAGE_MAP` (`"hu" → "Hungarian"`); Whisper passes the ISO code straight to faster-whisper (`auto`/empty → detect).
-- **Cohere model limitation**: cohere-transcribe-03-2026-ONNX q4 cannot transcribe Hungarian at all — en prompt → English hallucination, hu prompt → Cyrillic/spam hallucination (verified; English control input is perfect). Use whisper for non-English.
-- 56.8-min hu podcast benchmark (GTX 1650): whisper 498s/1290MiB/7.1× (excellent quality), cohere 1295s/2392MiB/2.65× (hu unusable), qwen3 2388s/2830MiB/1.43× (correct content, no punctuation).
-
-### 29. Auto-Collect: Cumulative Total vs Per-Chunk Cap
-- `auto_collect_from_diarization()` (voiceprint/service.py) pre-loops each segment while `current_total < AUTO_COLLECT_MAX_SEGMENT_SEC` (300s) — but `current_total` is the speaker's CUMULATIVE DB total (target cap is `AUTO_COLLECT_MAX_TOTAL_SEC` = 1200s). Any speaker already ≥300s (23 of 35 here) never entered the loop → silently collected zero snippets forever. The per-chunk length is already bounded inside by `chunk_end = min(seg_start + MAX_SEGMENT_SEC, seg_end)`.
-- Rule: gate the OUTER loop on `MAX_TOTAL_SEC` only; keep `MAX_SEGMENT_SEC` as an inner chunk bound. Cap skips now log `Auto-collect: %s at snippet cap`, and upload routers log `Auto-collected %d snippets from %d segments` so silent skips are visible.
-- Auto-collect runs unconditionally after diarization (NOT gated on `save=false`) and only for speakers with a registered voiceprint for the requesting `user_id` (generic `Speaker N` labels are skipped by design).
+### Reference documents
+- [docs/uncertain-speakers.md](docs/uncertain-speakers.md) — user-facing description of the
+  uncertainty policy: JSON shape, every `attribution_reason`, both naming gates, and the
+  known limitation on short recordings.
+- [docs/lessons/](docs/lessons/) — one file per subsystem with the full evidence behind
+  each rule above.

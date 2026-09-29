@@ -11,6 +11,7 @@ import soundfile as sf
 import torch
 
 from asr_mcp.db.manager import DatabaseManager, SnippetDB, VoiceprintDB, DEFAULT_USER
+from asr_mcp.speaker.uncertainty import eligible_for_auto_collect
 from asr_mcp.speaker.embedding import (
     extract_embedding, batch_embed_files, compute_pitch, compute_energy,
 )
@@ -34,17 +35,14 @@ def _origin_prefix(audio_path: str) -> str:
 
 
 def is_spurious_speaker_name(name: str) -> bool:
-    """Check if a speaker name is generic or auto-generated."""
-    import re
-    if not name or name == "OVERLAP":
-        return True
-    if re.match(r"^(SPEAKER|Speaker\s*)\d+$", name, re.IGNORECASE):
-        return True
-    if re.search(r"_\d{2}-\d{2}-\d{2}_(SPEAKER|Speaker\s*)\d+$", name, re.IGNORECASE):
-        return True
-    if re.match(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_.*$", name):
-        return True
-    return False
+    """Check if a speaker name is generic or auto-generated.
+
+    Delegates to the shared uncertainty policy (asr_mcp.speaker.uncertainty) so
+    this and the auto-collection gate can never disagree on what counts as an
+    identity.
+    """
+    from asr_mcp.speaker.uncertainty import is_uncertain_label
+    return is_uncertain_label(name)
 
 
 class VoiceprintService:
@@ -538,14 +536,25 @@ class VoiceprintService:
             speaker_totals[name] = info["total_duration"]
 
         by_speaker: dict[str, list[dict]] = {}
+        skipped_uncertain = 0
         for seg in segments:
             sp = seg.get("speaker", "")
             if not sp:
+                continue
+            # Uncertainty policy: never feed UNKNOWN / OVERLAP / generic
+            # "Speaker N" / suppressed or low-confidence segments into the DB.
+            if not eligible_for_auto_collect(seg):
+                skipped_uncertain += 1
                 continue
             dur = seg.get("end", 0) - seg.get("start", 0)
             if dur < AUTO_COLLECT_MIN_DURATION:
                 continue
             by_speaker.setdefault(sp, []).append(seg)
+        if skipped_uncertain:
+            logger.info(
+                "Auto-collect: skipped %d segment(s) with uncertain speaker identity",
+                skipped_uncertain,
+            )
 
         for speaker_name, segs in by_speaker.items():
             # ONLY auto-collect for genuinely registered known speakers (e.g. "Gergely Papp", "Ismael Capel")

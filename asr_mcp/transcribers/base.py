@@ -73,6 +73,7 @@ class ASRBackend(ABC):
         _no_window: bool = False,
         progress_cb: Optional[Callable[[dict], None]] = None,
         context: str = "",
+        pre_segmented: bool = False,
     ) -> dict:
         """Transcribe audio (or precomputed features). Returns:
         {text, segments, audio_duration_sec, inference_time_sec,
@@ -80,4 +81,8 @@ class ASRBackend(ABC):
 
         ``context`` is an optional short carry-over transcript that a backend
         may use as a decoding hint. Backends without a context slot ignore it.
+
+        ``pre_segmented`` marks audio the caller already cut into a single
+        speaker turn (live streaming). Backends with their own internal VAD or
+        previous-text conditioning must not re-segment or re-condition it.
         """

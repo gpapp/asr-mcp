@@ -37,6 +37,7 @@ def transcribe_audio_sync(
     _no_window: bool = False,
     progress_cb=None,
     context: str = "",
+    pre_segmented: bool = False,
 ) -> dict:
     """Transcribe audio (or a precomputed mel) with the active ASR backend."""
     return _backend().transcribe_audio_sync(
@@ -49,6 +50,7 @@ def transcribe_audio_sync(
         _no_window=_no_window,
         progress_cb=progress_cb,
         context=context,
+        pre_segmented=pre_segmented,
     )
 
 

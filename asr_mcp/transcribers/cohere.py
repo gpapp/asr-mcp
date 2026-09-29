@@ -687,8 +687,13 @@ class CohereBackend(ASRBackend):
         _no_window: bool = False,
         progress_cb: Optional[callable] = None,
         context: str = "",
+        pre_segmented: bool = False,
     ) -> dict:
         start_time = time.time()
+
+        # Cohere has no internal VAD and no previous-text conditioning; the
+        # parameter only documents that the audio is already one turn.
+        del pre_segmented
 
         if audio is not None and mel_spectrogram is None:
             if audio.dtype != np.float32:

@@ -158,21 +158,61 @@ session. Valid tokens are stored as SHA-256 hashes in the `api_tokens` table
 (one per user, plaintext shown once); token requests return 401 JSON rather
 than a login redirect.
 
-### Diarization Pipeline (13 steps)
+### Uncertain Speakers
 
-1. **VAD** — Silero ONNX → speech regions, merge gaps <1s
+When a speaker identity cannot be established, the server **suppresses the
+identity and keeps the text** instead of force-fitting the segment to the
+nearest or most common speaker:
+
+```json
+{ "start": 9.2, "end": 10.6, "text": "Yes.",
+  "speaker": null, "speaker_confidence": 0.0, "speaker_source": "unknown",
+  "uncertain": true, "attribution_reason": "boundary_crossing" }
+```
+
+- Every result carries `speaker_confidence`, `speaker_source`
+  (`known_voiceprint` | `diarization_cluster` | `unknown`) and, when the
+  identity was withheld, `attribution_reason` (e.g. `boundary_crossing`,
+  `ghost_speaker`, `low_span_turn_overlap`).
+- The `done` SSE event reports `status` = `ok` | `partial` | `error` and
+  `uncertain_segments`.
+- The web UI and the Windows client render `null` as `UNKNOWN (<reason>)`;
+  the client also prints a warning and can write a `.json` sidecar
+  (`WRITE_JSON=1` or `--json`). **Text is never dropped** — only the name is.
+- A cluster is renamed to a registered person only if the match clears two
+  gates: a minimum confidence (`second_pass.min_identity_confidence`) and a
+  one-to-one claim (two acoustically different clusters cannot share a
+  voiceprint). Below the gate it stays `Speaker N` — with a large voiceprint
+  menu the best of a bad lot is not an identification.
+- `num_speakers` selects a *different* clustering path (hard k, no greedy
+  merge). If a result looks lopsided, read the `Cluster balance: ...` line in
+  the server log before touching the naming policy.
+- Thresholds: `asr_mcp/config/thresholds.json` → `uncertainty`, `streaming`,
+  `second_pass`. Set `"uncertainty": {"enabled": false}` for the full legacy
+  behaviour, or keep the policy and only restore absorption with
+  `"suppress_ghost_speakers": false, "suppress_minority_speakers": false`.
+- Known limitation: short recordings (<1 min) over-cluster, so one person's
+  turns can come back `UNKNOWN`. See **[docs/uncertain-speakers.md](docs/uncertain-speakers.md)**.
+
+### Diarization Pipeline
+
+Step numbers match the `# Step N` comments in
+`asr_mcp/diarization/pipeline.py::Diarizer.run`.
+
+1. **VAD** — Silero ONNX → raw sections, merge gaps <0.5s
 2. **Energy-dip splitting** — split long segments at quiet dips
-3. **Sliding windows** — 3.0s window, 2.5s stride (embeddings only)
+3. **Sliding windows** — 2.0s window, 1.2s stride (embeddings only)
 4. **Embedding** — ECAPA-TDNN512 ONNX (192-dim), MD5-keyed LRU cache
-5. **Clustering** — AgglomerativeClustering (cosine, average linkage)
-6. **Greedy merge** — centroid distance < 0.25 merged
-7. **Collapse** — same-speaker merge (max gap 0.5s) + absorb islands
-8. **Boundary refinement** — re-embedding at transitions
-9. **Speaker profiling** — Pitch, energy, spectral, MFCC stats
-10. **Merge similar speakers** — embed-only threshold 0.2
-11. **Relabel by pitch** — "Speaker 1" = highest pitch (always `Speaker N`, 1-indexed)
-12. **Ghost elimination** — speakers with < 5s total speech absorbed
-13. **Voiceprint matching** — Multi-feature distance (emb 0.6 + pitch 0.15 + spectral 0.1 + MFCC 0.1)
+5. **Clustering** — AgglomerativeClustering (cosine): threshold path uses average linkage at `distance_threshold`, or hard k when `num_speakers` is given (`forced_k_linkage`, default `complete`)
+5b/5c. **Label assignment** to short segments, then **overlap detection**
+6. **Build segments** — "Speaker N" labels, same-speaker merge (max gap 1.0s)
+7. **Cleanup** — split OVERLAP, absorb islands, refine boundaries
+8. **Speaker profiling** — pitch, energy, spectral, MFCC stats
+9. **Voiceprint matching** — Multi-feature distance (emb 0.6 + pitch 0.15 + spectral 0.1 + MFCC 0.1)
+10. **Ghost elimination** — <10s total speech → suppressed to `UNKNOWN` (not reassigned)
+11. **Minority suppression** — short speakers suppressed, matched voiceprints protected
+12. **Second pass** — re-identify unknown speakers (gated by `second_pass.min_identity_confidence`)
+13. **Exact boundary refinement** — from the raw VAD sections
 
 ## Project Structure
 
@@ -213,6 +253,8 @@ asr-mcp/
 │   │   ├── vad.py             # VAD (energy-dip splitting, chunked, ONNX)
 │   │   ├── matcher.py         # Multi-feature distance
 │   │   ├── profiling.py       # Pitch/energy/MFCC profiling
+│   │   ├── uncertainty.py     # Uncertain-speaker policy (single source of truth)
+│   │   ├── attribution.py     # Post-hoc span→turn attribution (boundary crossings)
 │   │   └── service.py         # SpeakerService (SQLite-backed)
 │   ├── voiceprint/
 │   │   ├── service.py         # VoiceprintService (snippet CRUD, auto-collect, refine)
@@ -223,16 +265,18 @@ asr-mcp/
 │   ├── sessions/
 │   │   └── manager.py         # SessionManager (SQLite-backed)
 │   ├── streaming/
+│   │   ├── turn_detector.py   # Adaptive energy turn detector (streaming)
 │   │   └── handler.py         # WebSocket dual-channel handler
 │   ├── config/
 │   │   ├── settings.py        # Pydantic BaseSettings (TRANSCRIBE_ prefix)
 │   │   ├── logging.py         # Structured logging (stdlib)
-│   │   └── thresholds.json    # All tunable params
+│   │   └── thresholds.json    # All tunable params (diarization/uncertainty/streaming)
 │   ├── static/
 │   └── templates/
 │       ├── _nav.html          # SPA tab bar
 │       ├── login.html          # Login form
 │       └── app.html            # Unified SPA (Transcribe / Voiceprints / History / Settings)
+├── tests/                    # Pure-python unit tests (pytest, no GPU required)
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt, voiceprints
 │   ├── transcribe.bat          # Drop-target wrapper: bootstraps .env + private .venv
@@ -248,5 +292,8 @@ asr-mcp/
 ├── .env.example
 ├── .gitignore
 ├── AGENTS.md
+├── docs/
+│   ├── uncertain-speakers.md   # Uncertainty policy reference
+│   └── lessons/                # Evidence behind each AGENTS.md rule
 └── README.md
 ```

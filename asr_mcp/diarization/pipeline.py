@@ -230,7 +230,12 @@ class Diarizer:
         return {
             "segments": merged_segments,
             "profiles": profiles,
-            "total_speakers": len(set(s.get("speaker") for s in merged_segments)),
+            "total_speakers": len({
+                s.get("speaker") for s in merged_segments if s.get("speaker")
+            }),
+            "uncertain_segments": sum(
+                1 for s in merged_segments if s.get("uncertain")
+            ),
             "total_time_sec": round(total_time, 2),
             "audio_duration_sec": round(audio_duration, 2),
         }
@@ -350,8 +355,25 @@ class Diarizer:
 
     def _cluster_embeddings(self, raw_embeddings: np.ndarray, num_speakers: Optional[int], threshold: float, cfg: dict):
         if num_speakers is not None:
+            # Forced-k uses COMPLETE linkage on purpose.  Average linkage
+            # merges a few far-away windows early and then chains every other
+            # cluster into the first one, which on real recordings produced
+            # 86.5%/13.3%/0.1% splits for k=3 (see AGENTS.md lesson 32).
+            # Complete linkage only merges when ALL members are close, so the
+            # big/medium/small split survives.
+            forced_k_cfg = cfg.get("diarization", {})
+            forced_k_linkage = str(
+                forced_k_cfg.get("forced_k_linkage", "complete")
+            ).strip().lower()
+            if forced_k_linkage not in ("complete", "average", "single"):
+                logger.warning(
+                    "Forced speaker count: unknown linkage %r, falling back to "
+                    "'complete'",
+                    forced_k_linkage,
+                )
+                forced_k_linkage = "complete"
             clusterer = AgglomerativeClustering(
-                n_clusters=num_speakers, metric="cosine", linkage="average"
+                n_clusters=num_speakers, metric="cosine", linkage=forced_k_linkage
             )
         else:
             clusterer = AgglomerativeClustering(
@@ -380,6 +402,40 @@ class Diarizer:
                 mean_emb = raw_embeddings[mask].mean(axis=0)
                 norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
                 cluster_centroids[int(cluster_id)] = norm_emb
+
+        # Cluster balance diagnostic.  A lopsided split (one cluster holding
+        # nearly all the audio) means the clusterer collapsed distinct voices,
+        # which then surfaces downstream as ONE confident identity for a
+        # multi-voice recording — the exact false attribution the uncertainty
+        # policy exists to prevent.  Log it so the cause is diagnosable from
+        # the pipeline log instead of inferred from the transcript.
+        sizes = np.bincount(np.asarray(long_labels, dtype=int))
+        if sizes.size:
+            total = int(sizes.sum())
+            order = np.argsort(sizes)[::-1]
+            shares = ", ".join(
+                "c%d=%d(%.1f%%)" % (int(c), int(sizes[c]), 100.0 * sizes[c] / total)
+                for c in order[:8]
+            )
+            logger.info(
+                "Cluster balance: %d windows -> %d clusters (largest %.1f%%): %s",
+                total, sizes.size, 100.0 * sizes.max() / total, shares,
+            )
+            if sizes.size > 1 and sizes.max() / total > 0.75:
+                logger.warning(
+                    "Cluster balance: the largest cluster holds %.1f%% of all "
+                    "speaker windows — a multi-voice recording is being "
+                    "collapsed into one identity. Check the ECAPA embedding "
+                    "quality / diarization.merge_threshold%s",
+                    100.0 * sizes.max() / total,
+                    (
+                        ", or omit num_speakers (the default threshold + "
+                        "greedy-merge path splits this material far better than "
+                        "a forced speaker count)"
+                        if num_speakers is not None
+                        else ""
+                    ),
+                )
 
         return long_labels, cluster_centroids
 
@@ -462,6 +518,10 @@ class Diarizer:
         sample_rate: int,
         segments: list,
     ) -> Optional[np.ndarray]:
+        # Uncertain/UNKNOWN segments have no identity — never build a reference
+        # for them (None.strip() would raise).
+        if not speaker_name:
+            return None
         clean_name = speaker_name.strip("[]")
         if clean_name in known_speakers:
             emb = known_speakers[clean_name].get("embedding")

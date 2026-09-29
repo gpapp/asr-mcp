@@ -298,7 +298,14 @@ class WhisperBackend(ASRBackend):
     # Decoding
     # ------------------------------------------------------------------
 
-    def _run(self, arr: np.ndarray, language: str, context: str, progress_cb) -> dict:
+    def _run(
+        self,
+        arr: np.ndarray,
+        language: str,
+        context: str,
+        progress_cb,
+        pre_segmented: bool = False,
+    ) -> dict:
         from asr_mcp.core.model_state import is_gpu_oom
 
         requested = str(language or "").strip().lower() or "auto"
@@ -306,13 +313,21 @@ class WhisperBackend(ASRBackend):
         if lang in ("", "none", "auto", "auto-detect"):
             lang = None
 
+        # pre_segmented=True: the caller already cut this audio into a single
+        # speaker turn (live streaming).  faster-whisper's built-in Silero VAD
+        # would re-segment that turn a second time, and previous-text
+        # conditioning would carry the *previous* speaker's words into this
+        # one.  Both are disabled so the turn is decoded as-is.
+        vad_filter = bool(self.settings.whisper_vad_filter) and not pre_segmented
+        condition_prev = not pre_segmented
+
         kwargs = dict(
             language=lang,
             beam_size=max(1, int(self.settings.whisper_beam_size)),
-            vad_filter=bool(self.settings.whisper_vad_filter),
+            vad_filter=vad_filter,
             # Keep timestamp tokens: segment-level times feed speaker attribution.
             without_timestamps=False,
-            condition_on_previous_text=True,
+            condition_on_previous_text=condition_prev,
         )
         ctx = (context or "").strip()
         # Carry-over context wins when present; otherwise anchor the style so the
@@ -414,6 +429,7 @@ class WhisperBackend(ASRBackend):
         _no_window: bool = False,
         progress_cb=None,
         context: str = "",
+        pre_segmented: bool = False,
     ) -> dict:
         start_time = time.time()
 
@@ -431,7 +447,8 @@ class WhisperBackend(ASRBackend):
 
         out = None
         try:
-            out = self._run(arr, language=language, context=context, progress_cb=progress_cb)
+            out = self._run(arr, language=language, context=context, progress_cb=progress_cb,
+                            pre_segmented=pre_segmented)
         except Exception as e:
             from asr_mcp.core.model_state import is_gpu_oom
 
@@ -439,7 +456,8 @@ class WhisperBackend(ASRBackend):
                 logger.warning("Whisper CUDA OOM (%s); retrying on CPU (int8)", e)
                 try:
                     self._fallback_to_cpu()
-                    out = self._run(arr, language=language, context=context, progress_cb=progress_cb)
+                    out = self._run(arr, language=language, context=context,
+                                    progress_cb=progress_cb, pre_segmented=pre_segmented)
                 except Exception as e2:
                     logger.error("Whisper transcription failed on CPU: %s", e2)
                     return self._error_result(e2, audio_duration, start_time)

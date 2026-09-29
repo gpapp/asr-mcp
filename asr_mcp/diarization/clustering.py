@@ -4,6 +4,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering
 
+from asr_mcp.speaker.uncertainty import apply_identity
+
 logger = logging.getLogger("asr_mcp.diarization.clustering")
 
 
@@ -340,10 +342,18 @@ def match_known_speakers_full(
                 alternatives.append({"speaker": name, "confidence": round(conf, 2)})
 
         if best_match and best_dist <= match_thresh and clear_winner:
-            for seg in merged_segments:
-                if seg["speaker"] == spk:
-                    seg["speaker"] = best_match
-                    if alternatives:
+            margin = (matches[1][1] - best_dist) if len(matches) > 1 else None
+            # Stamp the evidence: an identity assertion must travel with the
+            # segments, otherwise the API reports the geometric overlap ratio
+            # (1.0) instead of the real match confidence.
+            apply_identity(
+                merged_segments, spk, best_match,
+                confidence=best_conf,
+                margin=margin, match_dist=best_dist,
+            )
+            if alternatives:
+                for seg in merged_segments:
+                    if seg["speaker"] == best_match:
                         seg["alternatives"] = alternatives
             if spk in profiles:
                 profiles[best_match] = profiles.pop(spk)
@@ -361,11 +371,23 @@ def match_known_speakers_full(
 
     for speaker, cluster_list in speaker_to_clusters.items():
         if len(cluster_list) > 1:
-            primary = cluster_list[0]
+            # Several clusters matched this voiceprint.  cluster_list[0] was
+            # already renamed in step 5 (and carries its own evidence); the
+            # rest need the primary's confidence stamped onto them.  The
+            # `any()` below is a guard, not the work — apply_identity mutates
+            # in place and would otherwise re-run for every matching segment.
+            ref = profiles.get(speaker, {})
             for extra in cluster_list[1:]:
-                for seg in merged_segments:
-                    if seg["speaker"] == extra or seg["speaker"] == primary:
-                        seg["speaker"] = speaker
+                needs_evidence = any(
+                    seg.get("speaker") == extra
+                    and not isinstance(seg.get("speaker_confidence"), (int, float))
+                    for seg in merged_segments
+                )
+                if needs_evidence:
+                    apply_identity(
+                        merged_segments, extra, speaker,
+                        confidence=ref.get("match_confidence"),
+                    )
                 merge_profiles(profiles, speaker, extra)
 
     # 7. Additional merge: clusters with near-identical distance profiles
@@ -418,7 +440,10 @@ def collapse_unknown_speakers_second_pass(
     """
     from asr_mcp.speaker.embedding import extract_embedding
     from asr_mcp.speaker.matcher import find_best_match, is_clear_winner
-    from asr_mcp.diarization.segment_ops import merge_profiles, collapse_same_speaker_segments
+    from asr_mcp.speaker.uncertainty import apply_identity, policy_enabled
+    from asr_mcp.diarization.segment_ops import (
+        merge_profiles, collapse_same_speaker_segments, _collapse_confident_only,
+    )
 
     if not segments or audio_np is None or len(audio_np) == 0:
         return segments, profiles
@@ -431,6 +456,11 @@ def collapse_unknown_speakers_second_pass(
     accept_thresh = sec_cfg.get("accept_threshold", 0.38)
     unknown_merge_thresh = sec_cfg.get("unknown_merge_threshold", 0.25)
     min_speaker_dur = sec_cfg.get("min_speaker_duration_sec", 1.0)
+    # Minimum voiceprint-match confidence required before a cluster may be
+    # RENAMED to a known person.  Confidence is linear in the combined
+    # distance (1 - combined / 0.5), so the shipped 0.5 gate is equivalent to
+    # combined <= 0.25.  Keep this default in sync with thresholds.json.
+    min_identity_conf = float(sec_cfg.get("min_identity_confidence", 0.5))
 
     all_speakers = set(seg.get("speaker") for seg in segments if seg.get("speaker"))
     unknown_speakers = [
@@ -490,38 +520,109 @@ def collapse_unknown_speakers_second_pass(
             reference_targets[name] = ref_vp
 
     # 3. Match unknown clusters against reference targets
+    #
+    # ONE-TO-ONE CONSTRAINT: a single voiceprint may only be claimed by
+    # clusters that are acoustically consistent with each other.  Without
+    # this, two genuinely different speakers can both be renamed to the same
+    # person (observed on a Hungarian podcast: clusters 0.30 and 0.32 away
+    # from each other — far beyond `unknown_merge_threshold` — were both
+    # mapped to "Gergely Papp", leaving 99% of a multi-voice recording with
+    # one confident, wrong identity).  When a name is already claimed by a
+    # cluster this one is NOT consistent with, the match is a contradiction
+    # and the cluster stays an unresolved "Speaker N" — it does NOT fall
+    # through to the runner-up, because with dozens of voiceprints in the
+    # menu a runner-up is noise, not a better answer.
     resolved_unknowns: set[str] = set()
+    claimed_by: dict[str, str] = {}  # known name -> cluster that won it
     if reference_targets:
-        for spk in list(unknown_speakers):
+        # Strongest match claims a name first, so the better-fitting cluster
+        # wins and the weaker one is the one that has to look elsewhere.
+        candidates: list[tuple[float, str, dict]] = []
+        for spk in unknown_speakers:
             if spk not in spk_embeddings:
                 continue
-            emb = spk_embeddings[spk]
             prof = profiles.get(spk, {})
-            pitch = prof.get("pitch_hz", 0.0) or 0.0
-            energy = prof.get("energy_rms", 0.0) or 0.0
-
-            best_name, best_dist, second_dist, all_dists = find_best_match(
-                emb.tolist(), pitch, energy, reference_targets, cfg
+            best_name, best_dist, _second, all_dists = find_best_match(
+                spk_embeddings[spk].tolist(),
+                prof.get("pitch_hz", 0.0) or 0.0,
+                prof.get("energy_rms", 0.0) or 0.0,
+                reference_targets, cfg,
             )
+            candidates.append((best_dist, spk, all_dists))
+        candidates.sort(key=lambda x: x[0])
 
-            is_strong = all_dists.get(best_name, {}).get("emb_dist", 1.0) < 0.16
-            if not best_name or (not is_strong and best_dist > accept_thresh):
+        for _best_dist, spk, all_dists in candidates:
+            emb = spk_embeddings[spk]
+            ranked = sorted(
+                ((n, d) for n, d in all_dists.items()),
+                key=lambda x: x[1]["combined"],
+            )
+            ordered = [(n, d["combined"], d["confidence"]) for n, d in ranked]
+            if not is_clear_winner(ordered, reference_targets, cfg):
+                logger.info("Second pass: %s has no clear winner — left unresolved", spk)
                 continue
 
-            matches = [(n, d["combined"], d["confidence"]) for n, d in all_dists.items()]
-            matches.sort(key=lambda x: x[1])
-            if not is_clear_winner(matches, reference_targets, cfg):
+            # `ranked` holds (name, distance-dict) pairs — read the distance
+            # explicitly.  It used to be unpacked as a float, so the
+            # `not is_strong` branch raised TypeError, which the pipeline's
+            # try/except silently downgraded to "second pass unknown collapse
+            # failed" — i.e. every non-obvious cluster stayed unnamed.
+            best_name, best_d = ranked[0]
+            best_dist = best_d.get("combined", 1.0)
+            best_conf = float(best_d.get("confidence", 0.0))
+            is_strong = best_d.get("emb_dist", 1.0) < 0.16
+            if not is_strong and best_dist > accept_thresh:
                 continue
 
-            # Remap segments
-            for seg in segments:
-                if seg.get("speaker") == spk:
-                    seg["speaker"] = best_name
+            # IDENTIFICATION GATE.  Naming a cluster after a person is a much
+            # stronger claim than "these two clusters sound alike", and the
+            # reference menu holds dozens of voiceprints — so the best of a
+            # bad lot is not an identification.  A Hungarian podcast (3 people,
+            # 35 voiceprints) had its two dominant clusters renamed to the same
+            # person at combined distances 0.303 / 0.324, i.e. confidence
+            # 0.39 / 0.35, which the pipeline happily reported as a certain
+            # identity.  Below `min_identity_confidence` the cluster stays an
+            # unresolved "Speaker N" — an honest generic label beats a
+            # confident-looking wrong name (AGENTS.md lesson 30).
+            if policy_enabled() and best_conf < min_identity_conf:
+                logger.info(
+                    "Second pass: %s -> %s rejected (conf=%.2f < %.2f, dist=%.3f) "
+                    "— left as %s",
+                    spk, best_name, best_conf, min_identity_conf, best_dist, spk,
+                )
+                continue
+
+            # A name may only be shared by clusters that sound like the same
+            # person.  When the winner is already held by a cluster this one
+            # is NOT acoustically consistent with, the match is a
+            # contradiction — and with dozens of voiceprints in the menu a
+            # runner-up is noise, not a better answer.  Leave the cluster
+            # unresolved ("Speaker N") instead of inventing an identity.
+            holder = claimed_by.get(best_name)
+            if holder is not None and holder != spk:
+                cos = 1.0 - float(np.dot(spk_embeddings[holder], emb))
+                logger.info(
+                    "Second pass: %s contests %s (held by %s, cluster dist=%.3f, "
+                    "thresh=%.2f) -> %s",
+                    spk, best_name, holder, cos, unknown_merge_thresh,
+                    "blocked" if cos >= unknown_merge_thresh else "allowed (same person?)",
+                )
+                if cos >= unknown_merge_thresh:
+                    continue
+
+            margin = None
+            if len(ranked) > 1:
+                margin = float(ranked[1][1].get("combined", 1.0)) - best_dist
+            apply_identity(
+                segments, spk, best_name,
+                confidence=best_conf, margin=margin, match_dist=best_dist,
+            )
             merge_profiles(profiles, best_name, spk)
             resolved_unknowns.add(spk)
+            claimed_by.setdefault(best_name, spk)
             logger.info(
                 "Second pass: collapsed unknown %s -> %s (dist=%.3f, conf=%.2f)",
-                spk, best_name, best_dist, all_dists[best_name].get("confidence", 0.0)
+                spk, best_name, best_dist, best_conf
             )
 
     # 4. Cross-match and merge duplicate unknown speakers
@@ -553,5 +654,8 @@ def collapse_unknown_speakers_second_pass(
                     secondary, primary, cos_dist
                 )
 
-    segments = collapse_same_speaker_segments(segments, max_gap=0.5)
+    # 7. Fuse adjacent same-speaker segments.  Suppressed (speaker=None)
+    # segments are left alone: they are NOT one speaker, and gluing them would
+    # fabricate a combined utterance with a single (wrong) identity.
+    segments = _collapse_confident_only(segments, max_gap=0.5)
     return segments, profiles

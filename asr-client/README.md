@@ -17,6 +17,9 @@ dependencies are required.
    - `TOKEN` — generate in the web UI ("Windows Client Token" card)
      or `POST /api/token` while logged in; one token per user
    - `LANGUAGE` — ISO 639-1 code (e.g. `hu`) or `auto` (default)
+   - `WRITE_JSON` — `1` also writes `<name>.json` next to each `.txt`
+     (raw segments plus per-result `speaker_confidence`, `speaker_source`,
+     `uncertain`, `attribution_reason`)
 4. Drag audio files onto `transcribe.bat`, or use the CLI below.
 
 ## Commands
@@ -28,25 +31,48 @@ dependencies are required.
 | `transcribe.bat voiceprints` | List speakers and voiceprints |
 | `transcribe.bat voiceprint-add <name> <file> [start] [end]` | Create/refine a voiceprint from a clip |
 | `transcribe.bat voiceprint-refine <name>` | Rebuild a voiceprint from its snippets |
-| `transcribe.bat <file...> [--language <code>]` | Transcribe (language overrides `.env`) |
+| `transcribe.bat <file...> [--language <code>] [--json]` | Transcribe (flags override `.env`) |
 
 Supported inputs: wav, mp3, flac, ogg, m4a, webm, opus, mkv, mp4.
 
 ## Output format
 
-Each `<name>.txt` contains a `SPEAKER VOICE PROFILES` banner (when the server
-reports profiles) followed by one paragraph line per run:
+Each `<name>.txt` contains:
 
 ```
+Audio: <filename>
+Date: <transcription run time>
+Speakers: N
+Duration: NNN.Ns
+
+============================================================
+SPEAKER VOICE PROFILES
+============================================================
+  Gergely Papp: pitch=123Hz (±82Hz)  energy=0.0089  speech=313s
+============================================================
+
 [00:00:12] Gergely Papp (77%): paragraph text
 [00:04:05] Speaker 3: paragraph without confidence suffix
+[00:05:40] UNKNOWN (boundary_crossing): text the server could not attribute
+
+WARNING: 3 of 41 segment(s) have an UNKNOWN speaker (identity could not be
+established; the text was kept). Re-run if you need clean labels.
 ```
 
-- Lines are `[HH:MM:SS] <speaker>: text` using the absolute start time; a run
-  is broken into paragraphs on a pause >= 1.5s or at a sentence end after
-  800 characters.
-- The `(NN%)` decode confidence is included only when the ASR backend reports
-  one (whisper does; cohere/qwen3 do not).
+- The profiles banner appears when the server reports voice profiles.
+- Paragraph lines are `[HH:MM:SS] <speaker>: text` (absolute start
+  time); the `(NN%)` decode confidence is included only when the ASR
+  backend reports it (whisper does; cohere/qwen3 do not).
+- `UNKNOWN (<reason>)` marks speech the server could not attribute to a
+  confident speaker (short answer crossing a diarization boundary, a
+  ghost/minority speaker, no diarization at all). **The text is kept** —
+  only the identity is suppressed, so nothing spoken is lost. The
+  reason codes come from the server's uncertainty policy and are also
+  present in the `.json` sidecar.
+- The CLI exits non-zero only for real failures (unreachable server,
+  bad token, error event). Uncertain/partial speaker data is reported on
+  stderr but keeps exit code 0, and a metadata-only `.txt` is always
+  flagged with a warning.
 
 ## Notes
 

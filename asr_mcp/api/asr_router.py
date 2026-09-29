@@ -1,5 +1,4 @@
 import asyncio
-import bisect
 import json
 import logging
 import re
@@ -19,6 +18,10 @@ from asr_mcp.api.security import verify_api_key, get_current_user, validate_uplo
 from asr_mcp.api.auth import get_session_user
 from asr_mcp.config.settings import Settings, get_settings
 from asr_mcp.core import job_state
+from asr_mcp.speaker.attribution import (
+    attribute_items, attribute_span, speaker_for_span,
+)
+from asr_mcp.speaker.uncertainty import SOURCE_UNKNOWN, setting
 from asr_mcp.speaker.vad import split_at_energy_dips
 
 logger = logging.getLogger("asr_mcp.api.asr_router")
@@ -26,6 +29,8 @@ router = APIRouter(prefix="/asr", tags=["ASR"])
 
 MAX_TURN_SEC = 120.0
 PARAGRAPH_PAUSE_SEC = 3.0
+#: Fields a raw backend result may contribute to a TranscribeResult.
+_RESULT_FIELDS = set(TranscribeResult.model_fields)
 _SENT_END_RE = re.compile(r'[.!?…]["”’)\]]?(?=\s|$)')
 
 
@@ -37,38 +42,59 @@ class JobCancelled(BaseException):
     """
 
 
-def _merge_into_turns(segments, max_gap_sec=3.0):
+def _merge_into_turns(segments, max_gap_sec=None):
     """Merge consecutive same-speaker segments into full speaker turns.
 
     A turn is a continuous span attributed to one speaker.  Segments from the
     same speaker separated by <= *max_gap_sec* are folded into a single turn
     so the transcriber receives coherent, single-speaker audio.
+
+    Uncertain (``speaker is None``) segments are never merged together —
+    two unrelated unknown utterances are not one turn.  The gap defaults to
+    ``uncertainty.turn_merge_gap_sec`` (1.0s, down from the previous 3.0s:
+    wide bridges were a major source of cross-turn attribution).
     """
+    if max_gap_sec is None:
+        max_gap_sec = float(setting("turn_merge_gap_sec", 1.0))
     if not segments:
         return []
     turns = []
-    cur = {
-        "start": segments[0]["start"],
-        "end": segments[0]["end"],
-        "speaker": segments[0].get("speaker", "UNKNOWN"),
-        "segments": [segments[0]],
-    }
+    cur = _new_turn(segments[0])
     for seg in segments[1:]:
         same_speaker = seg.get("speaker") == cur["speaker"]
+        mergeable = same_speaker and seg.get("speaker") is not None
         gap = seg["start"] - cur["end"]
-        if same_speaker and gap <= max_gap_sec:
+        if mergeable and gap <= max_gap_sec:
             cur["end"] = seg["end"]
             cur["segments"].append(seg)
         else:
             turns.append(cur)
-            cur = {
-                "start": seg["start"],
-                "end": seg["end"],
-                "speaker": seg.get("speaker", "UNKNOWN"),
-                "segments": [seg],
-            }
+            cur = _new_turn(seg)
     turns.append(cur)
     return turns
+
+
+# Identity evidence carried from a diarization segment onto its turn.  Without
+# it `attribute_span` has no match confidence to report and falls back to the
+# geometric overlap ratio, i.e. a 0.55-confident voiceprint match would reach
+# the API as 1.0.
+_TURN_EVIDENCE = (
+    "speaker_confidence", "speaker_margin", "speaker_match_dist",
+    "speaker_source", "uncertain", "attribution_reason",
+)
+
+
+def _new_turn(seg):
+    turn = {
+        "start": seg["start"],
+        "end": seg["end"],
+        "speaker": seg.get("speaker", "UNKNOWN"),
+        "segments": [seg],
+    }
+    for key in _TURN_EVIDENCE:
+        if key in seg:
+            turn[key] = seg[key]
+    return turn
 
 
 def _split_long_turn(turn):
@@ -96,6 +122,10 @@ def _split_long_turn(turn):
         "speaker": turn["speaker"],
         "segments": segs[best_idx:],
     }
+    for part in (t1, t2):
+        for key in _TURN_EVIDENCE:
+            if key in turn:
+                part[key] = turn[key]
     out = []
     out.extend(_split_long_turn(t1))
     out.extend(_split_long_turn(t2))
@@ -217,27 +247,6 @@ def _apply_paragraph_breaks(text, segments, turn_audio, sample_rate):
     return "\n\n".join(p for p in parts if p)
 
 
-def _speaker_for_span(start, end, turns, starts):
-    """Diarization speaker for a time span: midpoint lookup in sorted turns."""
-    if not turns:
-        return None
-    mid = (start + end) / 2.0
-    i = bisect.bisect_right(starts, mid) - 1
-    if i < 0:
-        return turns[0].get("speaker")
-    if i >= len(turns):
-        return turns[-1].get("speaker")
-    turn = turns[i]
-    if float(turn["start"]) <= mid <= float(turn["end"]):
-        return turn.get("speaker")
-    if i + 1 < len(turns):
-        nxt = turns[i + 1]
-        if mid - float(turn["end"]) <= float(nxt["start"]) - mid:
-            return turn.get("speaker")
-        return nxt.get("speaker")
-    return turn.get("speaker")
-
-
 def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None, language="en"):
     """Transcribe the whole file in one backend call; attribute output post-hoc.
 
@@ -270,29 +279,32 @@ def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None, langu
         (s for s in (tr.get("segments") or []) if (s.get("text") or "").strip()),
         key=lambda s: float(s.get("start") or 0.0),
     )
-    runs = []
-    for it in items:
-        s = float(it.get("start") or 0.0)
-        e = float(it.get("end") or s)
-        spk = _speaker_for_span(s, e, turns, starts)
-        if runs and runs[-1]["speaker"] == spk:
-            runs[-1]["items"].append(it)
-        else:
-            runs.append({"speaker": spk, "items": [it]})
+    # Runs come from the pure attribution module: uncertain items are never
+    # merged with each other (see attribute_items).
+    runs = attribute_items(items, turns, starts)
 
     if not runs:
+        spk, conf, source, reason = attribute_span(0.0, dur, turns, starts)
         return [TranscribeResult(
             text=text_all,
             start=0.0,
             end=dur,
-            speaker=_speaker_for_span(0.0, dur, turns, starts),
+            speaker=spk,
             audio_duration_sec=tr.get("audio_duration_sec", 0),
             inference_time_sec=tr.get("inference_time_sec", 0),
             tokens_generated=tr.get("tokens_generated", 0),
             error=error,
+            speaker_confidence=conf,
+            speaker_source=source,
+            uncertain=spk is None,
+            attribution_reason=reason,
         )]
 
-    logger.info("Attributed %d items into %d speaker runs", len(items), len(runs))
+    n_uncertain = sum(1 for r in runs if r["speaker"] is None)
+    logger.info(
+        "Attributed %d items into %d speaker runs (%d uncertain)",
+        len(items), len(runs), n_uncertain,
+    )
     results = []
     for ri, run in enumerate(runs):
         segs = run["items"]
@@ -321,6 +333,10 @@ def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None, langu
             inference_time_sec=tr.get("inference_time_sec", 0) if ri == 0 else 0.0,
             tokens_generated=tr.get("tokens_generated", 0) if ri == 0 else 0,
             error=error if ri == len(runs) - 1 else None,
+            speaker_confidence=round(run["confidence"], 3),
+            speaker_source=run["source"],
+            uncertain=run["speaker"] is None,
+            attribution_reason=run["reason"],
         ))
     return results
 
@@ -641,8 +657,15 @@ def _prepare_turns(segments, audio_duration_sec=None, audio=None,
     return split
 
 
-def _merge_consecutive_same_speaker_results(results, max_gap_sec=3.0):
-    """Merge consecutive same-speaker TranscribeResult entries into coherent turns."""
+def _merge_consecutive_same_speaker_results(results, max_gap_sec=None):
+    """Merge consecutive same-speaker TranscribeResult entries into coherent turns.
+
+    Uncertain results (speaker=None) are never merged with each other, so
+    unrelated unattributed utterances stay separate.  Gap defaults to
+    ``uncertainty.result_merge_gap_sec``.
+    """
+    if max_gap_sec is None:
+        max_gap_sec = float(setting("result_merge_gap_sec", 1.0))
     if not results:
         return []
     merged = []
@@ -656,7 +679,8 @@ def _merge_consecutive_same_speaker_results(results, max_gap_sec=3.0):
         prev_end = getattr(prev, "end", 0.0) if hasattr(prev, "end") else prev.get("end", 0.0)
         curr_start = getattr(r, "start", 0.0) if hasattr(r, "start") else r.get("start", 0.0)
 
-        if prev_spk == curr_spk and (curr_start - prev_end) <= max_gap_sec:
+        both_named = prev_spk is not None and curr_spk is not None
+        if both_named and prev_spk == curr_spk and (curr_start - prev_end) <= max_gap_sec:
             prev_text = (getattr(prev, "text", "") if hasattr(prev, "text") else prev.get("text", "")) or ""
             curr_text = (getattr(r, "text", "") if hasattr(r, "text") else r.get("text", "")) or ""
 
@@ -828,10 +852,20 @@ async def diarize_endpoint(
         logger.warning("Auto-collect failed: %s", e)
 
     return DiarizeResponse(
-        segments=[DiarizeResult(start=s["start"], end=s["end"], speaker=s["speaker"]) for s in segments],
+        segments=[
+            DiarizeResult(
+                start=s["start"],
+                end=s["end"],
+                speaker=s.get("speaker"),
+                uncertain=bool(s.get("uncertain")) or s.get("speaker") is None,
+                attribution_reason=s.get("attribution_reason"),
+            )
+            for s in segments
+        ],
         total_time_sec=result.get("total_time_sec", 0),
         total_speakers=result.get("total_speakers", 0),
         audio_duration_sec=result.get("audio_duration_sec", 0),
+        uncertain_segments=result.get("uncertain_segments", 0),
     )
 
 
@@ -1086,11 +1120,24 @@ async def transcribe_upload(
                     audio_dur or 0.0, processing,
                     f"{speedup:g}x realtime" if speedup else "n/a",
                 )
+                results = result.get("results") or []
+                n_uncertain = sum(1 for r in results if r.get("uncertain"))
+                n_text = sum(1 for r in results if (r.get("text") or "").strip())
+                n_error = sum(1 for r in results if r.get("error"))
+                if n_error or not n_text:
+                    status = "error"
+                elif n_uncertain:
+                    status = "partial"
+                else:
+                    status = "ok"
                 payload = {
                     "stage": "done",
                     "progress": 1.0,
                     "result": result,
                     "processing_time_sec": processing,
+                    "status": status,
+                    "uncertain_segments": n_uncertain,
+                    "segments": len(results),
                 }
                 if speedup:
                     payload["speedup"] = speedup
@@ -1147,10 +1194,25 @@ async def transcribe_upload(
                 except Exception as e:
                     logger.warning("Boundary refinement failed: %s", e)
                     turns = list(segments)
-            display_segments = (
-                [{"start": t["start"], "end": t["end"], "speaker": t["speaker"]} for t in turns]
-                if turns else segments
-            )
+            display_segments = [
+                {
+                    "start": t["start"],
+                    "end": t["end"],
+                    "speaker": t["speaker"],
+                    "uncertain": bool(t.get("uncertain")) or t.get("speaker") is None,
+                    "attribution_reason": t.get("attribution_reason"),
+                }
+                for t in turns
+            ] if turns else [
+                {
+                    "start": s["start"],
+                    "end": s["end"],
+                    "speaker": s.get("speaker"),
+                    "uncertain": bool(s.get("uncertain")) or s.get("speaker") is None,
+                    "attribution_reason": s.get("attribution_reason"),
+                }
+                for s in segments
+            ]
             diarization["segments"] = display_segments
 
             await _sse_put(queue, {
@@ -1160,6 +1222,9 @@ async def transcribe_upload(
                 "segments": display_segments,
                 "audio_duration_sec": audio_dur,
                 "total_speakers": diarization.get("total_speakers", 0),
+                "uncertain_segments": sum(
+                    1 for s in display_segments if s.get("uncertain")
+                ),
             })
 
             state.unload_embedding()
@@ -1170,7 +1235,18 @@ async def transcribe_upload(
             if not segments:
                 await _sse_put(queue, {"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
                 result = transcribe_audio_sync(audio=audio_np, language=language)
-                diarization["results"] = [_result_to_dict(TranscribeResult(**result))]
+                # No diarization at all -> no speaker evidence. Report the text
+                # with an explicit uncertain identity instead of leaving a
+                # stale/absent speaker that reads as "clean".
+                payload = {k: v for k, v in result.items() if k in _RESULT_FIELDS}
+                payload.update({
+                    "speaker": None,
+                    "speaker_confidence": 0.0,
+                    "speaker_source": SOURCE_UNKNOWN,
+                    "uncertain": True,
+                    "attribution_reason": "no_diarization",
+                })
+                diarization["results"] = [_result_to_dict(TranscribeResult(**payload))]
                 if client_disconnected:
                     _persist_transcript("client disconnected")
                 await _sse_put(queue, _done_event(diarization))
@@ -1201,7 +1277,7 @@ async def transcribe_upload(
                 "phase": "transcription",
                 "segment_index": 0,
                 "total_segments": 1,
-                "segment_speaker": _speaker_for_span(0.0, 0.0, attr_turns, starts) or "",
+                "segment_speaker": speaker_for_span(0.0, 0.0, attr_turns, starts) or "",
                 "segment_start": 0.0,
                 "segment_end": 0.0,
                 "partial_text": "",
@@ -1226,7 +1302,7 @@ async def transcribe_upload(
                         "phase": "transcription",
                         "segment_index": i - 1,
                         "total_segments": n,
-                        "segment_speaker": _speaker_for_span(win_start, win_end, attr_turns, starts) or "",
+                        "segment_speaker": speaker_for_span(win_start, win_end, attr_turns, starts) or "",
                         "segment_start": round(win_start, 2),
                         "segment_end": round(win_end, 2),
                         "turn_start": round(win_start, 2),

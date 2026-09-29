@@ -27,6 +27,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "onnxruntime-gpu>=1.22.0"
 
 COPY asr_mcp ./asr_mcp
+COPY tests ./tests
+
+# Test tooling is installed in its own layer (and kept out of requirements.txt)
+# so adding/removing it never invalidates the cached heavy dependency layer
+# above. Run with: docker compose exec asr-mcp python3 -m pytest tests/ -q
+RUN python3 -m pip install --no-cache-dir pytest
 
 RUN mkdir -p /app/data /app/logs /app/models /app/voices
 

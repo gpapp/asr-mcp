@@ -13,15 +13,24 @@ ENV_PATH = SCRIPT_DIR / ".env"
 
 SUPPORTED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm", ".opus", ".mkv", ".mp4"}
 
+#: Shown instead of a speaker name when the server could not attribute the
+#: utterance to a confident speaker (see the server's uncertainty policy).
+UNKNOWN_SPEAKER_LABEL = "UNKNOWN"
+
 USAGE = """Usage:
   transcribe <audio file> [more files...]   Transcribe files (writes <name>.txt next to each)
                                             Optional: --language <code|auto> (overrides .env LANGUAGE)
+                                            Optional: --json (also write <name>.json with raw segments)
   status                                    Check server/token connectivity
   voiceprints                               List speakers and voiceprints
   voiceprint-add <name> <file> [start] [end]   Create/refine a voiceprint from audio
   voiceprint-refine <name>                  Rebuild a voiceprint from its snippets
 
-Configuration: edit .env next to this script (SERVER_URL + TOKEN, optional LANGUAGE=auto)."""
+Segments the server could not attribute to a confident speaker are written as
+[UNKNOWN (<reason>)] with their text kept — the .txt is never silently clean.
+
+Configuration: edit .env next to this script (SERVER_URL + TOKEN, optional LANGUAGE=auto,
+optional WRITE_JSON=1)."""
 
 
 class ClientError(Exception):
@@ -45,6 +54,14 @@ def get_language():
     env = load_env()
     lang = (env.get("LANGUAGE") or env.get("TRANSCRIBE_LANGUAGE") or "auto").strip().lower()
     return lang or "auto"
+
+
+def get_json_sidecar() -> bool:
+    """WRITE_JSON=1 in .env (or --json) also writes <name>.json with raw segments."""
+    return _JSON_SIDECAR
+
+
+_JSON_SIDECAR = (load_env().get("WRITE_JSON") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def get_config():
@@ -199,7 +216,9 @@ def _profiles_banner(result):
 
 def _paragraphs_from_segments(segments):
     """Group a run's segments into paragraphs: break on pause >=1.5s or long text."""
-    paragraphs, current, current_len = [], [], 0
+    paragraphs = []
+    current = []
+    current_len = 0
     for seg in segments:
         text = (seg.get("text") or "").strip()
         if not text:
@@ -210,10 +229,11 @@ def _paragraphs_from_segments(segments):
             prev_end = float(current[-1].get("end") or current[-1].get("start") or 0.0)
             gap = start - prev_end
             last_text = (current[-1].get("text") or "").strip()
-            sentence_end = last_text.endswith((".", "!", "?", "\u2026"))
+            sentence_end = last_text.endswith((".","!","?","\u2026"))
             if gap >= 1.5 or current_len >= 800 and sentence_end or current_len >= 1600:
                 paragraphs.append(current)
-                current, current_len = [], 0
+                current = []
+                current_len = 0
         current.append(seg)
         current_len += len(text) + 1
     if current:
@@ -257,17 +277,20 @@ def build_transcript(filename, result, date_str):
 
     results = result.get("results") or []
     for r in results:
-        speaker = r.get("speaker") or ""
+        speaker = r.get("speaker") or UNKNOWN_SPEAKER_LABEL
+        if r.get("uncertain"):
+            reason = r.get("attribution_reason") or "unspecified"
+            speaker = f"{UNKNOWN_SPEAKER_LABEL} ({reason})"
         segs = [s for s in (r.get("segments") or [])
                 if isinstance(s, dict) and (s.get("text") or "").strip()]
         if not segs:
             text = r.get("text", "")
             start = r.get("start")
             end = r.get("end")
-            if speaker and start is not None and end is not None:
+            if start is not None and end is not None:
                 body = text.replace("\n", "\n    ")
                 lines.append(f"[{speaker}] {start:.1f}s - {end:.1f}s: {body}")
-            else:
+            elif text:
                 lines.append(text)
             continue
         for para in _paragraphs_from_segments(segs):
@@ -284,7 +307,51 @@ def build_transcript(filename, result, date_str):
         lines.append("")
         lines.append("Errors: " + "; ".join(str(e) for e in errors))
 
+    uncertain = [r for r in results if r.get("uncertain")]
+    if uncertain:
+        lines.append("")
+        lines.append(
+            f"WARNING: {len(uncertain)} of {len(results)} segment(s) have an UNKNOWN speaker "
+            "(identity could not be established; the text was kept). Re-run if you need clean labels."
+        )
+
     return "\n".join(lines)
+
+
+def _has_text(result):
+    return any((r.get("text") or "").strip() for r in (result.get("results") or []))
+
+
+def _write_sidecar(out_path: Path, result, done_evt, status, date_str):
+    """Optional machine-readable sidecar next to the .txt transcript."""
+    payload = {
+        "generated_at": date_str,
+        "status": status,
+        "processing_time_sec": (done_evt or {}).get("processing_time_sec"),
+        "speedup": (done_evt or {}).get("speedup"),
+        "total_speakers": result.get("total_speakers", 0),
+        "uncertain_segments": result.get("uncertain_segments", 0),
+        "audio_duration_sec": result.get("audio_duration_sec", 0),
+        "results": [
+            {
+                "start": r.get("start"),
+                "end": r.get("end"),
+                "speaker": r.get("speaker"),
+                "uncertain": bool(r.get("uncertain")),
+                "speaker_source": r.get("speaker_source"),
+                "speaker_confidence": r.get("speaker_confidence"),
+                "attribution_reason": r.get("attribution_reason"),
+                "text": r.get("text", ""),
+                "segments": r.get("segments") or [],
+                "error": r.get("error"),
+            }
+            for r in (result.get("results") or [])
+        ],
+        "errors": [r.get("error") for r in (result.get("results") or []) if r.get("error")],
+    }
+    sidecar = out_path.with_suffix(".json")
+    sidecar.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return sidecar
 
 
 def transcribe_file(base, token, path: Path, language: str = "auto"):
@@ -350,8 +417,14 @@ def transcribe_file(base, token, path: Path, language: str = "auto"):
         raise ClientError("Server stream ended without a result")
 
     date_str = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    status = (done_evt or {}).get("status") or ("ok" if _has_text(result) else "error")
+
     out_path = path.with_suffix(".txt")
     out_path.write_text(build_transcript(path.name, result, date_str), encoding="utf-8")
+
+    written = [out_path]
+    if get_json_sidecar():
+        written.append(_write_sidecar(out_path, result, done_evt, status, date_str))
 
     processing = (done_evt or {}).get("processing_time_sec")
     if processing:
@@ -361,7 +434,24 @@ def transcribe_file(base, token, path: Path, language: str = "auto"):
         if speedup:
             summary += f" ({speedup:g}x realtime)"
         print(f"  {summary}")
-    return out_path
+
+    results = result.get("results") or []
+    n_uncertain = sum(1 for r in results if r.get("uncertain"))
+    if n_uncertain:
+        print(
+            f"  WARNING: {n_uncertain}/{len(results)} segment(s) have an "
+            f"{UNKNOWN_SPEAKER_LABEL} speaker — text was kept, but the "
+            "identity could not be established."
+        )
+    if not _has_text(result):
+        # Never present a metadata-only file as a clean success.
+        print("  WARNING: the server returned no text for this file", file=sys.stderr)
+
+    if status == "error" and _has_text(result):
+        print("  WARNING: server reported a transcription error (partial text kept)",
+              file=sys.stderr)
+
+    return written, status
 
 
 def cmd_status():
@@ -436,6 +526,7 @@ def cmd_voiceprint_refine(name):
 
 
 def cmd_transcribe(paths):
+    global _JSON_SIDECAR
     base, token = get_config()
     args = list(paths)
     language = get_language()
@@ -446,23 +537,37 @@ def cmd_transcribe(paths):
             return 2
         language = args[i + 1].strip().lower() or "auto"
         args = args[:i] + args[i + 2:]
+    if "--json" in args:
+        _JSON_SIDECAR = True
+        args = [a for a in args if a != "--json"]
     if not args:
         print("No files given.")
         print(USAGE)
         return 2
     failures = 0
+    partial = 0
     for raw in args:
         path = Path(raw).expanduser()
         print(f"Transcribing {path.name} (language={language}) ...")
         try:
-            out_path = transcribe_file(base, token, path, language=language)
-            print(f"  saved {out_path}")
+            written, status = transcribe_file(base, token, path, language=language)
+            for p in written:
+                print(f"  saved {p}")
+            if status != "ok":
+                partial += 1
         except ClientError as e:
             failures += 1
             print(f"  FAILED: {e}", file=sys.stderr)
     if failures:
-        print(f"{failures} of {len(paths)} file(s) failed", file=sys.stderr)
+        print(f"{failures} of {len(args)} file(s) failed", file=sys.stderr)
         return 1
+    if partial:
+        # Text was recovered but at least one segment is uncertain or errored:
+        # report it, but do not fail the run.
+        print(
+            f"{partial} of {len(args)} file(s) finished with uncertain/partial speaker data",
+            file=sys.stderr,
+        )
     return 0
 
 
