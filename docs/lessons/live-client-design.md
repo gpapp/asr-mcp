@@ -98,8 +98,8 @@ casing drift, not wording). The fix is to add `--retranscribe` to
 | Turn shorter than `min_turn_sec` / longer than `max_turn_sec` | `UNKNOWN` (reason: `live_turn_too_short` / `live_turn_too_long`) |
 | **Mic channel** | `LOCAL_SPEAKER_LABEL` (default "You"), `speaker_source: "input_device"` |
 | Speaker channel, no voiceprints loaded | `UNKNOWN` (`no_voiceprints`) |
-| Speaker channel, best match below `min_match_confidence` (0.60) | `UNKNOWN` (`live_match_weak`) |
-| Speaker channel, runner-up too close (`min_match_margin` 0.05) | `UNKNOWN` (`live_match_ambiguous`) |
+| Speaker channel, best match below `min_match_confidence` (0.15) | `UNKNOWN` (`live_match_weak`) |
+| Speaker channel, runner-up too close (`min_match_margin` 0.10) | `UNKNOWN` (`live_match_ambiguous`) |
 | Otherwise | matched name, `speaker_source: "known_voiceprint"` |
 
 **The mic is deliberately not embedding-matched.** The default input device
@@ -107,11 +107,72 @@ carries the local user, who is by definition in their own voiceprints; matching
 that audio against the stored profile returns a confident answer that is wrong
 whenever they have more than one profile. The channel *is* the evidence.
 
-Speaker-channel turns are 1–3 s, which is the low end for ECAPA-TDNN512. The
-0.60 confidence bar is therefore higher than the file path's
-`uncertainty.min_speaker_confidence` (0.35) — that is honest, not a bug, and
-`live_attribution` is a separate config section precisely so it can be tuned
-without touching file-path behaviour.
+### The gates are calibrated, and the first calibration was wrong
+
+These gates originally shipped at `min_match_confidence: 0.60` /
+`min_match_margin: 0.05`, on the reasoning that "live turns are 1–3 s, the low
+end for ECAPA, so the bar must be higher than the file path's 0.35". The bar
+was raised in the wrong direction, and by more than the width of the genuine
+distribution.
+
+Measured on real 2–6 s excerpts of the *correct* speakers, fed through the
+handler's own embedding hooks against the 35-voiceprint menu:
+
+| population | combined distance | confidence | margin |
+|---|---|---|---|
+| **genuine** (13 excerpts, 6 speakers) | 0.174 – 0.402 | 0.196 – 0.65 | 0.141 – 0.417 |
+| **non-match** (corrupted audio, see below) | 0.780 – 0.870 | 0.00 | 0.002 – 0.062 |
+
+A 0.60 confidence bar sits *above the entire genuine population*: it rejected
+11 of 13 real matches, which is exactly the "the correct speaker is found but
+not attributed" report. Meanwhile the margin gate at 0.05 was far too loose to
+compensate — a non-match scored a margin of 0.002.
+
+The two populations leave an **empty band**: no non-match exceeded confidence
+0.00, and no genuine match fell below 0.196. So the confidence floor now sits
+in that gap (0.15) as a sanity check only, and the **margin does the
+discriminating** (0.10 — below the weakest genuine margin of 0.141, above the
+worst non-match of 0.062). The shipped values are pinned to these measurements
+by `tests/test_live_attribution_gates.py`, which fails if either gate is moved
+back to a value that would misclassify a measured population.
+
+Caveat worth keeping: these excerpts come from the same source audio the
+voiceprints were built from, so they are a best case. Real loopback audio
+arrives through a different signal path (room, headset EQ, cross-talk) and will
+score worse. The non-match side is also only sampled at the extremes — nothing
+was measured in the 0.4–0.78 combined band, which is where a genuinely
+different-but-similar colleague would land. Treat the margin gate as the real
+safety mechanism, not the confidence floor.
+
+### The bug that produced the non-match population
+
+Every live turn was scoring `dist ≈ 0.78–0.87` — random-pair territory — and
+the client showed `UNKNOWN` for all of them, which read as "randomly assigns
+speakers". The cause was a dtype mismatch, not the model:
+
+`Turn.audio` is a **float32 numpy array** everywhere on the server
+(`turn_detector.Turn._close_turn` and `handler._turn_from_frame` both do
+`np.frombuffer(pcm, np.int16).astype(np.float32) / 32768.0`). The client's
+`Turn` keeps raw int16 `pcm` bytes, because that is what it packs into the wire
+frame. Both representations are legitimate. But the embedding hooks in
+`handler.py` assumed the second:
+
+```python
+samples = np.frombuffer(turn.audio, dtype=np.int16)   # float32 array!
+```
+
+`np.frombuffer` on a float32 array reinterprets the **IEEE-754 bit patterns** as
+int16 and, because a float is 4 bytes and an int16 is 2, **doubles the length**.
+A 4800-sample turn arrived as 9600 samples of noise — a ramp from 0.0 to 0.5
+came through as `[0, 0, 0, 0.475, 0.5, 0.479]`, RMS 0.554 instead of 0.212.
+ECAPA embedded that noise, so every distance was a random-pair distance.
+
+The fix is `turn_detector.samples_as_float32(audio)`, which accepts bytes,
+int16 arrays, float arrays and `None`. It exists because two representations
+are in play and any code touching turn audio has to normalise. It is covered by
+`test_samples_as_float32_accepts_every_turn_payload_shape`, and the hook test
+was rewritten to assert sample **values** survive — the old test used a fake
+turn whose `audio` was int16 *bytes*, so it encoded the bug and passed.
 
 Gates run in the order above, so the cheap structural rejections
 (too short/long) never pay for an embedding, and the mic never pays for a

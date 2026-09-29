@@ -17,6 +17,7 @@ pytest.importorskip("onnxruntime", reason="handler touches ModelState")
 
 from asr_mcp.streaming import attribution  # noqa: E402
 from asr_mcp.streaming import handler as hd  # noqa: E402
+from asr_mcp.streaming.turn_detector import samples_as_float32  # noqa: E402
 
 SR = 16000
 AMP = 0.3
@@ -328,6 +329,7 @@ def test_live_embedding_hooks_call_the_real_functions_correctly(patched, monkeyp
     def fake_extract(waveform, sample_rate, *a, **kw):
         seen["sample_rate"] = sample_rate
         seen["n"] = int(waveform.numel())
+        seen["values"] = waveform.numpy().copy()
         return np.zeros(192, dtype=np.float32)
 
     def fake_pitch(waveform, sample_rate=16000):
@@ -366,6 +368,8 @@ def test_live_embedding_hooks_call_the_real_functions_correctly(patched, monkeyp
     ])
 
     assert captured.get("embed_fn") is not None, "embedding hooks were not built"
+
+    # --- bytes form (the client's Turn.pcm) -------------------------------
     turn = type("T", (), {"audio": _pcm(0.6), "duration_sec": 0.6})()
     emb = captured["embed_fn"](turn)          # must not raise
     assert emb.shape == (192,)
@@ -375,6 +379,51 @@ def test_live_embedding_hooks_call_the_real_functions_correctly(patched, monkeyp
     assert captured["energy_fn"](turn) == 0.2
     # 0.6s of audio = 9600 float samples, not 9600 bytes
     assert seen["energy_n"] == int(0.6 * SR)
+
+    # --- float32 array form (the server's Turn.audio) ---------------------
+    # np.frombuffer(float32_array, dtype=np.int16) would DOUBLE the length and
+    # yield the IEEE-754 bit patterns as int16, i.e. noise.  That is what made
+    # every live turn come back at dist 0.78-0.87 / conf 0.00.
+    ramp = np.linspace(0.0, 0.5, 4800, dtype=np.float32)
+    fturn = type("T", (), {"audio": ramp, "duration_sec": 0.3})()
+    captured["embed_fn"](fturn)
+    assert seen["n"] == ramp.size, "float32 turn was reinterpreted, not rescaled"
+    assert seen["values"].shape == ramp.shape
+    np.testing.assert_allclose(seen["values"], ramp, rtol=1e-6)
+
+
+def test_turn_from_frame_produces_a_float32_array():
+    """_turn_from_frame must yield float32 in [-1, 1] — the shape the hooks
+    and the speech gate expect.  A bytes payload here is what turned live
+    attribution into noise."""
+    from asr_mcp.core import model_state
+    from asr_mcp.streaming import handler as hd
+
+    st = model_state.state
+    for value, expected in ((0, 0.0), (16384, 0.5), (-32768, -1.0)):
+        turn = hd._turn_from_frame({"channel": 0, "start_sample": 0, "n_samples": 1},
+                                   np.array([value], dtype=np.int16).tobytes())
+        arr = samples_as_float32(turn.audio)
+        assert arr.dtype == np.float32
+        assert arr.shape == (1,)
+        assert arr[0] == pytest.approx(expected, abs=1e-3)
+
+
+def test_samples_as_float32_accepts_every_turn_payload_shape():
+    from asr_mcp.streaming.turn_detector import samples_as_float32 as norm
+
+    assert norm(None).shape == (0,)
+    assert norm(b"").shape == (0,)
+    assert norm(b"\x01").shape == (0,)               # odd length is truncated
+    int16_bytes = np.array([0, 16384, -32768], dtype=np.int16).tobytes()
+    np.testing.assert_allclose(norm(int16_bytes), [0.0, 0.5, -1.0], atol=1e-6)
+    np.testing.assert_allclose(norm(bytearray(int16_bytes)), [0.0, 0.5, -1.0], atol=1e-6)
+    np.testing.assert_allclose(norm(memoryview(int16_bytes)), [0.0, 0.5, -1.0], atol=1e-6)
+    np.testing.assert_allclose(norm(np.array([0, 16384], dtype=np.int16)), [0.0, 0.5], atol=1e-6)
+    floats = np.array([0.0, 0.25, -0.5], dtype=np.float32)
+    np.testing.assert_allclose(norm(floats), floats)
+    # a float64 array must not be reinterpreted either
+    np.testing.assert_allclose(norm(np.array([0.0, 0.25], dtype=np.float64)), [0.0, 0.25])
 
 
 @pytest.mark.skipif(

@@ -118,6 +118,43 @@ class Turn:
         return self.end_sample / SAMPLE_RATE
 
 
+def samples_as_float32(audio) -> np.ndarray:
+    """Normalise any accepted turn payload to float32 in ``[-1.0, 1.0]``.
+
+    ``Turn.audio`` has two legitimate representations depending on where the
+    turn was produced:
+
+    * the **server** (``TurnDetector._close_turn`` and
+      ``handler._turn_from_frame``) already stores a float32 numpy array;
+    * the **client** (``live_client.py``) keeps raw int16 ``pcm`` bytes,
+      because that is what it packs into the wire frame.
+
+    Both must be readable, and :func:`asr_mcp.streaming.handler` needs the
+    float form for ``extract_embedding`` / ``compute_pitch``.  Anything that
+    blindly calls ``np.frombuffer(x, dtype=np.int16)`` on a float32 array
+    silently **doubles the length** and yields the IEEE-754 *bit patterns* as
+    int16 -- i.e. noise.  That produced random voiceprint distances
+    (0.78-0.87, confidence 0.00) for every live turn, which looked like
+    "randomly assigns speakers".  Always go through this helper.
+    """
+    if audio is None:
+        return np.zeros(0, dtype=np.float32)
+    if isinstance(audio, np.ndarray):
+        if np.issubdtype(audio.dtype, np.floating):
+            return audio.astype(np.float32, copy=False)
+        return audio.astype(np.float32) / 32768.0
+    if isinstance(audio, (bytes, bytearray, memoryview)):
+        raw = bytes(audio)
+        usable = len(raw) - (len(raw) % 2)
+        if usable <= 0:
+            return np.zeros(0, dtype=np.float32)
+        return np.frombuffer(raw[:usable], dtype=np.int16).astype(np.float32) / 32768.0
+    arr = np.asarray(audio)
+    if np.issubdtype(arr.dtype, np.floating):
+        return arr.astype(np.float32, copy=False)
+    return arr.astype(np.float32) / 32768.0
+
+
 class TurnDetector:
     """Frame-based endpointing with an adaptive noise floor.
 

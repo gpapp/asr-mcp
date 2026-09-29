@@ -43,9 +43,17 @@ CHANNEL_SPEAKER = 1
 LOCAL_SPEAKER_LABEL = os.environ.get("TRANSCRIBE_LIVE_LOCAL_LABEL", "You")
 
 _DEFAULTS = {
-    # Live turns are short; ECAPA is far less reliable below a few seconds.
-    "min_match_confidence": 0.60,
-    "min_match_margin": 0.05,
+    # Calibrated from measured ECAPA distances on real 2-6s excerpts against
+    # the 35-voiceprint menu (see live-client-design.md). A genuine match
+    # scores combined 0.17-0.40 -> conf 0.20-0.65, margin 0.14-0.42. A
+    # non-match scores combined 0.78-0.87 -> conf 0.00, margin 0.002-0.06.
+    # The 0.60 confidence gate that shipped first sat ABOVE the genuine
+    # confidence ceiling and rejected 11 of 13 genuine matches. The two
+    # populations leave an empty band at conf 0.00-0.196, so the floor goes
+    # there (0.15) and the margin gate -- which separates 0.002-0.062 from
+    # 0.141-0.417 with no overlap -- carries the actual discrimination.
+    "min_match_confidence": 0.15,
+    "min_match_margin": 0.10,
     "min_turn_sec": 0.5,
     "max_turn_sec": 30.0,
     "match_voiceprints": True,

@@ -45,6 +45,7 @@ from asr_mcp.streaming.attribution import (
 from asr_mcp.streaming.speech_gate import probe_speech, turn_has_speech
 from asr_mcp.streaming.turn_detector import (
     Turn, TurnCoalescer, TurnDetector, config as detector_config,
+    samples_as_float32,
 )
 
 logger = logging.getLogger("asr_mcp.streaming.handler")
@@ -155,8 +156,12 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
             )
 
             def _waveform(turn):
-                samples = np.frombuffer(turn.audio, dtype=np.int16)
-                return torch.from_numpy(samples.astype("float32") / 32768.0)
+                # NOT np.frombuffer(turn.audio, dtype=np.int16): the server's
+                # Turn.audio is already a float32 array, and reinterpreting it
+                # as int16 doubles the length and feeds ECAPA the IEEE-754 bit
+                # patterns -- noise.  That yielded dist 0.78-0.87 / conf 0.00
+                # for every live turn (see samples_as_float32).
+                return torch.from_numpy(samples_as_float32(turn.audio))
 
             def embed_fn(turn):
                 # sample_rate is REQUIRED: extract_embedding takes it
