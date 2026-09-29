@@ -863,3 +863,164 @@ def test_probe_devices_survives_a_missing_host_api(live):
             raise RuntimeError("gone")
 
     assert live.probe_devices(_BadApi())[0]["api"] == "?"
+
+
+# ── Quiet microphones: a level sweep, not one hand-picked signal ──────────
+#
+# Regression tests for a real Windows failure: 59s of speech from a headset
+# mic produced ZERO turns, because `noise_floor_min` doubled as the absolute
+# detection gate (0.004 * 2.5 = 0.01 RMS = -40 dBFS) and a normal speaking
+# level on that mic sits below it. Each fix below is pinned independently so
+# the next one cannot silently re-break the previous.
+
+def _speechlike(seconds, peak=0.01, seed=0, rate=16000):
+    """Alternating voiced bursts with Hanning envelopes and gaps.
+
+    A sine tone is not representative: it has a stable RMS across the whole
+    turn, so it never exercises the noise floor the way speech does.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    n = int(seconds * rate)
+    x = np.zeros(n, dtype=np.float32)
+    t = 0
+    while t < n:
+        seg = min(int(rng.integers(0.15 * rate, 0.6 * rate)), n - t)
+        f0 = float(rng.uniform(90, 200))
+        tt = np.arange(seg) / rate
+        v = sum(np.sin(2 * np.pi * f0 * k * tt) / k for k in range(1, 8))
+        v = v + 0.4 * rng.standard_normal(seg)
+        x[t:t + seg] += (0.25 * v / 3.0) * np.hanning(seg)
+        t += seg + int(rng.integers(0.1 * rate, 0.5 * rate))
+    m = float(np.max(np.abs(x))) or 1.0
+    return (x / m * peak * 32767).astype(np.int16).tobytes()
+
+
+def test_quiet_microphone_still_produces_turns(live):
+    """Speech at -57 dBFS used to yield zero turns."""
+    pytest.importorskip("numpy")
+    det = live.TurnDetector()
+    turns = det.feed(_speechlike(20, peak=0.01, seed=0))
+    assert len(turns) > 5, (
+        f"a quiet but perfectly audible mic produced {len(turns)} turns")
+
+
+def test_very_quiet_audio_is_still_rejected(live):
+    """The fix must not turn the detector into a noise trigger."""
+    pytest.importorskip("numpy")
+    det = live.TurnDetector()
+    assert det.feed(_speechlike(20, peak=0.0008, seed=0)) == []
+
+
+def test_start_threshold_min_is_the_absolute_gate(live):
+    """`noise_floor_min` only guards the floor; it is not the gate."""
+    start, end = live.TurnDetector()._thresholds()
+    assert start >= live.DETECTOR_DEFAULTS["start_threshold_min"]
+    assert end < start, "hysteresis requires the end threshold below start"
+    # The old formula was max(floor*ratio, noise_floor_min) = 0.01.
+    assert start < 0.01, f"start threshold {start} is back at the old -40 dBFS floor"
+
+
+def test_min_voiced_gate_compares_milliseconds(live):
+    """3 voiced frames = 96ms is below min_voiced_ms (120ms) and is dropped.
+
+    Counting frames instead (int(120/32) = 3) kept these turns while the
+    server dropped them, so the two detectors disagreed on short answers.
+    """
+    from asr_mcp.streaming.turn_detector import TurnDetector as ServerDetector
+
+    pytest.importorskip("numpy")
+    # One 64ms burst = 2 voiced frames, below the gate for both detectors.
+    audio = _silence(0.4) + _pcm(0.064) + _silence(1.2)
+    assert live.TurnDetector().feed(audio) == []
+    assert ServerDetector().feed(audio) == []
+
+
+def test_client_and_server_detectors_agree_across_a_level_sweep(live):
+    """The strongest form of the equality requirement.
+
+    One hand-picked clip passed while the detectors were still wrong; a sweep
+    over signal level and chunk size is what exposed the float32 sqrt and the
+    frame-vs-millisecond gate. Exact equality, on purpose.
+    """
+    from asr_mcp.streaming.turn_detector import TurnDetector as ServerDetector
+
+    pytest.importorskip("numpy")
+    for seed in (0, 1, 2):
+        for peak in (0.5, 0.05, 0.01, 0.005):
+            pcm = _speechlike(20, peak=peak, seed=seed)
+            for chunk in (1024, 2134):
+                client, server = live.TurnDetector(), ServerDetector()
+                c_turns, s_turns = [], []
+                for i in range(0, len(pcm), chunk):
+                    c_turns += client.feed(pcm[i:i + chunk])
+                    s_turns += server.feed(pcm[i:i + chunk])
+                c_tail, s_tail = client.flush(), server.flush()
+                if c_tail:
+                    c_turns.append(c_tail)
+                if s_tail:
+                    s_turns.append(s_tail)
+                assert [(t.start_sample, t.end_sample, t.reason)
+                        for t in c_turns] == \
+                       [(t.start_sample, t.end_sample, t.reason)
+                        for t in s_turns], (
+                    f"seed={seed} peak={peak} chunk={chunk}: "
+                    f"client {len(c_turns)} turns, server {len(s_turns)}")
+
+
+def test_rms_is_computed_in_float32_like_the_server(live):
+    """math.sqrt(float(...)) promoted to float64 and moved turn boundaries.
+
+    The difference is ~1 ULP (3.7e-9) — invisible in the value, but enough
+    to flip an `rms >= threshold` comparison on a borderline frame.
+    """
+    from asr_mcp.streaming.turn_detector import rms as server_rms
+
+    pytest.importorskip("numpy")
+    det = live.TurnDetector()
+    for i in range(200):
+        frame = (np_random_frame(i)).tobytes()
+        assert det._rms(frame) == server_rms(frame), (
+            f"frame {i}: client {det._rms(frame)!r} != server {server_rms(frame)!r}")
+
+
+def np_random_frame(i):
+    import numpy as np
+
+    rng = np.random.default_rng(i)
+    return (rng.standard_normal(512) * 3000).astype(np.int16)
+
+
+# ── Level reporting ───────────────────────────────────────────────────────
+
+def test_level_meter_summary_reports_a_silent_channel(live):
+    import io
+
+    meter = live.LevelMeter(interval=0, stream=io.StringIO())
+    meter.feed(0, _pcm(0.1))
+    meter.tick(now=1.0)
+    meter.finalise()
+    summary = meter.summary()
+    assert "mic: peak" in summary
+    assert "SILENT" in summary, "a channel with no audio must say so"
+
+
+def test_level_meter_explains_a_zero_turn_run(live):
+    import io
+
+    buf = io.StringIO()
+    meter = live.LevelMeter(interval=0, stream=buf)
+    meter.feed(0, _silence(1.0))
+    meter.finalise()
+    meter.report_if_silent(0, out=buf)
+    text = buf.getvalue()
+    assert "No turns were detected" in text
+    assert "SILENT" in text, "the report must name the measured level"
+    # A run that DID send turns must stay quiet.
+    buf2 = io.StringIO()
+    m2 = live.LevelMeter(interval=0, stream=buf2)
+    m2.feed(0, _pcm(0.2))
+    m2.finalise()
+    m2.report_if_silent(3, out=buf2)
+    assert buf2.getvalue() == ""

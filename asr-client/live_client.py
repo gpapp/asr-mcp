@@ -118,10 +118,12 @@ def pack_flush() -> bytes:
 DETECTOR_DEFAULTS = {
     "frame_ms": 32.0,
     "noise_floor_ratio": 3.0,
-    "noise_floor_min": 0.004,
+    "noise_floor_min": 0.0005,
     "noise_floor_max": 0.05,
     "start_threshold_ratio": 2.5,
     "end_threshold_ratio": 1.6,
+    "start_threshold_min": 0.0012,
+    "end_threshold_min": 0.0006,
     "start_confirm_frames": 2,
     "end_confirm_frames": 3,
     "hangover_ms": 320,
@@ -192,9 +194,21 @@ class TurnDetector:
 
     # -- thresholds ------------------------------------------------------
     def _thresholds(self):
+        """MUST stay identical to asr_mcp/streaming/turn_detector.py.
+
+        The whole point of client-side endpointing is that a turn cut live is
+        cut the same way when the recording is re-diarized offline. This
+        function used to use `noise_floor_min` as the absolute gate while the
+        server used `noise_floor + 1e-4`, so the two disagreed (19 vs 23 turns
+        on the same audio at -43 dBFS) and the offline re-diarization would
+        move every boundary. `noise_floor_min` now only keeps the tracked floor
+        from collapsing to zero; `start_threshold_min` is the absolute gate.
+        """
         floor = self._noise_floor
-        start = max(floor * self.cfg["start_threshold_ratio"], self.cfg["noise_floor_min"])
-        end = max(floor * self.cfg["end_threshold_ratio"], self.cfg["noise_floor_min"])
+        start = max(floor * self.cfg["start_threshold_ratio"],
+                    self.cfg["start_threshold_min"])
+        end = max(floor * self.cfg["end_threshold_ratio"],
+                  self.cfg["end_threshold_min"], start * 0.6)
         return start, end
 
     def _rms(self, frame):
@@ -202,7 +216,12 @@ class TurnDetector:
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
         if samples.size == 0:
             return 0.0
-        return float(math.sqrt(float(np.mean(samples * samples))))
+        # The sqrt MUST stay in float32, exactly like the server's module-level
+        # `rms()`. Promoting to float64 first (math.sqrt(float(...))) differs by
+        # ~1 ULP (3.7e-9), which is enough to flip an `rms >= threshold`
+        # comparison on a borderline frame and move a turn boundary -- so the
+        # live cut and the offline re-diarization cut would disagree.
+        return float(np.sqrt(np.mean(samples ** 2)))
 
     def _track_floor(self, rms):
         """Follow quiet quickly, loud slowly — the floor must not chase speech."""
@@ -247,7 +266,7 @@ class TurnDetector:
             if len(self._pre_roll) > self.pre_roll_frames:
                 self._pre_roll.pop(0)
             if self._confirm_run >= self.cfg["start_confirm_frames"]:
-                self._open_turn()
+                self._open_turn(end_th)
             return None
 
         self._turn_samples.append(frame)
@@ -263,7 +282,7 @@ class TurnDetector:
             return self._close_turn("max_turn")
         return None
 
-    def _open_turn(self):
+    def _open_turn(self, end_th):
         """Open a turn, keeping the pre-roll so the onset is not clipped.
 
         Mirrors the server exactly, including the distinction that only frames
@@ -274,7 +293,8 @@ class TurnDetector:
         confirm_idx = self._frame_index - need
         older = [(i, f) for i, f in self._pre_roll if i < confirm_idx]
         self._in_turn = True
-        self._confirm_run = 0
+        # _confirm_run is deliberately NOT reset here: the server resets it
+        # only on close, and clearing it here made the two detectors differ.
         self._silent_run = 0
         self._turn_voiced = 0
         self._turn_peak = 0.0
@@ -285,7 +305,6 @@ class TurnDetector:
             self._turn_start_frame = confirm_idx
             self._turn_samples = []
         self._turn_samples.extend(f for i, f in self._pre_roll if i >= confirm_idx)
-        _, end_th = self._thresholds()
         for i, f in self._pre_roll:
             if i >= confirm_idx:
                 self._turn_peak = max(self._turn_peak, self._rms(f))
@@ -313,7 +332,12 @@ class TurnDetector:
         keep = max(1, len(frames) - hangover + post_roll)
         frames = frames[:keep]
 
-        if voiced < self.min_voiced_frames:
+        # The min-voiced gate compares MILLISECONDS, exactly like the server.
+        # Counting frames instead (int(min_voiced_ms / frame_ms) = 3) kept a
+        # 3-voiced-frame turn (96ms) that the server correctly dropped, so the
+        # two detectors disagreed on marginal short answers.
+        voiced_ms = voiced * self.cfg["frame_ms"]
+        if voiced_ms < float(self.cfg["min_voiced_ms"]):
             self.dropped_turns += 1
             return None
 
@@ -602,6 +626,10 @@ class LevelMeter:
         self._show_speaker = bool(show_speaker)
         self._peak = {0: 0.0, 1: 0.0}
         self._ever = {0: False, 1: False}
+        self._global_peak = {0: 0.0, 1: 0.0}
+        self._blocks = {0: [], 1: []}
+        self._median = {0: 0.0, 1: 0.0}
+        self._shown = bool(show_speaker)
         self._last = 0.0
         self._draw = False
 
@@ -625,6 +653,8 @@ class LevelMeter:
             if rms > 0.0:
                 self._ever[channel] = True
             self._peak[channel] = max(self._peak.get(channel, 0.0), rms)
+            if len(self._blocks[channel]) < 4096:
+                self._blocks[channel].append(rms)
 
     def tick(self, now=None):
         """Redraw if the interval has elapsed. Returns the rendered line."""
@@ -633,6 +663,10 @@ class LevelMeter:
         if t - self._last < self._interval:
             return None
         self._last = t
+        for ch in (0, 1):
+            p = self._peak.get(ch, 0.0)
+            if p > self._global_peak[ch]:
+                self._global_peak[ch] = p
         mic_db = self._db(self._peak.pop(0, 0.0))
         self._peak[0] = 0.0
         line = f"  mic {self._bar(mic_db):<{self.WIDTH}} {mic_db:6.1f} dB"
@@ -656,6 +690,44 @@ class LevelMeter:
             except Exception:
                 pass
             self._draw = False
+
+    def summary(self):
+        """Overall level statistics per channel, for the end-of-session report.
+
+        Pure text, no I/O. A run that produced no turns is otherwise
+        indistinguishable from a broken microphone, and the peak/median are
+        what identify which of the two it was.
+        """
+        parts = []
+        for ch, name in ((0, "mic"), (1, "speakers")):
+            peak = self._global_peak.get(ch, 0.0)
+            if not self._shown and ch == 1:
+                continue
+            pdb = self._db(peak)
+            if peak <= 0.0:
+                parts.append(f"{name}: SILENT (no audio reached this channel)")
+            else:
+                parts.append(
+                    f"{name}: peak {pdb:.1f} dB, median {self._db(self._median.get(ch, 0.0)):.1f} dB")
+        return "   ".join(parts)
+
+    def finalise(self):
+        """Freeze the median per channel once the session is over."""
+        for ch in (0, 1):
+            vals = sorted(self._blocks.get(ch, ()))
+            self._median[ch] = vals[len(vals) // 2] if vals else 0.0
+
+    def report_if_silent(self, turns_sent, out=None):
+        """Explain a zero-turn run in terms of levels, not speculation."""
+        if turns_sent or not self._shown:
+            return
+        (out or sys.stderr).write(
+            f"\nNo turns were detected, so nothing was sent. "
+            f"Capture levels: {self.summary()}\n"
+            f"A turn needs a frame above the start threshold, so a peak far "
+            f"below the noise floor means the device is capturing silence or "
+            f"is far too quiet -- raise the input gain, move closer to the "
+            f"mic, or pick another device with --device / --loopback.\n")
 
     def describe(self, channel):
         """Whether this channel EVER carried audio, not just right now.
@@ -1183,10 +1255,13 @@ def run_live(args):
         rx.start()
 
         while not stop.is_set():
+            # Tick EVERY iteration: it is internally throttled, and ticking
+            # only on an empty queue meant the meter never drew while audio
+            # was flowing -- which is exactly when it matters.
+            levels.tick()
             try:
                 channel, pcm = out_q.get(timeout=0.2)
             except queue.Empty:
-                levels.tick()
                 continue
             if not pcm:
                 continue
@@ -1211,6 +1286,8 @@ def run_live(args):
     finally:
         stop.set()
         levels.close()
+        levels.finalise()
+        levels.report_if_silent(session.turn_count)
         for c in captures:
             try:
                 c.stop()

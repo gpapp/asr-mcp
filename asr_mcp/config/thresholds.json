@@ -70,10 +70,12 @@
   "streaming": {
     "frame_ms": 32.0,
     "noise_floor_ratio": 3.0,
-    "noise_floor_min": 0.004,
+    "noise_floor_min": 0.0005,
     "noise_floor_max": 0.05,
     "start_threshold_ratio": 2.5,
     "end_threshold_ratio": 1.6,
+    "start_threshold_min": 0.0012,
+    "end_threshold_min": 0.0006,
     "start_confirm_frames": 2,
     "end_confirm_frames": 3,
     "hangover_ms": 320,

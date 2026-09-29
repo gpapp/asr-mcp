@@ -38,10 +38,12 @@ SAMPLE_RATE = 16000
 _DEFAULTS = {
     "frame_ms": 32.0,
     "noise_floor_ratio": 3.0,
-    "noise_floor_min": 0.004,
+    "noise_floor_min": 0.0005,
     "noise_floor_max": 0.05,
     "start_threshold_ratio": 2.5,
     "end_threshold_ratio": 1.6,
+    "start_threshold_min": 0.0012,
+    "end_threshold_min": 0.0006,
     "start_confirm_frames": 2,
     "end_confirm_frames": 3,
     "hangover_ms": 320,
@@ -164,15 +166,24 @@ class TurnDetector:
 
     # -- thresholds ------------------------------------------------------
     def _start_threshold(self) -> float:
+        # `noise_floor_min` only keeps the tracked floor from collapsing to
+        # zero; it must NOT also act as the absolute detection gate. It used
+        # to (`max(floor * ratio, noise_floor_min)`), which put a hard
+        # 0.004 * 2.5 = 0.01 RMS (-40 dBFS) floor on every start decision: a
+        # quiet headset mic speaking normally never crossed it, so 59s of
+        # speech produced zero turns. The absolute gate is
+        # `start_threshold_min`, and it is low enough to admit a real mic
+        # while still rejecting digital near-silence.
         return max(
             self._noise_floor * float(self.cfg["start_threshold_ratio"]),
-            self._noise_floor + 1e-4,
+            float(self.cfg["start_threshold_min"]),
         )
 
     def _end_threshold(self) -> float:
         # Strictly below the start threshold -> hysteresis.
         return max(
             self._noise_floor * float(self.cfg["end_threshold_ratio"]),
+            float(self.cfg["end_threshold_min"]),
             self._start_threshold() * 0.6,
         )
 
