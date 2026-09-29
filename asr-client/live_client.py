@@ -11,7 +11,7 @@ speaker names.
 Why it is separate from ``transcribe_client.py``
 -----------------------------------------------
 That script is standard-library only and is packaged as a standalone zip with
-a CI guard on that.  Live capture needs ``sounddevice`` (WASAPI), ``numpy`` and
+a CI guard on that.  Live capture needs ``PyAudioWPatch`` (WASAPI loopback), ``numpy`` and
 ``soxr`` (resampling to the 16 kHz the server expects), so this is a separate
 file with its own ``requirements-live.txt`` and the CI guard skips it.  The
 transcript *format* is shared by importing the render helpers from
@@ -330,11 +330,21 @@ class TurnDetector:
 
 
 # ── Audio capture ──────────────────────────────────────────────────────────
+#
+# Capture uses PyAudioWPatch, a PortAudio fork that carries the WASAPI loopback
+# patch (merged upstream in PortAudio 2022, but NOT in the prebuilt PortAudio
+# that sounddevice's wheels bundle -- see spatialaudio/portaudio-binaries#6,
+# still open).  Without loopback there is no way to capture "what the speakers
+# are playing", which is the entire basis of the two-channel design: the
+# microphone is the local user, the loopback is everyone else.
+
+LOOPBACK_SUFFIX = "[Loopback]"
+
 
 def _require_live_deps():
     missing = []
-    for mod, pkg in (("numpy", "numpy"), ("sounddevice", "sounddevice"),
-                     ("soxr", "soxr")):
+    for mod, pkg in (("numpy", "numpy"), ("pyaudiowpatch", "PyAudioWPatch"),
+                      ("soxr", "soxr")):
         try:
             __import__(mod)
         except ImportError:
@@ -347,42 +357,180 @@ def _require_live_deps():
         )
 
 
-def list_devices():
-    """Print capture and playback devices (helps pick a loopback source)."""
-    _require_live_deps()
-    import sounddevice as sd
+def probe_devices(p):
+    """Normalise PyAudioWPatch's device table into plain dicts.
 
-    print("Devices (loopback = capture-capable 'Render'/'Speakers' entries):\n")
-    for idx, dev in enumerate(sd.query_devices()):
-        if dev.get("max_input_channels", 0) < 1:
-            continue
-        api = sd.query_hostapis(dev["hostapi"])["name"]
-        print(f"  [{idx}] {dev['name']}")
-        print(f"        api={api}  in={dev['max_input_channels']} "
-              f"out={dev['max_output_channels']}  default_rate={dev['default_samplerate']:.0f}")
-
-
-def find_loopback_device(sd):
-    """Return (index, samplerate) of the default render device, or (None, None).
-
-    WASAPI exposes the speakers as a *capture* device with a hostapi loopback
-    flag; ``sd.query_devices()`` reports those as ordinary inputs, so the
-    default playback device is located via ``default_speakers`` on its hostapi.
+    Returned shape (plain data, so it can be asserted on in tests):
+        {"index", "name", "api", "in", "out", "rate", "is_loopback"}
     """
+    devs = []
+    for i in range(p.get_device_count()):
+        d = p.get_device_info_by_index(i)
+        try:
+            api = p.get_host_api_info_by_index(d["hostApi"])["name"]
+        except Exception:
+            api = "?"
+        name = d.get("name", "")
+        devs.append({
+            "index": i,
+            "name": name,
+            "api": api,
+            "in": int(d.get("maxInputChannels", 0)),
+            "out": int(d.get("maxOutputChannels", 0)),
+            "rate": int(d.get("defaultSampleRate", 0)),
+            "is_loopback": bool(d.get("isLoopbackDevice", False))
+                            or LOOPBACK_SUFFIX in name,
+        })
+    return devs
+
+
+def select_devices(devs, mic_index=None):
+    """Choose the microphone and the speakers-loopback. Pure — unit tested.
+
+    `devs` is `probe_devices()` output. Returns (mic, loopback, reason) where
+    `reason` is None on success or a human-readable explanation of why the
+    loopback channel is unavailable.
+
+    The loopback must be a real loopback device. An earlier version looked for
+    "the first WASAPI device with an input channel", which on a normal machine
+    is a *microphone* — it silently opened a second mic and labelled it
+    "everyone else", with no error anywhere.
+    """
+    if mic_index is not None:
+        mic = next((d for d in devs if d["index"] == mic_index), None)
+    else:
+        inputs = [d for d in devs if d["in"] >= 1 and not d["is_loopback"]]
+        mic = inputs[0] if inputs else None
+
+    loops = [d for d in devs if d["is_loopback"]]
+    if not loops:
+        # Report the actionable cause first: without the loopback patch there
+        # are no [Loopback] devices at all, and the missing-playback symptom
+        # would otherwise hide the fix.
+        reason = (
+            "no %s device found. Your PyAudioWPatch build is missing the "
+            "WASAPI loopback patch, so the speakers cannot be captured. "
+            "Reinstall with: pip install --force-reinstall PyAudioWPatch"
+            % LOOPBACK_SUFFIX)
+        if not any(d["out"] >= 1 for d in devs):
+            reason += " (This build also reports no playback device at all.)"
+        return mic, None, reason
+
+    # Prefer the loopback belonging to the default speakers, so a headset and
+    # a monitor are not confused for one another.
+    outs = [d for d in devs if d["out"] >= 1 and not d["is_loopback"]]
+    if outs:
+        want = outs[0]["name"]
+        for d in loops:
+            base = d["name"].replace(LOOPBACK_SUFFIX, "").strip()
+            if base == want:
+                return mic, d, None
+    return mic, loops[0], None
+
+
+def to_mono(pcm_bytes, channels):
+    """Interleaved int16 -> mono int16. Loopback devices are usually stereo."""
+    if channels <= 1:
+        return pcm_bytes
+    import numpy as np
+    if len(pcm_bytes) % 2:
+        # A truncated buffer would make np.frombuffer raise, and this runs in
+        # an audio callback. Drop the stray byte instead.
+        pcm_bytes = pcm_bytes[:-1]
+    if not pcm_bytes:
+        return b""
+    a = np.frombuffer(pcm_bytes, dtype=np.int16)
+    usable = (a.size // channels) * channels
+    if usable == 0:
+        return b""
+    a = a[:usable].reshape(-1, channels).astype(np.int32)
+    return np.clip(a.mean(axis=1).round(), -32768, 32767).astype(np.int16).tobytes()
+
+
+def list_devices(args=None):
+    """Print inputs, outputs and loopbacks (used to debug capture)."""
+    _require_live_deps()
+    import pyaudiowpatch as p
+
+    pa = p.PyAudio()
     try:
-        hostapis = sd.query_hostapis()
-        for api in hostapis:
-            if not api.get("default_speakers"):
-                continue
-            if "wasapi" not in str(api.get("name", "")).lower():
-                continue
-            for idx, dev in enumerate(sd.query_devices()):
-                if (dev.get("hostapi") == api["index"]
-                        and dev.get("max_input_channels", 0) >= 1):
-                    return idx, float(dev["default_samplerate"])
-    except Exception:
-        pass
-    return None, None
+        devs = probe_devices(pa)
+    finally:
+        pa.terminate()
+
+    print("Inputs (microphones):\n")
+    for d in devs:
+        if d["in"] >= 1 and not d["is_loopback"]:
+            print(f"  [{d['index']}] {d['name']}")
+            print(f"        api={d['api']}  in={d['in']}  rate={d['rate']}")
+    print("\nOutputs (speakers):\n")
+    for d in devs:
+        if d["out"] >= 1 and not d["is_loopback"]:
+            print(f"  [{d['index']}] {d['name']}")
+            print(f"        api={d['api']}  out={d['out']}  rate={d['rate']}")
+    print("\nLoopbacks (what the speakers play -- used for 'everyone else'):\n")
+    loops = [d for d in devs if d["is_loopback"]]
+    if not loops:
+        print("  NONE -- WASAPI loopback is unavailable in this build.")
+    for d in loops:
+        print(f"  [{d['index']}] {d['name']}  in={d['in']}  rate={d['rate']}")
+
+    mic, loop, reason = select_devices(devs, args.device)
+    if args.loopback is not None:
+        chosen = next((d for d in devs if d["index"] == args.loopback), None)
+        if chosen is None:
+            print(f"  --loopback {args.loopback} is not a valid device index")
+        else:
+            loop, reason = chosen, None
+    print(f"\nWould use microphone: {mic['name'] if mic else 'NONE'}")
+    print(f"Would use loopback  : {loop['name'] if loop else 'NONE'}")
+    if reason:
+        print(f"Problem            : {reason}")
+
+
+class Capture:
+    """One input stream (microphone or loopback) delivering mono 16 kHz PCM."""
+
+    def __init__(self, p, device, channels, out_rate, block_ms, on_block):
+        import numpy as np
+        self._pa = p
+        self._np = np
+        self._channels = max(1, int(channels or 1))
+        self._out_rate = out_rate
+        self._block_ms = block_ms
+        self._on_block = on_block
+        self._stream = None
+        block = max(64, int(int(device["rate"]) * block_ms / 1000))
+
+        def _cb(in_data, frame_count, time_info, status):
+            if status:
+                print(f"  capture status: {status}", file=sys.stderr)
+            try:
+                self._on_block(to_mono(in_data, self._channels))
+            except Exception as e:  # never let an exception kill the audio thread
+                print(f"  capture error: {e}", file=sys.stderr)
+            return in_data, self._pa.paContinue
+
+        self._stream = p.open(
+            format=p.paInt16,
+            channels=self._channels,
+            rate=int(device["rate"]),
+            input=True,
+            input_device_index=int(device["index"]),
+            frames_per_buffer=block,
+            stream_callback=_cb,
+        )
+
+    def start(self):
+        self._stream.start_stream()
+
+    def stop(self):
+        for fn in ("stop_stream", "close_stream"):
+            try:
+                getattr(self._stream, fn)()
+            except Exception:
+                pass
+
 
 
 class Resampler:
@@ -696,38 +844,39 @@ def _fmt_hms(sec):
 
 def run_live(args):
     _require_live_deps()
-    import sounddevice as sd
+    import pyaudiowpatch as p
 
     session = LiveSession(args)
-    loop_index, loop_rate = (None, None)
-    if not args.no_speaker:
-        loop_index, loop_rate = find_loopback_device(sd)
-        if loop_index is None:
-            print("No WASAPI loopback device found — recording microphone only.\n"
-                  "Other people's voices will be attributed from the mic (echo), "
-                  "which is much less accurate.", file=sys.stderr)
+    pa = p.PyAudio()
+    devs = probe_devices(pa)
+    mic_dev, loop_dev, problem = select_devices(devs, args.device)
+    if problem and not args.no_speaker:
+        print(f"WARNING: {problem}\n"
+              "Recording microphone only. Other people's voices will be picked "
+              "up from the microphone (echo), which is much less accurate.\n",
+              file=sys.stderr)
+    if args.no_speaker:
+        loop_dev = None
 
-    try:
-        default_in = sd.query_devices(kind="input")
-    except Exception:
-        default_in = None
-    mic_device = args.device if args.device is not None else default_in
-    mic_rate = float(args.rate or (default_in["default_samplerate"] if default_in else 48000))
-    block_ms = args.block_ms
-    block_samples = int(mic_rate * block_ms / 1000)
+    if mic_dev is None:
+        pa.terminate()
+        raise ClientError("No input device found. Check --devices.")
+
+    mic_rate = float(args.rate or mic_dev["rate"] or 48000)
+    loop_rate = float(loop_dev["rate"]) if loop_dev else None
 
     print(f"Session   : {session.stamp}")
     print(f"Server    : {session.base}")
     print(f"Language  : {session.language}")
-    print(f"Microphone: {mic_device['name'] if mic_device else 'default'} @ {mic_rate:.0f} Hz")
-    if loop_index is not None:
-        print(f"Loopback  : {sd.query_devices(loop_index)['name']} @ {loop_rate:.0f} Hz")
+    print(f"Microphone: {mic_dev['name']} @ {mic_rate:.0f} Hz")
+    if loop_dev is not None:
+        print(f"Loopback  : {loop_dev['name']} @ {loop_rate:.0f} Hz "
+              f"({loop_dev['in']}ch -> mono)")
     print(f"Recording : {session.mic_path}")
     print("Press Ctrl+C to stop.\n")
 
     mic_rec = ChannelRecorder(session.mic_path)
-    spk_rec = (ChannelRecorder(session.speaker_path)
-               if loop_index is not None else None)
+    spk_rec = ChannelRecorder(session.speaker_path) if loop_dev else None
     mic_det = TurnDetector()
     spk_det = TurnDetector() if spk_rec is not None else None
     mic_res = Resampler(mic_rate)
@@ -736,33 +885,27 @@ def run_live(args):
     out_q: "queue.Queue" = queue.Queue()
     stop = threading.Event()
 
-    def mic_callback(indata, frames, tinfo, status):
-        if status:
-            print(f"  mic status: {status}", file=sys.stderr)
-        out_q.put((CHANNEL_MIC, mic_res.process(bytes(indata))))
-
-    def spk_callback(indata, frames, tinfo, status):
-        if status:
-            print(f"  loopback status: {status}", file=sys.stderr)
-        out_q.put((CHANNEL_SPEAKER, spk_res.process(bytes(indata))))
-
-    streams = []
+    captures = []
     try:
-        streams.append(sd.InputStream(
-            device=mic_device, channels=1, samplerate=mic_rate,
-            blocksize=block_samples, dtype="int16", callback=mic_callback))
-        if loop_index is not None:
-            streams.append(sd.InputStream(
-                device=loop_index, channels=1, samplerate=loop_rate,
-                blocksize=block_samples, dtype="int16", callback=spk_callback))
-        for s in streams:
-            s.start()
+        captures.append(Capture(
+            pa, mic_dev, 1, SAMPLE_RATE, args.block_ms,
+            lambda pcm: out_q.put((CHANNEL_MIC, mic_res.process(pcm)))))
+        if loop_dev is not None:
+            captures.append(Capture(
+                pa, loop_dev, loop_dev["in"], SAMPLE_RATE, args.block_ms,
+                lambda pcm: out_q.put((CHANNEL_SPEAKER, spk_res.process(pcm)))))
+        for c in captures:
+            c.start()
     except Exception as e:
-        for s in streams:
+        for c in captures:
             try:
-                s.stop()
+                c.stop()
             except Exception:
                 pass
+        try:
+            pa.terminate()
+        except Exception:
+            pass
         raise ClientError(f"Could not open audio device: {e}") from None
 
     transport = None
@@ -823,12 +966,15 @@ def run_live(args):
         print("\nStopping ...")
     finally:
         stop.set()
-        for s in streams:
+        for c in captures:
             try:
-                s.stop()
-                s.close()
+                c.stop()
             except Exception:
                 pass
+        try:
+            pa.terminate()
+        except Exception:
+            pass
 
         # Flush both detectors so trailing speech is not lost, and pad both
         # recordings so they stay the same length as the sent audio.
@@ -881,7 +1027,10 @@ def build_parser():
     p.add_argument("--outdir", default=str(SCRIPT_DIR),
                    help="where to write the .wav/.txt/.asr.json (default: script dir)")
     p.add_argument("--device", type=int, default=None,
-                   help="microphone device index (default: system default input)")
+                   help="microphone device index (default: first input)")
+    p.add_argument("--loopback", type=int, default=None,
+                   help="speaker loopback device index (default: auto-detect; "
+                        "run --devices to see the [Loopback] entries)")
     p.add_argument("--rate", type=float, default=None,
                    help="microphone sample rate (default: device default)")
     p.add_argument("--block-ms", type=float, default=64.0,
@@ -900,7 +1049,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.devices:
-        list_devices()
+        list_devices(args)
         return 0
     try:
         session, rediag = run_live(args)

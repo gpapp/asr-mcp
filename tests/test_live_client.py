@@ -328,3 +328,178 @@ def test_uncertain_speaker_kept_with_reason(tmp_path, monkeypatch, live):
     assert "UNKNOWN (live_match_weak)" in text
     assert "mumble" in text  # text retained — identity withheld, not content
     assert "Live (diarization skipped)" in text
+
+
+# ── Device selection ───────────────────────────────────────────────────────
+#
+# The device list below is the REAL output of `live_client.py --devices` on
+# the tester's Windows machine, trimmed to the entries that matter. It is the
+# fixture that exposed the original bug: `find_loopback_device` returned
+# device 14 ("Microphone Array (Intel)") as the "speaker loopback", because
+# sounddevice cannot expose WASAPI loopback at all and the code settled for
+# the first WASAPI device with an input channel -- which is a microphone.
+# Nothing would have errored; it would have opened a second mic and labelled
+# it "everyone else".
+
+WINDOWS_DEVICES = [
+    {"index": 0, "name": "Microsoft Sound Mapper - Input", "api": "Windows WASAPI",
+     "in": 2, "out": 0, "rate": 48000, "is_loopback": False},
+    {"index": 14, "name": "Microphone Array (Intel)", "api": "Windows WASAPI",
+     "in": 4, "out": 0, "rate": 48000, "is_loopback": False},
+    {"index": 15, "name": "Headset Microphone (2- Plantronics Blackwire 3220 Series)",
+     "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
+     "is_loopback": False},
+]
+
+
+def _with_loopback():
+    devs = list(WINDOWS_DEVICES)
+    devs.append({"index": 16,
+                 "name": "Speakers (Realtek(R) Audio) [Loopback]",
+                 "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
+                 "is_loopback": True})
+    return devs
+
+
+def test_select_devices_never_uses_a_microphone_as_the_loopback(live):
+    """The regression that matters: no [Loopback] device -> no loopback."""
+    mic, loop, reason = live.select_devices(WINDOWS_DEVICES)
+    assert mic["index"] == 0
+    assert loop is None, "a microphone must never be used as the speaker channel"
+    assert reason and "no [Loopback] device" in reason
+    assert "force-reinstall PyAudioWPatch" in reason
+
+
+def test_select_devices_uses_a_real_loopback_when_present(live):
+    mic, loop, reason = live.select_devices(_with_loopback())
+    assert reason is None
+    assert loop["index"] == 16
+    assert loop["is_loopback"] is True
+    assert mic["index"] == 0 and mic["is_loopback"] is False
+
+
+def test_select_devices_honours_an_explicit_microphone(live):
+    mic, _, _ = live.select_devices(_with_loopback(), mic_index=15)
+    assert mic["name"].startswith("Headset Microphone")
+
+
+def test_select_devices_rejects_an_invalid_microphone_index(live):
+    mic, _, _ = live.select_devices(_with_loopback(), mic_index=999)
+    assert mic is None
+
+
+def test_select_devices_prefers_the_loopback_of_the_default_output(live):
+    devs = _with_loopback()
+    devs.append({"index": 4, "name": "Speakers (Realtek(R) Audio)",
+                 "api": "Windows WASAPI", "in": 0, "out": 2, "rate": 48000,
+                 "is_loopback": False})
+    devs.append({"index": 17,
+                 "name": "Headphones (Plantronics Blackwire 3220) [Loopback]",
+                 "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
+                 "is_loopback": True})
+    _, loop, _ = live.select_devices(devs)
+    # Output 4 is the first non-loopback output, so its loopback (16) wins
+    # over the headphones one (17).
+    assert loop["index"] == 16
+
+
+def test_select_devices_reports_the_missing_playback_device_too(live):
+    mic, loop, reason = live.select_devices(
+        [{"index": 0, "name": "In", "api": "WASAPI", "in": 1, "out": 0,
+          "rate": 48000, "is_loopback": False}])
+    assert mic["index"] == 0 and loop is None
+    assert "no playback device at all" in reason
+
+
+def test_select_devices_is_a_pure_function(live):
+    """No mutation, no I/O -- it is the part we can test off-Windows."""
+    devs = _with_loopback()
+    snapshot = [dict(d) for d in devs]
+    live.select_devices(devs)
+    assert devs == snapshot
+
+
+# ── Downmix ────────────────────────────────────────────────────────────────
+
+def test_to_mono_averages_stereo_int16(live):
+    import numpy as np
+    left = np.array([1000, -2000], dtype=np.int16)
+    right = np.array([3000, -1000], dtype=np.int16)
+    inter = np.empty(4, dtype=np.int16)
+    inter[0::2], inter[1::2] = left, right
+    out = np.frombuffer(live.to_mono(inter.tobytes(), 2), dtype=np.int16)
+    assert out.tolist() == [2000, -1500]
+
+
+def test_to_mono_passes_a_mono_stream_through(live):
+    raw = b"\x01\x00\x02\x00"
+    assert live.to_mono(raw, 1) == raw
+
+
+def test_to_mono_ignores_a_trailing_partial_frame(live):
+    """A dropped sample must not shift every channel by one."""
+    import numpy as np
+    pcm = np.array([100, 200, 300, 400, 999], dtype=np.int16).tobytes()
+    out = np.frombuffer(live.to_mono(pcm, 2), dtype=np.int16)
+    assert out.tolist() == [150, 350]
+
+
+def test_to_mono_handles_an_empty_buffer(live):
+    assert live.to_mono(b"", 2) == b""
+    assert live.to_mono(b"\x01", 2) == b""
+
+
+def test_to_mono_clips_instead_of_wrapping(live):
+    """Loud stereo must clip to int16 range, not overflow to a negative peak."""
+    import numpy as np
+    pcm = np.array([32767, 32767, -32768, -32768], dtype=np.int16).tobytes()
+    out = np.frombuffer(live.to_mono(pcm, 2), dtype=np.int16)
+    assert out.tolist() == [32767, -32768]
+
+
+# ── probe_devices ──────────────────────────────────────────────────────────
+
+class _FakePyAudio:
+    def get_device_count(self):
+        return 2
+
+    def get_device_info_by_index(self, i):
+        return {
+            0: {"name": "Mic", "maxInputChannels": 1, "maxOutputChannels": 0,
+                "defaultSampleRate": 48000.0, "hostApi": 0},
+            1: {"name": "Speakers [Loopback]", "maxInputChannels": 2,
+                "maxOutputChannels": 0, "defaultSampleRate": 44100.0,
+                "hostApi": 0, "isLoopbackDevice": True},
+        }[i]
+
+    def get_host_api_info_by_index(self, i):
+        return {"name": "Windows WASAPI"}
+
+
+def test_probe_devices_normalises_the_table(live):
+    devs = live.probe_devices(_FakePyAudio())
+    assert devs == [
+        {"index": 0, "name": "Mic", "api": "Windows WASAPI", "in": 1,
+         "out": 0, "rate": 48000, "is_loopback": False},
+        {"index": 1, "name": "Speakers [Loopback]", "api": "Windows WASAPI",
+         "in": 2, "out": 0, "rate": 44100, "is_loopback": True},
+    ]
+
+
+def test_probe_devices_detects_loopback_by_name_too(live):
+    """A build without the isLoopbackDevice field still names them."""
+    class _NoFlag(_FakePyAudio):
+        def get_device_info_by_index(self, i):
+            d = dict(super().get_device_info_by_index(i))
+            d.pop("isLoopbackDevice", None)
+            return d
+
+    assert live.probe_devices(_NoFlag())[1]["is_loopback"] is True
+
+
+def test_probe_devices_survives_a_missing_host_api(live):
+    class _BadApi(_FakePyAudio):
+        def get_host_api_info_by_index(self, i):
+            raise RuntimeError("gone")
+
+    assert live.probe_devices(_BadApi())[0]["api"] == "?"

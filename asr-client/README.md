@@ -91,8 +91,15 @@ established; the text was kept). Re-run if you need clean labels.
 
 ## Live mode (`transcribe.bat live`)
 
-Real-time transcription of a meeting. Requires `sounddevice`, `numpy`, `soxr`
+Real-time transcription of a meeting. Requires `PyAudioWPatch`, `numpy`, `soxr`
 and `websockets` (installed automatically from `requirements-live.txt`).
+
+> **Not `sounddevice`.** Capturing the *other* speakers needs the WASAPI
+> loopback patch, which was merged into PortAudio in 2022 but is not in the
+> prebuilt PortAudio that `sounddevice`'s wheels bundle
+> ([portaudio-binaries#6](https://github.com/spatialaudio/portaudio-binaries/issues/6)
+> is still open). With `sounddevice` there is no way to capture the speakers at
+> all, which is the whole basis of the two-channel design.
 
 ```
 transcribe.bat live

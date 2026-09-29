@@ -137,10 +137,32 @@ in the same order as `get_current_user`: session → `X-API-Key` header or
 *before* `accept()` so the client gets a 403 rather than a socket that dies
 immediately.
 
+## Capture library: PyAudioWPatch, not sounddevice
+
+The two-channel design needs "what the speakers are playing". That is WASAPI
+**loopback**, which PortAudio gained in 2022 (PR #672) as *virtual input
+devices* named `<render device> [Loopback]`. The stock PortAudio binaries that
+`sounddevice` ships still predate that patch, so those devices simply do not
+appear — and `sounddevice.WasapiSettings` has no loopback option at all
+(only `exclusive`).
+
+`sounddevice`'s absence of loopback caused a silent, dangerous bug: the first
+implementation looked for "the first WASAPI device with an input channel",
+which on an ordinary machine is a **microphone**. It opened a second mic,
+labelled it "everyone else", and raised no error. The fix is
+`PyAudioWPatch` (a PortAudio fork carrying the patch) plus a `select_devices`
+function that returns `loopback=None` unless a device is genuinely marked
+`isLoopbackDevice` / named `[Loopback]`.
+
+Loopback devices are usually **stereo**, so capture also has to downmix
+interleaved int16 to mono (`to_mono`) instead of assuming mono bytes.
+
 ## Known limitation
 
-The audio-capture path (`sounddevice`, WASAPI loopback, the WebSocket
+The audio-capture path (device enumeration, loopback capture, the WebSocket
 `Transport`) has never been executed against real hardware — no Windows host
 and no audio device were available during development. Framing, endpointing,
-resampling arithmetic, and session bookkeeping are covered by tests; device
-enumeration and loopback capture are not.
+resampling arithmetic, device selection and session bookkeeping are covered by
+tests (including the real device table from a Windows machine, which is what
+exposed the loopback bug); the actual audio callback and loopback capture are
+not.

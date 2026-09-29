@@ -1,18 +1,12 @@
-# Live (real-time) client dependencies — installed by `transcribe.bat live`.
+# Live mode only. The file client (transcribe_client.py) stays stdlib-only.
 #
-# The file client (transcribe_client.py) is standard-library only and installs
-# from requirements.txt, which stays empty. Live capture needs real audio I/O
-# (WASAPI on Windows), so it gets its own dependency set.
-#
-#   python -m pip install -r requirements-live.txt
-#
-# sounddevice  — PortAudio bindings; WASAPI loopback is how the default sound
-#                device is recorded as a second channel.
-# numpy        — sample buffers for the resampler and RMS.
-# soxr         — high-quality streaming resample to the 16 kHz the server wants
-#                (a 48 kHz device stream cannot be sent unconverted).
-# websockets   — WebSocket client for /api/asr/ws/stream.
-sounddevice>=0.4.6
+# PyAudioWPatch, not sounddevice: capturing "what the speakers are playing"
+# needs the WASAPI loopback patch, which was merged into PortAudio in 2022 but
+# is NOT in the prebuilt PortAudio that sounddevice's wheels bundle
+# (spatialaudio/portaudio-binaries#6 is still open). With sounddevice there is
+# no way to get the other speakers, which is the whole basis of the
+# two-channel live design.
+PyAudioWPatch>=0.2.12.8
 numpy>=1.24
 soxr>=0.3.7
 websockets>=12.0
