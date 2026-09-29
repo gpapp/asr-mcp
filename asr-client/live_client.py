@@ -384,10 +384,45 @@ def probe_devices(p):
     return devs
 
 
-def select_devices(devs, mic_index=None):
+# Windows exposes the same hardware under three APIs, plus MME "Sound Mapper"
+# aliases that are not real devices. Picking the wrong layer gives a mangled
+# name match, so the defaults are resolved from the OS and passed in rather
+# than guessed from list order.
+_MME_ALIASES = ("sound mapper", "primary sound", "communications")
+
+
+def _is_alias(name):
+    low = name.lower()
+    return any(tok in low for tok in _MME_ALIASES)
+
+
+def default_device_names(p):
+    """Names of the OS default input and output, best available. Never raises.
+
+    WASAPI is preferred: it is native-rate shared mode, whereas the MME
+    "Sound Mapper" alias is a legacy wrapper that resamples to 44100.
+    """
+    names = {"input": None, "output": None}
+    for key, wasapi, generic in (
+        ("input", "get_default_wasapi_device_info", "get_default_input_device_info"),
+        ("output", "get_default_wasapi_device_info", "get_default_output_device_info"),
+    ):
+        for getter in (wasapi, generic):
+            try:
+                info = getattr(p, getter)()
+            except Exception:
+                continue
+            if info:
+                names[key] = info.get("name")
+                break
+    return names
+
+
+def select_devices(devs, mic_index=None, default_input=None, default_output=None):
     """Choose the microphone and the speakers-loopback. Pure — unit tested.
 
-    `devs` is `probe_devices()` output. Returns (mic, loopback, reason) where
+    `devs` is `probe_devices()` output; `default_input`/`default_output` are
+    names from `default_device_names()`. Returns (mic, loopback, reason) where
     `reason` is None on success or a human-readable explanation of why the
     loopback channel is unavailable.
 
@@ -395,12 +430,31 @@ def select_devices(devs, mic_index=None):
     "the first WASAPI device with an input channel", which on a normal machine
     is a *microphone* — it silently opened a second mic and labelled it
     "everyone else", with no error anywhere.
+
+    Matching the loopback to the *default output* matters: on a machine with
+    both a headset and built-in speakers there are two loopbacks, and choosing
+    the wrong one captures silence (or, worse, the local user's own voice
+    played back through the speakers).
     """
     if mic_index is not None:
         mic = next((d for d in devs if d["index"] == mic_index), None)
     else:
         inputs = [d for d in devs if d["in"] >= 1 and not d["is_loopback"]]
-        mic = inputs[0] if inputs else None
+        mic = next((d for d in inputs if d["name"] == default_input), None)
+        if mic is None:
+            # Fall back to the first real (non-MME-alias) input, so we do not
+            # capture through the legacy Sound Mapper wrapper.
+            mic = next((d for d in inputs if not _is_alias(d["name"])), None) \
+                or (inputs[0] if inputs else None)
+        elif "WASAPI" not in mic["api"]:
+            # One physical device is listed once per API layer under the same
+            # name. WASAPI is native-rate shared mode; MME and DirectSound are
+            # compatibility wrappers that resample and can add their own
+            # processing, so prefer the WASAPI entry of the same device.
+            for d in inputs:
+                if d["name"] == mic["name"] and "WASAPI" in d["api"]:
+                    mic = d
+                    break
 
     loops = [d for d in devs if d["is_loopback"]]
     if not loops:
@@ -416,16 +470,15 @@ def select_devices(devs, mic_index=None):
             reason += " (This build also reports no playback device at all.)"
         return mic, None, reason
 
-    # Prefer the loopback belonging to the default speakers, so a headset and
-    # a monitor are not confused for one another.
-    outs = [d for d in devs if d["out"] >= 1 and not d["is_loopback"]]
-    if outs:
-        want = outs[0]["name"]
+    if default_output:
         for d in loops:
-            base = d["name"].replace(LOOPBACK_SUFFIX, "").strip()
-            if base == want:
+            if _base_name(d) == default_output:
                 return mic, d, None
     return mic, loops[0], None
+
+
+def _base_name(dev):
+    return dev["name"].replace(LOOPBACK_SUFFIX, "").strip()
 
 
 def to_mono(pcm_bytes, channels):
@@ -455,27 +508,32 @@ def list_devices(args=None):
     pa = p.PyAudio()
     try:
         devs = probe_devices(pa)
+        defaults = default_device_names(pa)
     finally:
         pa.terminate()
 
     print("Inputs (microphones):\n")
     for d in devs:
         if d["in"] >= 1 and not d["is_loopback"]:
-            print(f"  [{d['index']}] {d['name']}")
+            mark = "  <- OS default" if d["name"] == defaults["input"] else ""
+            print(f"  [{d['index']}] {d['name']}{mark}")
             print(f"        api={d['api']}  in={d['in']}  rate={d['rate']}")
     print("\nOutputs (speakers):\n")
     for d in devs:
         if d["out"] >= 1 and not d["is_loopback"]:
-            print(f"  [{d['index']}] {d['name']}")
+            mark = "  <- OS default" if d["name"] == defaults["output"] else ""
+            print(f"  [{d['index']}] {d['name']}{mark}")
             print(f"        api={d['api']}  out={d['out']}  rate={d['rate']}")
     print("\nLoopbacks (what the speakers play -- used for 'everyone else'):\n")
     loops = [d for d in devs if d["is_loopback"]]
     if not loops:
         print("  NONE -- WASAPI loopback is unavailable in this build.")
     for d in loops:
-        print(f"  [{d['index']}] {d['name']}  in={d['in']}  rate={d['rate']}")
+        mark = "  <- selected" if _base_name(d) == defaults["output"] else ""
+        print(f"  [{d['index']}] {d['name']}  in={d['in']}  rate={d['rate']}{mark}")
 
-    mic, loop, reason = select_devices(devs, args.device)
+    mic, loop, reason = select_devices(
+        devs, args.device, defaults["input"], defaults["output"])
     if args.loopback is not None:
         chosen = next((d for d in devs if d["index"] == args.loopback), None)
         if chosen is None:
@@ -542,7 +600,13 @@ class Resampler:
         self._soxr = soxr
         self.in_rate = float(in_rate)
         self.out_rate = int(out_rate)
-        self._stream = soxr.ResampleStream(self.in_rate, self.out_rate, 1, "HQ")
+        # Quality is a KEYWORD argument; the 4th positional is the numpy dtype
+        # (passing "HQ" there raises "data type 'HQ' not understood"). The
+        # default dtype is float32, which would reject the int16 chunks the
+        # callback delivers, so int16 is requested explicitly -- that also
+        # keeps the whole chain in int16 instead of round-tripping via float.
+        self._stream = soxr.ResampleStream(
+            self.in_rate, self.out_rate, 1, dtype="int16", quality="HQ")
 
     def process(self, pcm_bytes: bytes) -> bytes:
         import numpy as np
@@ -849,7 +913,9 @@ def run_live(args):
     session = LiveSession(args)
     pa = p.PyAudio()
     devs = probe_devices(pa)
-    mic_dev, loop_dev, problem = select_devices(devs, args.device)
+    defaults = default_device_names(pa)
+    mic_dev, loop_dev, problem = select_devices(
+        devs, args.device, defaults["input"], defaults["output"])
     if problem and not args.no_speaker:
         print(f"WARNING: {problem}\n"
               "Recording microphone only. Other people's voices will be picked "
@@ -872,6 +938,15 @@ def run_live(args):
     if loop_dev is not None:
         print(f"Loopback  : {loop_dev['name']} @ {loop_rate:.0f} Hz "
               f"({loop_dev['in']}ch -> mono)")
+        if _is_alias(defaults["output"] or ""):
+            # Windows only reports a generic mapper here, so the loopback is a
+            # guess. If it is wrong the recording is silent, which looks like
+            # a server fault rather than a device choice.
+            print(f"WARNING: Windows reports the default output only as "
+                  f"\"{defaults['output']}\", so the loopback above is a guess. "
+                  f"Play something through your actual output; if the "
+                  f"'everyone else' lines are missing, re-run with "
+                  f"--loopback <index> from --devices.", file=sys.stderr)
     print(f"Recording : {session.mic_path}")
     print("Press Ctrl+C to stop.\n")
 

@@ -191,8 +191,25 @@ def test_resampler_converts_to_16k(live):
     chunk = (np.sin(2 * np.pi * 220 * np.arange(4800) / 48000) * 8000)
     out = res.process((chunk * 32767).astype(np.int16).tobytes())
     samples = np.frombuffer(out, dtype=np.int16)
-    # 4800 samples at 48 kHz is 0.1s -> ~1600 samples at 16 kHz.
-    assert 1500 < len(samples) < 1700
+    # 4800 samples at 48 kHz is 0.1s -> ~1600 samples at 16 kHz. A streaming
+    # resampler holds back its filter delay, so the count is short until
+    # flush(); check the total, not a single chunk.
+    assert 1400 < len(samples) < 1600
+    total = len(samples) + len(np.frombuffer(res.flush(), dtype=np.int16))
+    assert 1590 <= total <= 1620
+
+
+def test_resampler_accepts_int16_chunks(live):
+    """soxr's ResampleStream defaults to float32 and rejects int16 input.
+
+    Passing the quality as the 4th positional argument lands it in the dtype
+    slot and raises "data type 'HQ' not understood"; omitting the dtype then
+    raises on the first chunk. Both crashed the client at startup.
+    """
+    pytest.importorskip("soxr")
+    res = live.Resampler(48000)
+    assert isinstance(res.process(b"\\x01\\x00" * 512), bytes)
+    assert isinstance(res.flush(), bytes)
 
 
 def test_resampler_flush_ends_the_stream(live):
@@ -341,82 +358,169 @@ def test_uncertain_speaker_kept_with_reason(tmp_path, monkeypatch, live):
 # Nothing would have errored; it would have opened a second mic and labelled
 # it "everyone else".
 
+# The REAL, complete output of `live_client.py --devices` on the tester's
+# Windows machine (a laptop with a Plantronics Blackwire 3220 headset). It is
+# the fixture that exposed the original bug: `find_loopback_device` returned
+# device 14 ("Microphone Array (Intel)") as the "speaker loopback", because
+# sounddevice cannot expose WASAPI loopback at all and the code settled for
+# the first WASAPI device with an input channel -- which is a microphone.
+# Nothing would have errored; it would have opened a second mic and labelled
+# it "everyone else".
+#
+# Note the shape: every real device appears three times (MME / DirectSound /
+# WASAPI), and MME contributes "Sound Mapper" aliases that are not devices at
+# all. Matching on list order or on the first entry therefore picks the wrong
+# layer.
+
 WINDOWS_DEVICES = [
-    {"index": 0, "name": "Microsoft Sound Mapper - Input", "api": "Windows WASAPI",
-     "in": 2, "out": 0, "rate": 48000, "is_loopback": False},
-    {"index": 14, "name": "Microphone Array (Intel)", "api": "Windows WASAPI",
-     "in": 4, "out": 0, "rate": 48000, "is_loopback": False},
+    {"index": 0, "name": "Microsoft Sound Mapper - Input", "api": "MME",
+     "in": 2, "out": 0, "rate": 44100, "is_loopback": False},
+    {"index": 1, "name": "Headset Microphone (2- Plantronics Blackwire 3220 Series)",
+     "api": "MME", "in": 2, "out": 0, "rate": 44100, "is_loopback": False},
+    {"index": 2, "name": "Microphone Array (Intel(R) Smart Sound Technology "
+                          "for Digital Microphones)",
+     "api": "MME", "in": 2, "out": 0, "rate": 44100, "is_loopback": False},
+    {"index": 3, "name": "Microsoft Sound Mapper - Output", "api": "MME",
+     "in": 0, "out": 2, "rate": 44100, "is_loopback": False},
+    {"index": 4, "name": "Headset Earphone (2- Plantronics Blackwire 3220 Series)",
+     "api": "MME", "in": 0, "out": 2, "rate": 44100, "is_loopback": False},
+    {"index": 5, "name": "Speakers (Realtek(R) Audio)", "api": "MME",
+     "in": 0, "out": 2, "rate": 44100, "is_loopback": False},
+    {"index": 6, "name": "Primary Sound Capture Driver",
+     "api": "Windows DirectSound", "in": 2, "out": 0, "rate": 44100,
+     "is_loopback": False},
+    {"index": 7, "name": "Headset Microphone (2- Plantronics Blackwire 3220 Series)",
+     "api": "Windows DirectSound", "in": 2, "out": 0, "rate": 44100,
+     "is_loopback": False},
+    {"index": 8, "name": "Microphone Array (Intel(R) Smart Sound Technology "
+                          "for Digital Microphones)",
+     "api": "Windows DirectSound", "in": 2, "out": 0, "rate": 44100,
+     "is_loopback": False},
+    {"index": 9, "name": "Primary Sound Driver", "api": "Windows DirectSound",
+     "in": 0, "out": 2, "rate": 44100, "is_loopback": False},
+    {"index": 10, "name": "Headset Earphone (2- Plantronics Blackwire 3220 Series)",
+     "api": "Windows DirectSound", "in": 0, "out": 2, "rate": 44100,
+     "is_loopback": False},
+    {"index": 11, "name": "Speakers (Realtek(R) Audio)",
+     "api": "Windows DirectSound", "in": 0, "out": 2, "rate": 44100,
+     "is_loopback": False},
+    {"index": 12, "name": "Speakers (Realtek(R) Audio)", "api": "Windows WASAPI",
+     "in": 0, "out": 2, "rate": 48000, "is_loopback": False},
+    {"index": 13, "name": "Headset Earphone (2- Plantronics Blackwire 3220 Series)",
+     "api": "Windows WASAPI", "in": 0, "out": 2, "rate": 48000,
+     "is_loopback": False},
+    {"index": 14, "name": "Microphone Array (Intel(R) Smart Sound Technology "
+                           "for Digital Microphones)",
+     "api": "Windows WASAPI", "in": 4, "out": 0, "rate": 48000,
+     "is_loopback": False},
     {"index": 15, "name": "Headset Microphone (2- Plantronics Blackwire 3220 Series)",
      "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
      "is_loopback": False},
+    {"index": 16, "name": "Speakers (Realtek(R) Audio) [Loopback]",
+     "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
+     "is_loopback": True},
+    {"index": 17, "name": "Headset Earphone (2- Plantronics Blackwire 3220 "
+                           "Series) [Loopback]",
+     "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
+     "is_loopback": True},
 ]
 
-
-def _with_loopback():
-    devs = list(WINDOWS_DEVICES)
-    devs.append({"index": 16,
-                 "name": "Speakers (Realtek(R) Audio) [Loopback]",
-                 "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
-                 "is_loopback": True})
-    return devs
+_HEADSET_OUT = "Headset Earphone (2- Plantronics Blackwire 3220 Series)"
+_SPEAKERS_OUT = "Speakers (Realtek(R) Audio)"
 
 
 def test_select_devices_never_uses_a_microphone_as_the_loopback(live):
     """The regression that matters: no [Loopback] device -> no loopback."""
-    mic, loop, reason = live.select_devices(WINDOWS_DEVICES)
-    assert mic["index"] == 0
+    devs = [d for d in WINDOWS_DEVICES if not d["is_loopback"]]
+    mic, loop, reason = live.select_devices(devs)
     assert loop is None, "a microphone must never be used as the speaker channel"
     assert reason and "no [Loopback] device" in reason
     assert "force-reinstall PyAudioWPatch" in reason
 
 
-def test_select_devices_uses_a_real_loopback_when_present(live):
-    mic, loop, reason = live.select_devices(_with_loopback())
+def test_select_devices_picks_the_loopback_of_the_default_output(live):
+    """Two loopbacks exist here; the wrong one captures silence or own echo."""
+    _, loop, reason = live.select_devices(
+        WINDOWS_DEVICES, default_output=_HEADSET_OUT)
     assert reason is None
+    assert loop["index"] == 17, "headset output must select the headset loopback"
+
+
+def test_select_devices_switches_loopback_with_the_output(live):
+    """Plugging in / unplugging the headset must change the captured device."""
+    _, loop, _ = live.select_devices(
+        WINDOWS_DEVICES, default_output=_SPEAKERS_OUT)
     assert loop["index"] == 16
+
+
+def test_select_devices_never_matches_an_mme_alias(live):
+    """The MME 'Sound Mapper' aliases are not devices and have no loopback.
+
+    Matching against the first output in list order picked the Realtek
+    speakers even while the headset was the default output -- the bug this
+    machine exposed.
+    """
+    assert "Microsoft Sound Mapper - Output" in WINDOWS_DEVICES[3]["name"]
+    _, loop, _ = live.select_devices(
+        WINDOWS_DEVICES, default_output="Microsoft Sound Mapper - Output")
+    # No exact match exists, so it must fall back to a real loopback rather
+    # than to the alias.
     assert loop["is_loopback"] is True
-    assert mic["index"] == 0 and mic["is_loopback"] is False
+
+
+def test_select_devices_prefers_the_os_default_microphone(live):
+    mic, _, _ = live.select_devices(
+        WINDOWS_DEVICES, default_input=_HEADSET_OUT.replace("Earphone", "Microphone"))
+    assert mic["index"] == 15
+
+
+def test_select_devices_avoids_the_mme_alias_microphone(live):
+    """Without a known default, take a real device rather than Sound Mapper."""
+    mic, _, _ = live.select_devices(WINDOWS_DEVICES)
+    assert mic["name"] != "Microsoft Sound Mapper - Input"
+    assert mic["is_loopback"] is False
 
 
 def test_select_devices_honours_an_explicit_microphone(live):
-    mic, _, _ = live.select_devices(_with_loopback(), mic_index=15)
-    assert mic["name"].startswith("Headset Microphone")
+    mic, _, _ = live.select_devices(
+        WINDOWS_DEVICES, mic_index=14, default_output=_HEADSET_OUT)
+    assert mic["name"].startswith("Microphone Array")
 
 
 def test_select_devices_rejects_an_invalid_microphone_index(live):
-    mic, _, _ = live.select_devices(_with_loopback(), mic_index=999)
+    mic, _, _ = live.select_devices(WINDOWS_DEVICES, mic_index=999)
     assert mic is None
 
 
-def test_select_devices_prefers_the_loopback_of_the_default_output(live):
-    devs = _with_loopback()
-    devs.append({"index": 4, "name": "Speakers (Realtek(R) Audio)",
-                 "api": "Windows WASAPI", "in": 0, "out": 2, "rate": 48000,
-                 "is_loopback": False})
-    devs.append({"index": 17,
-                 "name": "Headphones (Plantronics Blackwire 3220) [Loopback]",
-                 "api": "Windows WASAPI", "in": 2, "out": 0, "rate": 48000,
-                 "is_loopback": True})
-    _, loop, _ = live.select_devices(devs)
-    # Output 4 is the first non-loopback output, so its loopback (16) wins
-    # over the headphones one (17).
-    assert loop["index"] == 16
-
-
 def test_select_devices_reports_the_missing_playback_device_too(live):
-    mic, loop, reason = live.select_devices(
-        [{"index": 0, "name": "In", "api": "WASAPI", "in": 1, "out": 0,
-          "rate": 48000, "is_loopback": False}])
+    devs = [{"index": 0, "name": "In", "api": "WASAPI", "in": 1, "out": 0,
+             "rate": 48000, "is_loopback": False}]
+    mic, loop, reason = live.select_devices(devs)
     assert mic["index"] == 0 and loop is None
     assert "no playback device at all" in reason
 
 
 def test_select_devices_is_a_pure_function(live):
     """No mutation, no I/O -- it is the part we can test off-Windows."""
-    devs = _with_loopback()
+    devs = list(WINDOWS_DEVICES)
     snapshot = [dict(d) for d in devs]
-    live.select_devices(devs)
+    live.select_devices(devs, default_output=_HEADSET_OUT)
     assert devs == snapshot
+
+
+def test_default_device_names_survives_a_failing_getter(live):
+    class _Broken:
+        def get_default_wasapi_device_info(self):
+            raise RuntimeError("no WASAPI on this host")
+
+        def get_default_input_device_info(self):
+            return {"name": "Mic"}
+
+        def get_default_output_device_info(self):
+            return {"name": "Speakers"}
+
+    assert live.default_device_names(_Broken()) == {
+        "input": "Mic", "output": "Speakers"}
 
 
 # ── Downmix ────────────────────────────────────────────────────────────────
