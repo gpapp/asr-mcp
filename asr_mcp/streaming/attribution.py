@@ -162,17 +162,34 @@ def attribute_live_turn(
     )
     margin = (others[0] - float(best_dist)) if others else float("inf")
 
-    logger.info(
-        "Live match channel=%s: %s dist=%.3f conf=%.2f margin=%s",
-        channel, best_name, best_dist, conf,
-        "inf" if margin == float("inf") else f"{margin:.3f}",
-    )
-
+    # The gates decide FIRST and the log follows the decision. This line used
+    # to log the nearest name before the gates ran, so a rejected match read
+    # as "Live match channel=1: Daniil Khabarov dist=0.783 conf=0.00" and the
+    # operator concluded speakers were being assigned at random -- while the
+    # client was correctly showing UNKNOWN. Rejections are DEBUG; only a
+    # match that survives both gates is worth an INFO line.
+    m_s = "inf" if margin == float("inf") else f"{margin:.3f}"
     if conf < float(cfg["min_match_confidence"]):
+        logger.debug(
+            "Live attribution channel=%s: no match -- nearest %s was rejected "
+            "(dist=%.3f conf=%.2f < %.2f, margin=%s) -> UNKNOWN",
+            channel, best_name, best_dist, conf,
+            float(cfg["min_match_confidence"]), m_s,
+        )
         return _unknown("live_match_weak", conf=conf, margin=margin,
                         match_dist=best_dist)
     if margin < float(cfg["min_match_margin"]):
+        logger.debug(
+            "Live attribution channel=%s: no match -- nearest %s was ambiguous "
+            "(dist=%.3f conf=%.2f, margin=%s < %.2f) -> UNKNOWN",
+            channel, best_name, best_dist, conf, m_s,
+            float(cfg["min_match_margin"]),
+        )
         return _unknown("live_match_ambiguous", conf=conf, margin=margin,
                         match_dist=best_dist)
 
+    logger.info(
+        "Live match channel=%s: %s dist=%.3f conf=%.2f margin=%s",
+        channel, best_name, best_dist, conf, m_s,
+    )
     return _identified(best_name, conf, margin, best_dist)

@@ -83,7 +83,7 @@
     "post_roll_ms": 200,
     "min_voiced_ms": 120,
     "max_turn_sec": 30.0,
-    "queue_size": 8,
+    "queue_size": 32,
     "drop_on_overflow": true
   },
   "debug": false,

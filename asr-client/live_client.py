@@ -1106,18 +1106,36 @@ class LiveSession:
                 },
                 timeout=3600,
             )
+            # request_json returns (status, parsed) -- returning the tuple
+            # straight through made final_result() die with
+            # "'tuple' object has no attribute 'get'" and lose the .txt and
+            # .asr.json entirely, on a run whose live transcript was fine.
+            status, payload = resp
+            if status != 200:
+                raise ClientError(
+                    f"server returned HTTP {status}: "
+                    f"{(payload or {}).get('error', 'no error detail')}"
+                )
+            return payload
         except ClientError as e:
             print(f"Re-attribution failed: {e}", file=sys.stderr)
             print("The live transcript below is still valid.", file=sys.stderr)
             return None
-        return resp
 
     def build_live_result(self):
-        """Shape the live items like a transcribe result for build_transcript."""
+        """Shape the live items like a transcribe result for build_transcript.
+
+        Sorted by start time. Each channel runs its own TurnDetector with its
+        own sample counter, and the server drains one serial ASR worker, so
+        items arrive in decode-completion order -- not chronological. Left
+        unsorted the .txt read "[00:00:30] You ... [00:00:00] UNKNOWN ..."
+        because a later-arriving turn decoded sooner.
+        """
+        items = sorted(self.items, key=lambda it: (it.get("start") or 0.0))
         return {
-            "total_speakers": len({it["speaker"] for it in self.items if it["speaker"]}),
+            "total_speakers": len({it["speaker"] for it in items if it["speaker"]}),
             "audio_duration_sec": 0.0,
-            "results": self.items,
+            "results": items,
         }
 
     def final_result(self, rediag):

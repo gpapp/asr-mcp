@@ -1046,3 +1046,98 @@ def test_turns_sent_and_transcripts_received_are_separate(tmp_path, monkeypatch,
     data = json.loads(s.write_sidecar({}).read_text(encoding="utf-8"))
     assert data["turns_sent"] == 1
     assert data["transcripts_received"] == 1
+
+
+def test_reattribute_unpacks_the_status_tuple(tmp_path, monkeypatch, live):
+    """request_json returns (status, parsed). Returning the tuple whole used to
+    make final_result() raise AttributeError: 'tuple' object has no attribute
+    'get', which threw away a perfectly good live transcript's .txt and
+    .asr.json. Regression for the crash seen on a real 2-minute run."""
+    s = _session(tmp_path, monkeypatch, live)
+    s.on_message({"type": "transcript", "start": 0.0, "end": 1.0,
+                  "text": "hi", "channel": 0, "speaker": None})
+    payload = {"results": [{"start": 0.0, "end": 1.0, "text": "hi",
+                            "speaker": "Gergely Papp", "uncertain": False,
+                            "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}]}
+
+    captured = {}
+
+    def fake_request_json(method, url, **kw):
+        captured["url"] = url
+        return 200, payload
+
+    monkeypatch.setattr(live, "request_json", fake_request_json)
+    s.mic_path.write_bytes(b"RIFF" + b"\x00" * 40)
+    got = s.reattribute()
+    assert got == payload, "must return the parsed dict, not (status, parsed)"
+    # And the consumer must survive it.
+    result, used = s.final_result(got)
+    assert used is True and result["results"][0]["speaker"] == "Gergely Papp"
+
+
+def test_reattribute_non_200_falls_back_to_live(tmp_path, monkeypatch, live):
+    """A server-side error payload must not become the transcript, and must not
+    crash -- the live items are still valid."""
+    s = _session(tmp_path, monkeypatch, live)
+    s.on_message({"type": "transcript", "start": 0.0, "end": 1.0,
+                  "text": "live", "channel": 0, "speaker": "You"})
+
+    monkeypatch.setattr(
+        live, "request_json",
+        lambda *a, **k: (500, {"error": "Diarization failed"}))
+    s.mic_path.write_bytes(b"RIFF" + b"\x00" * 40)
+    got = s.reattribute()
+    assert got is None
+    result, used = s.final_result(got)
+    assert used is False and result["results"][0]["text"] == "live"
+
+
+def test_live_results_are_sorted_chronologically(tmp_path, monkeypatch, live):
+    """Each channel has its own sample counter and the server drains one serial
+    ASR worker, so items arrive in decode-completion order. Unsorted, the .txt
+    read "[00:00:30] You ... [00:00:00] UNKNOWN ..."."""
+    s = _session(tmp_path, monkeypatch, live)
+    # Deliberately out of order, as the real run delivered them.
+    for start, spk, txt in ((30.0, "You", "late mic"),
+                            (0.0, None, "first speaker"),
+                            (12.0, "You", "mid mic")):
+        s.on_message({"type": "transcript", "start": start, "end": start + 2.0,
+                      "text": txt, "channel": 0 if spk else 1, "speaker": spk})
+    result, used = s.final_result(None)
+    assert used is False
+    assert [r["text"] for r in result["results"]] == [
+        "first speaker", "mid mic", "late mic"]
+
+
+def test_live_attribution_log_comes_after_the_gates(caplog, live):
+    """A rejected match must not print 'Live match <name>' -- that read as a
+    random assignment every turn while the client correctly showed UNKNOWN."""
+    import asr_mcp.streaming.attribution as attr
+    import numpy as np
+
+    vps = {"Gergely Papp": {"embedding": [0.0] * 192, "pitch": 0.0,
+                            "energy": 0.0, "mfcc_mean": [0.0] * 20,
+                            "mfcc_std": [1.0] * 20}}
+    # A vector nothing matches: the matcher still returns a nearest name.
+    far = [0.0] * 191 + [1.0]
+    turn = type("T", (), {"audio": b"\x00\x00" * 100, "duration_sec": 1.0,
+                          "peak_rms": 0.05, "mean_rms": 0.03})()
+    with caplog.at_level("INFO"):
+        out = attr.attribute_live_turn(
+            turn, 1, vps, attr.config(),
+            # NB: embed_fn takes the TURN, not (audio, sample_rate) -- it is
+            # the server's closure that supplies the rate. Passing two args
+            # raised inside the try, was caught as live_match_failed, and made
+            # this test pass without ever reaching the gate.
+            embed_fn=lambda t: np.array(far, dtype=np.float32),
+            pitch_fn=lambda t: 100.0, energy_fn=lambda t: 0.5)
+    # Must be rejected BY THE GATE. live_match_failed would mean the injectable
+    # never ran, and the "no Live match" assertion would be vacuous.
+    assert out["speaker"] is None, "an unmatched turn must be UNKNOWN"
+    assert out["speaker_source"] == "unknown"
+    assert out.get("attribution_reason") in ("live_match_weak",
+                                             "live_match_ambiguous"), (
+        "expected a real gate rejection, got "
+        f"{out.get('attribution_reason')!r} -- the gate was never reached")
+    assert "Live match" not in caplog.text, (
+        "a rejected match must not log 'Live match': " + caplog.text)
