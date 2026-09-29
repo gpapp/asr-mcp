@@ -79,17 +79,35 @@ def _turn_message(turn: Turn, text: str, inference_sec: float, tokens: int,
     return _as_dict(msg)
 
 
+def _err(exc: Exception, limit: int = 300) -> str:
+    """A bounded one-line description of an exception.
+
+    A backend that was handed the wrong type embeds the whole offending
+    payload in its message, so an untruncated ``logger.error("...: %s", e)``
+    wrote megabytes of hex per failed turn.
+    """
+    detail = str(exc)
+    if len(detail) > limit:
+        detail = f"{detail[:limit]}... ({len(detail)} chars total)"
+    return detail
+
+
 def _turn_from_frame(header: dict, pcm: bytes) -> Turn:
     """Build a Turn from a client-cut turn frame (no detector involved)."""
     import numpy as np
 
     start_sample = int(header["start_sample"])
     n_samples = int(header["n_samples"])
-    samples = np.frombuffer(pcm, dtype=np.int16)
+    # Turn.audio is a float32 numpy array in [-1, 1] everywhere else (see
+    # turn_detector._close_turn). Passing the raw bytes through instead made
+    # every single live turn die in the ASR backend with
+    # "could not convert string to float: b'\\x00\\x00...'", and the exception
+    # text carried the whole PCM payload into the log.
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     return Turn(
         start_sample=start_sample,
         end_sample=start_sample + n_samples,
-        audio=pcm,
+        audio=samples,
         reason="client_turn",
         peak_rms=0.0,
         mean_rms=0.0,
@@ -273,7 +291,10 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
                     None, _transcribe_turn, turn, channel,
                 )
             except Exception as e:  # pragma: no cover - defensive
-                logger.error("Utterance processing failed: %s", e)
+                logger.error(
+                    "Utterance processing failed: %s: %s",
+                    type(e).__name__, _err(e),
+                )
                 msg = {"type": "error", "message": str(e),
                        "start": round(turn.start_sec, 2)}
             try:
@@ -366,7 +387,7 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
     except WebSocketDisconnect:
         logger.info("WebSocket stream disconnected")
     except Exception as e:
-        logger.error("WebSocket error: %s", e)
+        logger.error("WebSocket error: %s: %s", type(e).__name__, _err(e))
         worker.cancel()
         try:
             await websocket.close()

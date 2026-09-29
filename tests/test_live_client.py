@@ -251,7 +251,7 @@ def test_on_message_records_item_and_prints(tmp_path, monkeypatch, live, capsys)
         "channel": 1, "speaker": "Gergely Papp", "speaker_confidence": 0.8,
         "speaker_source": "known_voiceprint", "uncertain": False,
     })
-    assert s.turn_count == 1
+    assert s.transcript_count == 1
     assert s.items[0]["text"] == "hello"
     assert s.items[0]["speaker"] == "Gergely Papp"
     out = capsys.readouterr().out
@@ -278,7 +278,10 @@ def test_sidecar_records_gaps_and_source(tmp_path, monkeypatch, live):
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["asr_source"] == "live_stream"
-    assert data["turns"] == 1
+    # This test drives on_message directly, so no turn was ever sent --
+    # which is exactly the split the two counters exist to expose.
+    assert data["turns_sent"] == 0
+    assert data["transcripts_received"] == 1
     assert len(data["gaps"]) == 1
     assert data["server_stats"]["covered_sec"] == 2.5
     assert data["items"][0]["text"] == "hi"
@@ -1024,3 +1027,22 @@ def test_level_meter_explains_a_zero_turn_run(live):
     m2.finalise()
     m2.report_if_silent(3, out=buf2)
     assert buf2.getvalue() == ""
+
+
+def test_turns_sent_and_transcripts_received_are_separate(tmp_path, monkeypatch, live):
+    """A session can send turns and get no replies back.
+
+    These were one counter, so a run where the server received 24 turns and
+    returned nothing reported "Turns sent: 0" and blamed the microphone.
+    """
+    s = _session(tmp_path, monkeypatch, live)
+    assert s.turns_sent == 0
+    assert s.transcript_count == 0
+    s.on_message({"type": "transcript", "start": 1.0, "end": 2.0,
+                  "text": "hello", "channel": 0, "speaker": "You",
+                  "speaker_confidence": 1.0, "speaker_source": "input_device"})
+    s.turns_sent += 1
+    assert s.transcript_count == 1
+    data = json.loads(s.write_sidecar({}).read_text(encoding="utf-8"))
+    assert data["turns_sent"] == 1
+    assert data["transcripts_received"] == 1

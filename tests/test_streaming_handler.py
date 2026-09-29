@@ -42,6 +42,12 @@ def _turn_frame(channel, payload, start_sample=0):
     return proto.pack_turn(channel, start_sample, payload)
 
 
+def proto_flush():
+    from asr_mcp.streaming import protocol as proto
+
+    return proto.pack_control(proto.MSG_FLUSH)
+
+
 class FakeWebSocket:
     """Minimal stand-in for starlette's WebSocket."""
 
@@ -74,7 +80,16 @@ def patched(monkeypatch):
     calls = []
 
     def fake_transcribe(audio=None, **kw):
-        calls.append({"dur": len(audio) / SR, "kwargs": kw})
+        # Assert the real contract, not just a length. `len(audio)` happens to
+        # work on raw bytes, which let `_turn_from_frame` hand the backend the
+        # whole PCM payload instead of a float32 array and every live turn die
+        # with "could not convert string to float" while these tests stayed
+        # green. The backend is a real array consumer, so assert as one.
+        assert isinstance(audio, np.ndarray), (
+            f"backend received {type(audio).__name__}, expected np.ndarray"
+        )
+        assert audio.dtype == np.float32, f"dtype was {audio.dtype}"
+        calls.append({"dur": len(audio) / SR, "kwargs": kw, "audio": audio})
         return {"text": "hello", "inference_time_sec": 0.01, "tokens_generated": 3}
 
     monkeypatch.setattr(model_state.state, "ensure_ready", lambda *a, **k: None, raising=False)
@@ -322,3 +337,70 @@ def test_cpu_embedding_session_does_not_receive_gpu_arena_options():
     gpu = FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
     assert emb._run_with_cpu_fallback(gpu, {}, ["out"]) == ["ok"]
     assert gpu.calls == [GPU_SHRINK_RUN_OPTIONS], "GPU session must still shrink"
+
+
+# --- the turn frame payload contract ---------------------------------------
+
+def test_turn_frame_audio_is_a_float32_array():
+    """Regression: raw PCM bytes were passed to the ASR backend.
+
+    `Turn.audio` is a float32 numpy array in [-1, 1] everywhere else. The
+    turn-frame path passed `pcm` (bytes) through instead, so every live turn
+    raised "could not convert string to float: b'...'" and the exception text
+    dumped the entire payload into the log. The real-world symptom was a
+    session reporting 0 transcripts with megabytes of hex in the server log.
+    """
+    from asr_mcp.streaming import protocol as proto
+
+    pcm = _pcm(0.2)
+    header, data = proto.unpack_turn(proto.pack_turn(0, 0, pcm))
+    turn = hd._turn_from_frame(header, data)
+
+    assert isinstance(turn.audio, np.ndarray), type(turn.audio)
+    assert turn.audio.dtype == np.float32
+    assert abs(float(np.abs(turn.audio).max()) - 0.3) < 0.01
+    assert turn.end_sample - turn.start_sample == len(turn.audio)
+
+
+def test_turn_frame_audio_matches_the_server_detector_output():
+    """A client cut and a server cut must produce the same array convention."""
+    from asr_mcp.streaming import protocol as proto
+    from asr_mcp.streaming.turn_detector import TurnDetector
+
+    pcm = _pcm(0.3)
+    header, data = proto.unpack_turn(proto.pack_turn(0, 0, pcm))
+    framed = hd._turn_from_frame(header, data)
+
+    det = TurnDetector()
+    det.feed(_silence(0.4))
+    det.feed(pcm)
+    detected = det.feed(_silence(1.2))[0]
+
+    # Both paths must hand the backend the same KIND of thing: float32 in
+    # [-1, 1]. They are not byte-identical because the server re-frames the
+    # audio and adds pre/post-roll, so only the convention is comparable.
+    for turn in (framed, detected):
+        assert turn.audio.dtype == np.float32
+        assert np.abs(turn.audio).max() <= 1.0
+        assert np.abs(turn.audio).max() > 0.1
+    assert np.isclose(np.abs(framed.audio).max(),
+                      np.abs(detected.audio).max(), atol=0.01)
+
+
+def test_transcribed_turn_reaches_the_client(patched):
+    """End to end through the TURN FRAME path (not the legacy raw-PCM path).
+
+    The earlier end-to-end check drove the legacy raw-PCM path, which goes
+    through the server's own detector and therefore always had a proper
+    array. This exercises the path the live client actually uses.
+    """
+    frames = [
+        {"type": "websocket.receive", "bytes": _turn_frame(0, _pcm(0.4))},
+        {"type": "websocket.receive", "bytes": proto_flush()},
+    ]
+    ws = _run(frames)
+    texts = [m for m in ws.sent if m.get("type") == "transcript"]
+    assert texts, f"no transcript message; sent={ws.sent}"
+    assert texts[0]["text"] == "hello"
+    assert patched, "the backend was never called"
+    assert patched[0]["audio"].dtype == np.float32

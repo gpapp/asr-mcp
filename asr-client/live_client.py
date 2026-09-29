@@ -953,7 +953,13 @@ class LiveSession:
 
         self.items = []          # live ASR items -> the re-attribution input
         self.gaps = []           # server-reported drops
-        self.turn_count = 0
+        # Turns the client cut and handed to the transport. Distinct from
+        # transcripts received back: a session can send 24 turns and get 0
+        # replies (server error, or a backend that returns nothing), and
+        # conflating the two made "Turns sent: 0" print while the server log
+        # showed queued_turns: 24.
+        self.turns_sent = 0
+        self.transcript_count = 0
         self.drop_count = 0
         self.sequence = 0
         self.covered_sec = 0.0
@@ -1005,7 +1011,7 @@ class LiveSession:
                     "uncertain": bool(msg.get("uncertain")),
                     "attribution_reason": msg.get("attribution_reason"),
                 })
-                self.turn_count += 1
+                self.transcript_count += 1
             speaker = msg.get("speaker") or "UNKNOWN"
             conf = msg.get("speaker_confidence")
             conf_s = f" ({conf:.0%})" if isinstance(conf, (int, float)) and conf > 0 else ""
@@ -1046,7 +1052,8 @@ class LiveSession:
                     "speaker_wav": str(self.speaker_path) if self.speaker_path.exists() else None,
                 },
                 "asr_source": "live_stream",
-                "turns": self.turn_count,
+                "turns_sent": self.turns_sent,
+                "transcripts_received": self.transcript_count,
                 "gaps": self.gaps,
                 "server_stats": self.server_stats,
                 "items": self.items,
@@ -1074,7 +1081,8 @@ class LiveSession:
             ]
         if not items:
             print("\nNo transcribed text to re-attribute.", file=sys.stderr)
-            print(f"Turns sent: {self.turn_count}. The microphone recording is "
+            print(f"Turns sent: {self.turns_sent}, transcripts received: "
+                  f"{self.transcript_count}. The microphone recording is "
                   f"{self.mic_seconds:.1f}s. If you spoke during the session, "
                   f"capture or the server is the problem -- not "
                   f"re-attribution. Re-run --devices to confirm the device, or "
@@ -1127,7 +1135,8 @@ class LiveSession:
         header = (f"# {banner}\n"
                   f"# Session: {self.started.isoformat(timespec='seconds')}\n"
                   f"# Audio: {self.mic_path}\n"
-                  f"# Turns: {self.turn_count}  Gaps: {self.drop_count}\n")
+                  f"# Turns sent: {self.turns_sent}  Transcripts: "
+                  f"{self.transcript_count}  Gaps: {self.drop_count}\n")
         self.txt_path.write_text(header + text, encoding="utf-8")
         return self.txt_path
 
@@ -1183,6 +1192,8 @@ def run_live(args):
                   f"'everyone else' lines are missing, re-run with "
                   f"--loopback <index> from --devices.", file=sys.stderr)
     print(f"Recording : {session.mic_path}")
+    if loop_dev:
+        print(f"Speaker rec: {session.speaker_path}")
     print("Press Ctrl+C to stop.")
     print("Watch the levels below: a flat column means that channel captured "
           "nothing.\n")
@@ -1276,6 +1287,7 @@ def run_live(args):
                 session.sequence += 1
                 try:
                     transport.send_turn(channel, turn, session.sequence)
+                    session.turns_sent += 1
                 except Exception as e:
                     send_error = e
                     print(f"\nSend failed: {e}", file=sys.stderr)
@@ -1287,7 +1299,7 @@ def run_live(args):
         stop.set()
         levels.close()
         levels.finalise()
-        levels.report_if_silent(session.turn_count)
+        levels.report_if_silent(session.turns_sent)
         for c in captures:
             try:
                 c.stop()
@@ -1313,6 +1325,7 @@ def run_live(args):
                 if transport is not None and not send_error:
                     try:
                         transport.send_turn(channel, tail, session.sequence)
+                        session.turns_sent += 1
                     except Exception:
                         pass
             rec.write(res.flush())
@@ -1407,6 +1420,8 @@ def main(argv=None):
     if uncertain:
         print(f"WARNING: {uncertain} segment(s) have an UNKNOWN speaker "
               "(text kept, identity withheld).", file=sys.stderr)
+    if session.speaker_path.exists():
+        print(f"Speaker rec: {session.speaker_path}")
     return 0
 
 
