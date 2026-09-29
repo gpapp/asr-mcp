@@ -375,14 +375,18 @@ def test_uncertain_speaker_kept_with_reason(tmp_path, monkeypatch, live):
 WINDOWS_DEVICES = [
     {"index": 0, "name": "Microsoft Sound Mapper - Input", "api": "MME",
      "in": 2, "out": 0, "rate": 44100, "is_loopback": False},
-    {"index": 1, "name": "Headset Microphone (2- Plantronics Blackwire 3220 Series)",
+    # MME truncates device names to 31 characters. This is verbatim what
+    # PyAudioWPatch reports on the tester's machine, and it is the reason a
+    # name comparison against the WASAPI / [Loopback] entries of the same
+    # hardware used to fail: the OS default came back truncated.
+    {"index": 1, "name": "Headset Microphone (2- Plantron",
      "api": "MME", "in": 2, "out": 0, "rate": 44100, "is_loopback": False},
     {"index": 2, "name": "Microphone Array (Intel(R) Smart Sound Technology "
                           "for Digital Microphones)",
      "api": "MME", "in": 2, "out": 0, "rate": 44100, "is_loopback": False},
     {"index": 3, "name": "Microsoft Sound Mapper - Output", "api": "MME",
      "in": 0, "out": 2, "rate": 44100, "is_loopback": False},
-    {"index": 4, "name": "Headset Earphone (2- Plantronics Blackwire 3220 Series)",
+    {"index": 4, "name": "Headset Earphone (2- Plantronic",
      "api": "MME", "in": 0, "out": 2, "rate": 44100, "is_loopback": False},
     {"index": 5, "name": "Speakers (Realtek(R) Audio)", "api": "MME",
      "in": 0, "out": 2, "rate": 44100, "is_loopback": False},
@@ -427,6 +431,8 @@ WINDOWS_DEVICES = [
 
 _HEADSET_OUT = "Headset Earphone (2- Plantronics Blackwire 3220 Series)"
 _SPEAKERS_OUT = "Speakers (Realtek(R) Audio)"
+# The full, untruncated WASAPI-layer name for the headset microphone.
+_HEADSET_MIC = "Headset Microphone (2- Plantronics Blackwire 3220 Series)"
 
 
 def test_select_devices_never_uses_a_microphone_as_the_loopback(live):
@@ -521,6 +527,146 @@ def test_default_device_names_survives_a_failing_getter(live):
 
     assert live.default_device_names(_Broken()) == {
         "input": "Mic", "output": "Speakers"}
+
+
+def test_same_device_matches_an_mme_truncated_name(live):
+    """MME truncates device names to 31 chars; the rest of the layers do not.
+
+    This is the exact mismatch the tester's machine exposed: Windows reported
+    the default output as "Headset Earphone (2- Plantronic", which matches no
+    loopback by equality, so the real headset loopback was never selected.
+    """
+    assert live._same_device("Headset Earphone (2- Plantronic",
+                             "Headset Earphone (2- Plantronics "
+                             "Blackwire 3220 Series)")
+    assert live._same_device("Headset Earphone (2- Plantronics "
+                             "Blackwire 3220 Series",
+                             "Headset Earphone (2- Plantronic")
+
+
+def test_same_device_rejects_unrelated_and_short_names(live):
+    assert not live._same_device("Speakers (Realtek(R) Audio)",
+                                 "Headset Earphone (2- Plantronics)")
+    assert not live._same_device("", "Headset")
+    assert not live._same_device(None, None)
+    # A short common prefix must not be treated as the same device.
+    assert not live._same_device("Mic", "Microphone Array (Intel)")
+
+
+def test_truncated_default_output_selects_the_right_loopback(live):
+    """End to end with the OS default reported by the MME layer."""
+    _, loop, reason = live.select_devices(
+        WINDOWS_DEVICES, default_output="Headset Earphone (2- Plantronic")
+    assert reason is None
+    assert loop["index"] == 17
+
+
+def test_truncated_default_input_upgrades_to_wasapi(live):
+    """A truncated MME default must still resolve to the WASAPI mic (15)."""
+    mic, _, _ = live.select_devices(
+        WINDOWS_DEVICES, default_input="Headset Microphone (2- Plantron")
+    assert mic["index"] == 15, "must capture at native 48 kHz, not via MME"
+    assert mic["rate"] == 48000
+
+
+def test_default_device_names_rejects_a_wrong_direction_answer(live):
+    """get_default_wasapi_device_info() reports the INPUT, so asking it for
+    the output yields a microphone name. The answer is dropped instead of
+    being trusted."""
+    class _P:
+        def get_default_input_device_info(self):
+            return {"name": _HEADSET_MIC}
+
+        def get_default_output_device_info(self):
+            return {"name": _HEADSET_MIC}
+
+    got = live.default_device_names(_P(), WINDOWS_DEVICES)
+    assert got["input"] is not None
+    assert got["output"] is None, "a microphone name is not a valid output default"
+
+
+def test_default_device_names_prefers_direction_correct_names(live):
+    class _P:
+        def get_default_input_device_info(self):
+            return {"name": _HEADSET_MIC}
+
+        def get_default_output_device_info(self):
+            return {"name": "Speakers (Realtek(R) Audio)"}
+
+    got = live.default_device_names(_P(), WINDOWS_DEVICES)
+    assert got["input"] == _HEADSET_MIC
+    assert got["output"] == "Speakers (Realtek(R) Audio)"
+
+
+# ── Capture: module vs instance attributes ─────────────────────────────────
+
+class _FakeModule:
+    """pyaudiowpatch: paInt16 / paContinue are MODULE-level constants."""
+    paInt16 = 8
+    paContinue = 1
+    paComplete = 2
+
+
+class _FakeInstance:
+    """PyAudio(): has open(), and deliberately nothing else."""
+
+    def __init__(self, log):
+        self._log = log
+
+    def open(self, **kw):
+        self._log.append(kw)
+        return _FakeStream(kw["stream_callback"])
+
+
+class _FakeStream:
+    def __init__(self, callback=None):
+        self._cb = callback
+        self.started = self.stopped = False
+
+    def start_stream(self):
+        self.started = True
+
+    def stop_stream(self):
+        self.stopped = True
+
+    def close_stream(self):
+        pass
+
+
+def test_capture_reads_format_constants_from_the_module(live):
+    """Regression: reading paInt16 off the instance crashes at open time.
+
+    The real failure was "Could not open audio device: 'PyAudio' object has
+    no attribute 'paInt16'" -- the first thing the client does after the
+    banner prints, so nothing worked at all.
+    """
+    pytest.importorskip("numpy")
+    log = []
+    got = []
+    dev = {"index": 15, "name": "Mic", "rate": 48000, "in": 2}
+    cap = live.Capture(_FakeInstance(log), _FakeModule, dev, 2, 16000, 20,
+                       got.append)
+    assert log, "the stream was never opened"
+    assert log[0]["format"] == _FakeModule.paInt16
+    assert log[0]["input_device_index"] == 15
+    assert log[0]["channels"] == 2
+    assert log[0]["input"] is True
+    # The callback must downmix to mono and keep the audio thread alive.
+    cap._stream._cb(b"\x01\x00\x02\x00\x03\x00\x04\x00", 2, None, 0)
+    assert len(got) == 1 and isinstance(got[0], (bytes, bytearray))
+    cap.start()
+    assert cap._stream.started
+    cap.stop()
+
+
+def test_capture_swallows_callback_errors(live):
+    """An exception in the audio callback must not kill PortAudio's thread."""
+    pytest.importorskip("numpy")
+    cap = live.Capture(_FakeInstance([]), _FakeModule,
+                       {"index": 0, "name": "M", "rate": 48000, "in": 1},
+                       1, 16000, 20, lambda pcm: 1 / 0)
+    out = cap._stream._cb(b"\x00" * 8, 4, None, 0)
+    assert out is not None
 
 
 # ── Downmix ────────────────────────────────────────────────────────────────

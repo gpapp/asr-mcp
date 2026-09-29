@@ -390,31 +390,66 @@ def probe_devices(p):
 # than guessed from list order.
 _MME_ALIASES = ("sound mapper", "primary sound", "communications")
 
+# MME device names are truncated to 31 characters (MAXPNAMELEN 32 minus the
+# NUL), so "Headset Microphone (2- Plantronics Blackwire 3220 Series)" is
+# reported as "Headset Microphone (2- Plantron" on that layer only. The OS
+# default name comes back from whichever layer it came from, so an exact
+# comparison misses the WASAPI and [Loopback] entries of the same hardware.
+_NAME_MIN_PREFIX = 8
+
 
 def _is_alias(name):
     low = name.lower()
     return any(tok in low for tok in _MME_ALIASES)
 
 
-def default_device_names(p):
+def _same_device(a, b):
+    """True if two device names denote the same hardware across API layers.
+
+    Exact match first, then a prefix match, which is what recovers an MME
+    truncated name against a full WASAPI or ``[Loopback]`` name. A prefix is
+    only accepted when it is long enough to be unambiguous -- comparing the
+    first 8 characters of unrelated devices would match constantly.
+    """
+    if not a or not b:
+        return False
+    a, b = a.strip(), b.strip()
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return len(short) >= _NAME_MIN_PREFIX and long_.startswith(short)
+
+
+def default_device_names(p, devs=None):
     """Names of the OS default input and output, best available. Never raises.
 
-    WASAPI is preferred: it is native-rate shared mode, whereas the MME
-    "Sound Mapper" alias is a legacy wrapper that resamples to 44100.
+    The generic getters are tried per direction. ``get_default_wasapi_device_info``
+    is deliberately NOT used: on Windows it reports the default *input*, so
+    asking it for the output yields a microphone name, and when it is absent
+    the fallback silently returns an MME name truncated to 31 characters.
+    Direction is verified against `devs` so a mismatched answer is dropped
+    rather than trusted.
     """
     names = {"input": None, "output": None}
-    for key, wasapi, generic in (
-        ("input", "get_default_wasapi_device_info", "get_default_input_device_info"),
-        ("output", "get_default_wasapi_device_info", "get_default_output_device_info"),
-    ):
-        for getter in (wasapi, generic):
-            try:
-                info = getattr(p, getter)()
-            except Exception:
+    for key, getter in (("input", "get_default_input_device_info"),
+                        ("output", "get_default_output_device_info")):
+        try:
+            info = getattr(p, getter)()
+        except Exception:
+            continue
+        if not info:
+            continue
+        name = info.get("name")
+        if not name:
+            continue
+        if devs is not None:
+            want_in = key == "input"
+            ok = any(d["in"] >= 1 if want_in else d["out"] >= 1
+                     for d in devs if _same_device(d["name"], name)
+                     and not d["is_loopback"])
+            if not ok:
                 continue
-            if info:
-                names[key] = info.get("name")
-                break
+        names[key] = name
     return names
 
 
@@ -440,7 +475,7 @@ def select_devices(devs, mic_index=None, default_input=None, default_output=None
         mic = next((d for d in devs if d["index"] == mic_index), None)
     else:
         inputs = [d for d in devs if d["in"] >= 1 and not d["is_loopback"]]
-        mic = next((d for d in inputs if d["name"] == default_input), None)
+        mic = next((d for d in inputs if _same_device(d["name"], default_input)), None)
         if mic is None:
             # Fall back to the first real (non-MME-alias) input, so we do not
             # capture through the legacy Sound Mapper wrapper.
@@ -452,7 +487,7 @@ def select_devices(devs, mic_index=None, default_input=None, default_output=None
             # compatibility wrappers that resample and can add their own
             # processing, so prefer the WASAPI entry of the same device.
             for d in inputs:
-                if d["name"] == mic["name"] and "WASAPI" in d["api"]:
+                if "WASAPI" in d["api"] and _same_device(d["name"], mic["name"]):
                     mic = d
                     break
 
@@ -472,7 +507,7 @@ def select_devices(devs, mic_index=None, default_input=None, default_output=None
 
     if default_output:
         for d in loops:
-            if _base_name(d) == default_output:
+            if _same_device(_base_name(d), default_output):
                 return mic, d, None
     return mic, loops[0], None
 
@@ -508,20 +543,20 @@ def list_devices(args=None):
     pa = p.PyAudio()
     try:
         devs = probe_devices(pa)
-        defaults = default_device_names(pa)
+        defaults = default_device_names(pa, devs)
     finally:
         pa.terminate()
 
     print("Inputs (microphones):\n")
     for d in devs:
         if d["in"] >= 1 and not d["is_loopback"]:
-            mark = "  <- OS default" if d["name"] == defaults["input"] else ""
+            mark = "  <- OS default" if _same_device(d["name"], defaults["input"]) else ""
             print(f"  [{d['index']}] {d['name']}{mark}")
             print(f"        api={d['api']}  in={d['in']}  rate={d['rate']}")
     print("\nOutputs (speakers):\n")
     for d in devs:
         if d["out"] >= 1 and not d["is_loopback"]:
-            mark = "  <- OS default" if d["name"] == defaults["output"] else ""
+            mark = "  <- OS default" if _same_device(d["name"], defaults["output"]) else ""
             print(f"  [{d['index']}] {d['name']}{mark}")
             print(f"        api={d['api']}  out={d['out']}  rate={d['rate']}")
     print("\nLoopbacks (what the speakers play -- used for 'everyone else'):\n")
@@ -529,7 +564,7 @@ def list_devices(args=None):
     if not loops:
         print("  NONE -- WASAPI loopback is unavailable in this build.")
     for d in loops:
-        mark = "  <- selected" if _base_name(d) == defaults["output"] else ""
+        mark = "  <- selected" if _same_device(_base_name(d), defaults["output"]) else ""
         print(f"  [{d['index']}] {d['name']}  in={d['in']}  rate={d['rate']}{mark}")
 
     mic, loop, reason = select_devices(
@@ -547,12 +582,18 @@ def list_devices(args=None):
 
 
 class Capture:
-    """One input stream (microphone or loopback) delivering mono 16 kHz PCM."""
+    """One input stream (microphone or loopback) delivering mono 16 kHz PCM.
 
-    def __init__(self, p, device, channels, out_rate, block_ms, on_block):
-        import numpy as np
-        self._pa = p
-        self._np = np
+    `pa` is the ``PyAudio()`` instance (it owns ``.open``) and `mod` is the
+    ``pyaudiowpatch`` module. They are separate on purpose: ``paInt16`` and
+    ``paContinue`` are MODULE-level constants, so reading them off the
+    instance raises "'PyAudio' object has no attribute 'paInt16'" at open
+    time.
+    """
+
+    def __init__(self, pa, mod, device, channels, out_rate, block_ms, on_block):
+        self._pa = pa
+        self._mod = mod
         self._channels = max(1, int(channels or 1))
         self._out_rate = out_rate
         self._block_ms = block_ms
@@ -567,10 +608,10 @@ class Capture:
                 self._on_block(to_mono(in_data, self._channels))
             except Exception as e:  # never let an exception kill the audio thread
                 print(f"  capture error: {e}", file=sys.stderr)
-            return in_data, self._pa.paContinue
+            return in_data, self._mod.paContinue
 
-        self._stream = p.open(
-            format=p.paInt16,
+        self._stream = pa.open(
+            format=self._mod.paInt16,
             channels=self._channels,
             rate=int(device["rate"]),
             input=True,
@@ -913,7 +954,7 @@ def run_live(args):
     session = LiveSession(args)
     pa = p.PyAudio()
     devs = probe_devices(pa)
-    defaults = default_device_names(pa)
+    defaults = default_device_names(pa, devs)
     mic_dev, loop_dev, problem = select_devices(
         devs, args.device, defaults["input"], defaults["output"])
     if problem and not args.no_speaker:
@@ -963,11 +1004,11 @@ def run_live(args):
     captures = []
     try:
         captures.append(Capture(
-            pa, mic_dev, 1, SAMPLE_RATE, args.block_ms,
+            pa, p, mic_dev, 1, SAMPLE_RATE, args.block_ms,
             lambda pcm: out_q.put((CHANNEL_MIC, mic_res.process(pcm)))))
         if loop_dev is not None:
             captures.append(Capture(
-                pa, loop_dev, loop_dev["in"], SAMPLE_RATE, args.block_ms,
+                pa, p, loop_dev, loop_dev["in"], SAMPLE_RATE, args.block_ms,
                 lambda pcm: out_q.put((CHANNEL_SPEAKER, spk_res.process(pcm)))))
         for c in captures:
             c.start()
