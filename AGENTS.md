@@ -132,6 +132,17 @@ inert. Do not document them as active pipeline steps.
 - Auto-converts to WAV PCM 16kHz mono via ffmpeg before processing
 - Voiceprint snippets stored as **FLAC** (compressed, lossless)
 
+### Browser Live Tab (`static/live.js`)
+A third live client alongside `asr-client/live_client.py`, for `/live` in the SPA. It re-implements the wire protocol and the endpointing in JS, so both are drift-guarded by `tests/test_live_js_protocol.py` (constants vs. `protocol.py`, `DETECTOR_DEFAULTS` vs. `turn_detector.config()`, packed frames vs. `unpack_turn`, node-vs-server detector boundary equality, and `buildTranscript` vs. `transcribe_client.build_transcript`).
+
+- **Capture** — `getUserMedia` (mono, AEC/NS) → `AudioWorkletNode` (`live-worklet.js`) that resamples to 16 kHz, **levels the input** (auto-gain, see below) and posts 1024-sample int16 blocks. Channel 1 is `getDisplayMedia({audio, video: true})` tab/system audio — Chrome only returns tab audio when video is requested, and a failed display-media call degrades to mic-only with a visible note.
+- **Input levelling** — both live clients (the worklet and `live_client.py::AutoGain`) apply the same boost-only AGC before the int16 conversion, so the frames on the wire AND the WAV re-uploaded for re-attribution carry the same level: `TARGET_RMS 0.125` (-18 dBFS), `MIN_ENV 0.0008` (room tone left alone), `MAX_GAIN 16.0` (+24 dB), `ATTACK 0.5` / `RELEASE 0.02` (log-domain, so a quiet mic is pulled up fast and a loud one eased down without pumping), `PEAK_CEILING 0.98` per-block limiter. `desired = TARGET_RMS / rms` — dividing by the *already-gained* level fixes the loop at `sqrt(TARGET/rms)`, which looks like convergence and leaves a -40 dBFS mic at -32 dBFS. Boost-only: a hot source is never attenuated. `--no-agc` on the client; the gate is at 16x, not infinite.
+- **Endpointing in JS** — `TurnDetector`/`TurnCoalescer` ports; the server runs neither on LVT1 frames (`handler.py:101` builds the `Turn` straight from the frame). One coalescer per channel, `poll()` every iteration.
+- **Auth** — the browser WS cannot set headers, so the session cookie is used; `?token=` is the fallback (from the Settings "Windows Client Token" card).
+- **Stop** — `MSG_FLUSH`, then wait for the server's `stats` frame (the drain signal) before building the transcript. A failed drain must not strand the tab: the transport buttons are restored in a `finally`, and a socket that dropped *after* transcripts arrived still gets downloads and the History save. Re-attribution via `/api/asr/attribution/upload` (no re-decode), optional `POST /api/asr/live/save` to History (text only — audio goes through the upload route, which is the capped one). Downloads are generated client-side: `.txt`, `.asr.json`, and per-channel `.wav`.
+- **Per-channel turn split** (`Session.turnSplit()`, in the end-of-session note, the sidecar and the `.txt` header) is the one number that explains a bad transcript. `mic 0, speaker 12` means the mic recording has no speech for the re-attribution to diarize, so every item collapses onto one speakerless turn and the whole session comes back UNKNOWN with no reason shown.
+- Live transcript items arrive in **decode-completion order** — sort by `start` before rendering or re-attributing.
+
 ## Project Structure
 
 ```
@@ -194,6 +205,9 @@ asr-mcp/
 │   │   ├── logging.py         # Structured logging (stdlib)
 │   │   └── thresholds.json    # All tunable diarization/matching/VAD params
 │   ├── static/
+│   │   ├── viewer.js          # Speaker colors, block rendering, transcript viewer
+│   │   ├── live.js            # Browser live client: LVT1 packing, JS TurnDetector/TurnCoalescer, live pane UI
+│   │   └── live-worklet.js    # AudioWorkletProcessor: getUserMedia/getDisplayMedia -> 16 kHz mono int16 blocks + input auto-gain
 │   └── templates/
 │       ├── _nav.html          # SPA tab bar snippet (__NAV__ + __ACT_*__ markers)
 │       ├── login.html         # Dark-themed login form
@@ -238,7 +252,8 @@ asr-mcp/
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Health check + model status |
-| `/gui` | GET | Session | SPA — Transcribe tab (also serves /voices, /transcriptions, /settings with different active tab) |
+| `/gui` | GET | Session | SPA — Transcribe tab (also serves /live, /voices, /transcriptions, /settings with different active tab) |
+| `/live` | GET | Session | SPA — Live tab (browser real-time transcription, `static/live.js`) |
 | `/voices` | GET | Session | SPA — Voiceprints tab |
 | `/transcriptions` | GET | Session | SPA — History tab |
 | `/settings` | GET | Session | SPA — Settings tab (status, client token, session) |
@@ -255,6 +270,7 @@ asr-mcp/
 | `/api/asr/stream` | POST | No | Always 501 — a stub that points at the WebSocket endpoint |
 | `/api/asr/attribution` | POST | Session/API key | Re-attribute cached ASR items to speakers from a server-side `wav_path` — **no ASR** (`items` is a list of `{start, end, text, confidence}`) |
 | `/api/asr/attribution/upload` | POST | Session/API key | Same, for a client-recorded upload: `file` + `items` (JSON array form field) |
+| `/api/asr/live/save` | POST | Session/API key | Persist a browser Live-tab session to History: JSON `{audio_filename, result, stats?, sidecar?}` — text only, no audio field; stores `metadata.asr_source="live_stream"` |
 | `/api/speaker/register` | POST | API key | Register voiceprint |
 | `/api/speaker/register/upload` | POST | API key | Register voiceprint from upload |
 | `/api/speaker/identify` | POST | API key | Identify speaker from audio |
@@ -403,6 +419,8 @@ anything the rule covers.
 | 31 | Streaming: one speech state per turn, validate `len(data) >= 8`, bounded queue, coalesce short turns, gate non-speech, flush on disconnect | [streaming](docs/lessons/streaming-websocket.md) |
 | 34 | Live: the mic channel IS the identity evidence — never voiceprint-match it; WS auth precedes `accept()` | [live design](docs/lessons/live-client-design.md) |
 | 35 | `Turn.audio` is float32 on the server, int16 bytes on the client — normalise with `samples_as_float32`; live match gates are calibrated, not guessed | [live design](docs/lessons/live-client-design.md) |
+| 36 | A second live channel requires LVT1 turn frames — the legacy raw-PCM path drops channel 1; browsers have no WASAPI loopback, so channel 1 is `getDisplayMedia` tab/system audio | [live design](docs/lessons/live-client-design.md) |
+| 37 | Level the input ONCE in the capture chain (both clients, shared constants); `desired = TARGET/rms` — dividing by the already-gained level settles at a geometric mean that looks like convergence | [live design](docs/lessons/live-client-design.md) |
 
 ### Reference documents
 - [docs/uncertain-speakers.md](docs/uncertain-speakers.md) — user-facing description of the

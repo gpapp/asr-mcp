@@ -295,6 +295,28 @@
         .detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #98a2bd; font-size: .9rem; text-align: center; padding: 2rem; }
         .meta-line { font-size: .8rem; color: var(--muted); margin-bottom: .8rem; }
 
+        /* ── Live tab ─────────────────────────────────────────────── */
+        .live-status { font-size: .82rem; color: var(--muted); font-weight: 600; }
+        .live-status.ok { color: var(--ok); }
+        .live-status.bad { color: var(--bad); }
+        .live-meters { display: flex; flex-direction: column; gap: .4rem; margin-top: .8rem; }
+        .live-meter { display: flex; align-items: center; gap: .6rem; }
+        .live-meter-name { font-size: .72rem; color: var(--muted); width: 6.5rem; flex-shrink: 0; }
+        .live-meter-track { flex: 1; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; display: block; }
+        /* display:block is load-bearing -- the fill is a <span>, and width/height
+           do not apply to a non-replaced inline box, so the meter sat at 0 and
+           looked like a dead capture. */
+        .live-meter-fill { display: block; height: 100%; width: 0%; background: var(--ok); transition: width .1s linear; }
+        .live-meter-label { font-size: .7rem; color: var(--muted); width: 9.5rem; text-align: right; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+        /* Height is set on the element itself, so a scrollable pane needs a
+           definite height rather than growing with its content. */
+        .live-text { max-height: 46vh; overflow-y: auto; padding: 1rem 1.1rem; }
+        .live-note { font-size: .78rem; color: var(--muted); padding: .3rem 0; font-style: italic; }
+        .live-note.warn { color: #b45309; font-style: normal; }
+        .live-note.ok { color: var(--ok); font-style: normal; }
+        .live-downloads { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .6rem; }
+        .live-downloads a.btn { text-decoration: none; }
+
         ::-webkit-scrollbar { width: 10px; height: 10px; }
         ::-webkit-scrollbar-thumb { background: #c8d0e4; border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
         ::-webkit-scrollbar-thumb:hover { background: #aab4d4; border: 2px solid transparent; background-clip: content-box; }
@@ -308,6 +330,9 @@
             .detail-pane { min-height: 50vh; }
             .tv-viewer { flex-direction: column; }
             .tv-bars { flex: none; padding-right: 84px; }
+            .live-meter-name { width: 4.5rem; }
+            .live-meter-label { width: 6.5rem; }
+            .live-text { max-height: 38vh; }
         }
     </style>
 </head>
@@ -379,6 +404,76 @@
                             <div id="timelineContainer"></div>
                             <div id="resultsContent"></div>
                         </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="tab-pane" id="tab-live">
+            <div class="pane-inner pane-narrow">
+                <div class="card">
+                    <div class="card-title">Live Transcription</div>
+                    <div class="card-body">
+                        <p class="meta-line" style="margin-bottom: 1rem;">
+                            Transcribe a meeting in real time from this browser. The microphone
+                            is the local user and is never voiceprint-matched against your own
+                            profile; shared tab or system audio is everyone else and is matched
+                            against your stored voiceprints. On stop the recording is
+                            re-diarized without re-transcribing, so the final text carries
+                            real speaker names.
+                        </p>
+
+                        <div class="options" id="liveSettings">
+                            <label>Language:
+                                <select id="liveLang"><option value="auto">Auto-detect</option></select>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:.35rem;">
+                                <input type="checkbox" id="liveSpeaker" checked>
+                                Include tab / system audio
+                            </label>
+                            <label style="display:flex;align-items:center;gap:.35rem;">
+                                <input type="checkbox" id="liveSaveHistory" checked>
+                                Save to history
+                            </label>
+                        </div>
+                        <details id="liveConnection" style="margin-top:.9rem;">
+                            <summary class="meta-line" style="cursor:pointer;">
+                                Connection details
+                            </summary>
+                            <div class="form-inline" style="margin-top:.6rem;">
+                                <label style="flex:1;">
+                                    API token (only needed without a session cookie):
+                                    <input type="text" id="liveToken" placeholder="from the Settings tab"
+                                           style="width:100%;margin-top:.2rem;">
+                                </label>
+                            </div>
+                        </details>
+                        <!-- The transport controls live OUTSIDE liveSettings: the
+                             recording state hides the settings, and hiding them
+                             must not take the Stop button with them. -->
+                        <div class="options" style="margin-top:.9rem;">
+                            <button class="btn btn-primary" id="liveStart">Start</button>
+                            <button class="btn btn-danger" id="liveStop" disabled>Stop</button>
+                            <span class="live-status" id="liveStatus"></span>
+                        </div>
+
+                        <div class="live-meters" id="liveOutput" style="display:none;">
+                            <div class="live-meter">
+                                <span class="live-meter-name">Microphone</span>
+                                <span class="live-meter-track"><span class="live-meter-fill" id="liveMeterMic"></span></span>
+                                <span class="live-meter-label"></span>
+                            </div>
+                            <div class="live-meter">
+                                <span class="live-meter-name">Tab / system</span>
+                                <span class="live-meter-track"><span class="live-meter-fill" id="liveMeterSpk"></span></span>
+                                <span class="live-meter-label"></span>
+                            </div>
+                        </div>
+
+                        <div class="live-text" id="liveText"
+                             style="margin-top:1rem;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);"></div>
+
+                        <div class="live-downloads" id="liveDownloads"></div>
                     </div>
                 </div>
             </div>
@@ -499,9 +594,13 @@
     <div class="toast" id="toast"></div>
 
     <script src="__PREFIX__/static/viewer.js"></script>
+    <script src="__PREFIX__/static/live.js"></script>
     <script>
         const P = '__PREFIX__';
         const API = P + '/api/voiceprint';
+        // A WebSocket URL and the AudioWorklet module URL are both built in
+        // live.js, which reads this. It must be set before Live.init() runs.
+        window.livePrefix = P;
 
         let speakersData = [];
         let transcripts = [];
@@ -560,13 +659,14 @@
         function tabFromPath() {
             const p = location.pathname;
             if (p.endsWith('/voices')) return 'voiceprints';
+            if (p.endsWith('/live')) return 'live';
             if (p.endsWith('/transcriptions')) return 'history';
             if (p.endsWith('/settings')) return 'settings';
             return 'transcribe';
         }
 
         function activateTab(name) {
-            const panes = ['transcribe', 'voiceprints', 'history', 'settings'];
+            const panes = ['transcribe', 'live', 'voiceprints', 'history', 'settings'];
             if (!panes.includes(name)) name = 'transcribe';
             for (const p of panes) {
                 document.getElementById('tab-' + p).classList.toggle('active', p === name);
@@ -577,6 +677,41 @@
             if (name === 'voiceprints') refresh();
             if (name === 'history') loadTranscripts();
             if (name === 'settings') checkStatus();
+            // AudioWorklet needs a secure context (https or localhost) and the
+            // page may never have asked for a mic, so this must happen on a
+            // user gesture -- entering the tab is one, getUserMedia is not
+            // available at load time on some browsers.
+            if (name === 'live') initLive();
+        }
+
+        function initLive() {
+            if (!window.Live) return;
+            Live.init();
+            // The language list comes from the transcribe tab's loader, which
+            // runs on every page load, so the options already exist; copy them
+            // rather than making a second request.
+            const live = document.getElementById('liveLang');
+            const main = document.getElementById('langSel');
+            if (live && main && main.options.length > live.options.length) {
+                for (let i = 0; i < main.options.length; i++) {
+                    const o = main.options[i];
+                    if (!live.querySelector(`option[value="${o.value}"]`)) {
+                        const n = document.createElement('option');
+                        n.value = o.value;
+                        n.textContent = o.textContent;
+                        live.appendChild(n);
+                    }
+                }
+                live.value = main.value;
+            }
+            // Prefill the token from the Settings tab when it has one, so the
+            // "only needed without a session cookie" field is usually already
+            // correct and the user never has to find it.
+            const liveTok = document.getElementById('liveToken');
+            const mainTok = document.getElementById('tokenValue');
+            if (liveTok && mainTok && mainTok.value && !liveTok.value) {
+                liveTok.value = mainTok.value;
+            }
         }
 
         document.querySelectorAll('.tabs a').forEach(a => {

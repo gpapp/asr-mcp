@@ -190,6 +190,99 @@ Both frame shapes are accepted by the server: turn frames (magic `LVT1`) and
 legacy raw PCM (8-byte header). The magic discriminates them, so no
 configuration flag is needed and old clients keep working.
 
+## 36. A second channel requires LVT1; browsers have no loopback
+
+The legacy raw-PCM path runs server-side endpointing, and it only ever feeds
+**channel 0** to the detector — `handler.py:437` `continue`s on any other
+channel, so the speaker channel is silently discarded before it reaches the ASR.
+A client that wants two channels must send LVT1 turn frames and do its own
+endpointing, exactly like the Windows client.
+
+The browser Live tab (`asr_mcp/static/live.js`) does exactly that, which makes
+it a *third* implementation of the protocol constants, the turn detector and
+the transcript renderer. All three are drift-guarded by
+`tests/test_live_js_protocol.py`: constants vs. `protocol.py`, every
+`setUintNN(offset, …)` in `packTurn` vs. the struct layout, packed bytes vs.
+`unpack_turn`, `DETECTOR_DEFAULTS` vs. `turn_detector.config()` (including the
+key set, minus the six server-only queue/VAD knobs), node-vs-server detector
+boundary equality on a synthetic signal, and `buildTranscript` byte-equality
+with `transcribe_client.build_transcript`.
+
+Capture has no browser equivalent for WASAPI loopback: `getUserMedia` gives the
+mic only, and `getDisplayMedia({audio, video: true})` gives tab/system audio.
+The `video: true` is required — Chrome returns no tab audio unless video is also
+requested — so this channel is Chrome/Edge only, and a rejected permission
+degrades to mic-only with a visible note rather than failing the session.
+
+The server's queue is 32 turns and overflow evicts the *oldest*, so a slow
+decode shows up as `dropped` gaps rather than latency. Both clients cache every
+`transcript` item and close the session by re-attributing the recording; the
+`stats` frame (not socket close) is the drain signal, and a `stats` frame with
+`covered_sec` well below the recording length is how you notice the drops.
+
+### The per-channel turn split is the diagnostic
+
+A real session logged in `logs/app.log` — 13 turn frames, 12 transcripts,
+voiceprint matches, `dropped_turns: 0` — ended with
+`Re-attributed 12 item(s) onto 1 turn(s) ... 7 result(s), 0 speaker(s),
+7 uncertain` and a transcript that was entirely UNKNOWN, with nothing in the UI
+to explain it. The one number that explains it is in the same `stats` frame:
+
+```
+'mic_packets': 0, 'speaker_packets': 12, 'turn_frames': 13
+```
+
+The microphone produced no turns at all, so the mic recording uploaded for
+re-attribution contained no speech, and every speaker-channel item collapsed
+onto a single speakerless turn, which the uncertainty policy then suppressed
+outright. A quiet microphone is not a cosmetic problem in this pipeline: it is
+the difference between named speakers and no speakers, and the failure is
+silent. That is what motivated input levelling (§37) and why `mic 0, speaker
+12` is now printed in the end-of-session note, the `.asr.json` sidecar and the
+`.txt` header.
+
+Corollary: never discard a session because the socket failed *after* text
+arrived. The client caches every transcript item, so the recording and the text
+are still worth re-attributing and downloading.
+
+## 37. Level the input once, in the capture chain, in both clients
+
+A quiet microphone does far more damage than it looks. The turn detector is
+unaffected — its thresholds are ratios against a tracked noise floor, so
+scaling the signal scales the floor with it — but the recogniser and the
+offline pass both care about absolute level. And the offline pass is the one
+that is easy to forget: on shutdown the recording is re-uploaded to
+`/api/asr/attribution/upload`, where VAD and the ECAPA-TDNN embeddings run over
+it, so levelling only the frames on the wire leaves re-attribution working on
+quiet audio. **Level once, in the capture chain, before the int16 conversion**,
+so the socket, the detector and the WAV on disk all carry the same signal.
+
+Two clients implement the capture chain, so both carry the loop: the browser
+worklet (`static/live-worklet.js`) and `asr-client/live_client.py::AutoGain`
+(inside `Resampler.process`, one per channel). The constants are pinned
+against each other by `test_the_two_clients_level_identically`, and the
+behaviour by tests that drive the real worklet in node and the real
+`AutoGain` in numpy and compare them.
+
+Three things the loop has to get right:
+
+- **`desired = TARGET_RMS / rms`,** the gain that puts *this block* at the
+  target. The first version computed `TARGET_RMS / (rms * gain)` — a feedback
+  expression whose fixed point is `sqrt(TARGET / rms)`, i.e. a geometric mean
+  of where the signal started and where it was going. It rose smoothly toward
+  the target, which read exactly like convergence, and left a -40 dBFS mic at
+  -32 dBFS. Compare the achieved level against the target, not against the
+  starting level.
+- **Smoothing in the log domain** (`gain *= (desired/gain)**k`), so the time
+  constant is constant in dB. A linear ramp pumps audibly on every syllable.
+  Fast attack / slow release biases an amplitude-modulated signal upward, which
+  is what the peak limiter is for — a real speech envelope will sit above the
+  nominal RMS.
+- **Boost-only, with a gate.** The gain decays back to 1.0 and is never pushed
+  below it, so a hot source is never made worse. `MIN_ENV` (room tone) is set
+  well below quiet speech so a genuinely quiet talker is still lifted, and
+  `MAX_GAIN` is what bounds it, not the gate.
+
 ## Auth
 
 `WS /asr/ws/stream` was previously **unauthenticated**. It now resolves the user
@@ -219,6 +312,19 @@ Loopback devices are usually **stereo**, so capture also has to downmix
 interleaved int16 to mono (`to_mono`) instead of assuming mono bytes.
 
 ## Known limitation
+
+The browser Live tab has been run end to end in Chrome, and `logs/app.log`
+records a successful session (tab audio through the worklet, the socket, the
+decoder, voiceprint matching, the flush, the re-attribution and the History
+save). Two things about that run are still unproven. The microphone channel
+contributed **no turns** — see the turn-split note above — so the levelled mic
+path has never carried a turn end to end, and the level meters have not been
+checked against a known signal. Separately, the *diagnosis* of the capture
+failure that preceded it (a suspended `AudioContext`, built after two
+permission prompts) was never confirmed; `numberOfOutputs: 0` on the worklet
+node, which may leave the graph unpulled in some builds, produces identical
+symptoms. The fix is defensive on both counts and the watchdog note names the
+silent channel, so a recurrence is diagnosable rather than silent.
 
 The audio-capture path (device enumeration, loopback capture, the WebSocket
 `Transport`) has never been executed against real hardware — no Windows host

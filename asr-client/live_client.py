@@ -886,10 +886,85 @@ class Capture:
 
 
 
-class Resampler:
-    """Streaming resample (device rate -> 16 kHz) with ratio-change guard."""
+# Input levelling. Mirrors the constants and the loop in the browser's
+# asr_mcp/static/live-worklet.js so the two live clients behave identically.
+TARGET_RMS = 0.125     # -18 dBFS: a normal speech level into a recogniser
+MIN_ENV = 0.0008      # ~-62 dBFS; only real room tone is protected
+MAX_GAIN = 16.0        # +24 dB, enough for a laptop mic across a room
+AGC_ATTACK = 0.5      # raise the gain fast ...
+AGC_RELEASE = 0.02    # ... lower it slowly
+AGC_PEAK_CEILING = 0.98
 
-    def __init__(self, in_rate, out_rate=SAMPLE_RATE):
+
+class AutoGain:
+    """Boost-only input levelling.
+
+    A quiet microphone hurts the recogniser far more than it hurts the turn
+    detector, whose thresholds are ratios against a tracked noise floor. It also
+    hurts the offline pass: on shutdown the recorded WAV is re-uploaded to
+    /api/asr/attribution/upload, where VAD and the ECAPA-TDNN embeddings are
+    both level sensitive. Levelling therefore happens once, in the capture
+    chain, so the frames on the wire and the WAV on disk carry the same level.
+
+    The gain only ever rises (it decays back to 1.0 as the source gets louder),
+    so a hot source is never attenuated and the loop cannot pump: the time
+    constant is constant in dB because the smoothing is done in the log domain.
+    It is gated at MIN_ENV so room tone is lifted to a ceiling rather than to
+    full scale, and a per-block peak limiter keeps the boost from clipping.
+    """
+
+    __slots__ = ("enabled", "gain", "last_gain")
+
+    def __init__(self, enabled=True):
+        self.enabled = bool(enabled)
+        self.gain = 1.0
+        self.last_gain = 1.0
+
+    def _update(self, rms):
+        # `desired` is the gain that puts THIS block at the target, so it is
+        # TARGET / rms. Dividing by the already-gained level instead
+        # (TARGET / (rms * gain)) fixes the loop at sqrt(TARGET / rms) and
+        # settles at a geometric mean of where it started and where it was
+        # going -- which is how an earlier version left a -40 dBFS mic at
+        # -32 dBFS and looked like it had converged.
+        desired = 1.0
+        if rms > MIN_ENV:
+            desired = min(MAX_GAIN, TARGET_RMS / rms)
+        k = AGC_ATTACK if desired > self.gain else AGC_RELEASE
+        self.gain *= (desired / self.gain) ** k
+        if self.gain < 1.0:
+            self.gain = 1.0
+        elif self.gain > MAX_GAIN:
+            self.gain = MAX_GAIN
+        return self.gain
+
+    def apply(self, samples):
+        """Scale a float32 block in 0..1, in place, and return it."""
+        import numpy as np
+
+        if not self.enabled or samples.size == 0:
+            return samples
+        rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+        gain = self._update(rms)
+        peak = float(np.max(np.abs(samples)))
+        scaled = peak * gain
+        if scaled > AGC_PEAK_CEILING:
+            gain *= AGC_PEAK_CEILING / scaled
+        self.last_gain = gain
+        samples *= gain
+        np.clip(samples, -1.0, 1.0, out=samples)
+        return samples
+
+
+class Resampler:
+    """Streaming resample (device rate -> 16 kHz) with ratio-change guard.
+
+    Also the capture chain's levelling point: the auto-gain runs on the
+    resampled float samples, before the int16 conversion, so the audio handed
+    to the detector, the socket and the WAV recorder is identical.
+    """
+
+    def __init__(self, in_rate, out_rate=SAMPLE_RATE, auto_level=True):
         import soxr
 
         self._soxr = soxr
@@ -902,12 +977,17 @@ class Resampler:
         # keeps the whole chain in int16 instead of round-tripping via float.
         self._stream = soxr.ResampleStream(
             self.in_rate, self.out_rate, 1, dtype="int16", quality="HQ")
+        self.autogain = AutoGain(enabled=auto_level)
 
     def process(self, pcm_bytes: bytes) -> bytes:
         import numpy as np
 
         samples = np.frombuffer(pcm_bytes, dtype=np.int16)
         out = self._stream.resample_chunk(samples)
+        if self.autogain.enabled and out is not None and len(out):
+            x = out.astype(np.float32) / 32768.0
+            self.autogain.apply(x)
+            out = (x * 32768.0).round()
         return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
 
     def flush(self) -> bytes:
@@ -1340,8 +1420,8 @@ def run_live(args):
     coalescers = {CHANNEL_MIC: TurnCoalescer(mic_det.cfg),
                   CHANNEL_SPEAKER: TurnCoalescer(mic_det.cfg)}
     session.coalescers = coalescers
-    mic_res = Resampler(mic_rate)
-    spk_res = Resampler(loop_rate) if spk_rec is not None else None
+    mic_res = Resampler(mic_rate, auto_level=not args.no_agc)
+    spk_res = Resampler(loop_rate, auto_level=not args.no_agc) if spk_rec is not None else None
 
     out_q: "queue.Queue" = queue.Queue()
     stop = threading.Event()
@@ -1541,6 +1621,9 @@ def build_parser():
                    help="microphone only; skip the sound-device loopback channel")
     p.add_argument("--no-rediag", action="store_true",
                    help="skip re-diarization on shutdown (live labels only)")
+    p.add_argument("--no-agc", action="store_true",
+                   help="disable input levelling (auto-gain is on by default; "
+                        "it lifts a quiet mic to a normal speech level)")
     p.add_argument("--devices", action="store_true",
                    help="list audio devices and exit")
     return p

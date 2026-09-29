@@ -115,6 +115,31 @@ class AttributionResponse(BaseModel):
     error: Optional[str] = None
 
 
+class LiveSessionSave(BaseModel):
+    """Persist a finished browser live-transcribe session to the History tab.
+
+    The live path is not a transcribe job -- it is a WebSocket that decoded its
+    turns in real time -- so it has no ``done`` event to hang the normal save
+    off.  The browser posts the already-assembled result here instead, in the
+    same ``AttributionResponse`` shape, so History renders it with no changes.
+
+    ``stats``/``sidecar`` are the session's own bookkeeping (turns sent, dropped
+    gaps, non-speech skips, the server's ``stats`` frame).  They are stored
+    under ``metadata`` and never interpreted server-side.
+
+    There is deliberately no audio field.  A live session is saved for its
+    text, and History only ever renders the text; an inline base64 blob would
+    also make this an unbounded request body, where the sibling upload route
+    caps files at 200MB.  The recording itself reaches the re-attribution pass
+    through ``POST /api/asr/attribution/upload``, which is where audio belongs.
+    """
+
+    audio_filename: str
+    result: dict
+    stats: Optional[dict] = None
+    sidecar: Optional[dict] = None
+
+
 class SpeakerRegisterRequest(BaseModel):
     name: str
     wav_path: Optional[str] = None

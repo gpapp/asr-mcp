@@ -114,6 +114,13 @@ It captures the **default microphone** and the **default sound device**
 registered voiceprints, and stay `UNKNOWN` when the match is weak or ambiguous —
 the text is always kept, only the name is withheld.
 
+Each channel is levelled on the way in: a quiet microphone is lifted toward
+-18 dBFS RMS (up to +24 dB) with a peak limiter, because a low level costs the
+recogniser and the re-diarization pass far more than it costs the turn
+detector. Room tone is left alone and a hot source is never attenuated. Pass
+`--no-agc` to record the raw levels instead. The browser Live tab
+(`/live` in the web UI) uses the same loop with the same constants.
+
 Press Ctrl-C to stop. On shutdown the client writes:
 
 | File | Contents |

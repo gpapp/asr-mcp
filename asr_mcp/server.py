@@ -164,7 +164,7 @@ def _render(template_name: str, active: str = "") -> HTMLResponse:
         nav_path = templates_dir / "_nav.html"
         if "__NAV__" in content and nav_path.exists():
             nav = nav_path.read_text(encoding="utf-8")
-            for key in ("GUI", "VOICES", "TRANSCRIPTS", "SETTINGS"):
+            for key in ("GUI", "LIVE", "VOICES", "TRANSCRIPTS", "SETTINGS"):
                 nav = nav.replace(f"__ACT_{key}__",
                                   ' class="active"' if key.lower() == active else "")
             content = content.replace("__NAV__", nav)
@@ -341,6 +341,11 @@ async def logout_post(request: Request):
 @app.get("/gui", response_class=HTMLResponse)
 async def gui(request: Request):
     return _render("app.html", active="gui")
+
+
+@app.get("/live", response_class=HTMLResponse)
+async def live_page(request: Request):
+    return _render("app.html", active="live")
 
 
 @app.get("/voices", response_class=HTMLResponse)

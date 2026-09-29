@@ -17,7 +17,7 @@ from starlette.responses import StreamingResponse
 from asr_mcp.api.schemas import (
     AttributionItem, AttributionRequest, AttributionResponse,
     DiarizeRequest, DiarizeResponse, DiarizeResult,
-    TranscribeResponse, TranscribeResult,
+    LiveSessionSave, TranscribeResponse, TranscribeResult,
 )
 from asr_mcp.api.security import verify_api_key, get_current_user, validate_upload_filename
 from asr_mcp.api.auth import get_session_user
@@ -1746,6 +1746,69 @@ async def attribution_upload_endpoint(
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@router.post("/live/save")
+async def save_live_session(
+    req: LiveSessionSave,
+    settings: Settings = Depends(get_settings),
+    user: str = Depends(get_current_user),
+):
+    """Persist a finished live-transcribe session so it appears in History.
+
+    A live session is not a transcribe job: its text was decoded in real time
+    over ``/ws/stream`` and re-attributed on shutdown, so there is no ``done``
+    event for ``run_transcribe._persist_transcript`` to hang a save off.  The
+    browser already holds the final result in the same shape the transcribe
+    endpoint returns, so it posts that here.
+
+    Text only.  The recording goes to ``/api/asr/attribution/upload`` for the
+    re-attribution pass, and History only ever renders the text, so this route
+    stays a small JSON insert rather than a second, unbounded upload path.
+
+    No model is loaded and no audio is decoded -- this is one SQLite insert.
+    The result is stored verbatim under ``metadata`` alongside the session
+    statistics, which is what lets History render it through the existing
+    ``result.results[]`` path with no special-casing.
+
+    A failure here is reported, never fatal: the browser still has the session
+    in memory and can download it.
+    """
+    import hashlib
+
+    result = req.result if isinstance(req.result, dict) else {}
+
+    stored = dict(result)
+    stored["metadata"] = {
+        "asr_source": "live_stream",
+        "stats": req.stats or {},
+        "sidecar": req.sidecar or {},
+    }
+    try:
+        from asr_mcp.db.manager import DatabaseManager, TranscriptDB
+        db = DatabaseManager(settings.db_path)
+        tdb = TranscriptDB(db)
+        transcript_id = tdb.save(
+            audio_filename=Path(req.audio_filename).name,
+            result=stored,
+            user_id=user,
+            # Not a dedupe key (TranscriptDB.save has no such check); it is a
+            # fingerprint of the session's own bookkeeping, so two saves of the
+            # same session are visibly identical.
+            file_hash=hashlib.sha256(
+                json.dumps(stored, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:16],
+            total_speakers=int(result.get("total_speakers") or 0),
+            audio_duration_sec=float(result.get("audio_duration_sec") or 0.0),
+            processing_time_sec=float(result.get("processing_time_sec") or 0.0),
+        )
+    except Exception as e:
+        logger.warning("Failed to save live session: %s", e)
+        return JSONResponse(status_code=500, content={"detail": "Failed to save live session"})
+
+    logger.info("Live session saved: %s (%d result(s))", req.audio_filename,
+                len(result.get("results") or []))
+    return {"success": True, "id": transcript_id}
 
 
 @router.websocket("/ws/stream")
