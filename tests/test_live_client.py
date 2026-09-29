@@ -10,6 +10,7 @@ need numpy/soxr skip when those are missing.
 """
 
 import importlib.util
+import io
 import json
 import struct
 import sys
@@ -596,6 +597,115 @@ def test_default_device_names_prefers_direction_correct_names(live):
     got = live.default_device_names(_P(), WINDOWS_DEVICES)
     assert got["input"] == _HEADSET_MIC
     assert got["output"] == "Speakers (Realtek(R) Audio)"
+
+
+# ── Level meter: telling silence from a dead device ────────────────────────
+
+def test_level_meter_shows_a_flat_bar_for_silence(live):
+    pytest.importorskip("numpy")
+    m = live.LevelMeter(interval=0, stream=io.StringIO())
+    m.feed(0, b"\x00\x00" * 1600)
+    m.feed(1, b"\x00\x00" * 1600)
+    line = m.tick(now=1.0)
+    assert line is not None
+    assert "#" not in line, "silence must render as an empty bar"
+    assert "-60.0 dB" in line
+    assert "mic" in line and "speakers" in line
+
+
+def test_level_meter_shows_a_bar_for_audio(live):
+    pytest.importorskip("numpy")
+    import numpy as np
+    m = live.LevelMeter(interval=0, stream=io.StringIO())
+    loud = (np.sin(np.arange(16000) / 40) * 20000).astype(np.int16).tobytes()
+    m.feed(0, loud)
+    m.feed(1, b"\x00\x00" * 100)
+    line = m.tick(now=1.0)
+    mic_part = line.split("speakers")[0]
+    spk_part = line.split("speakers")[1]
+    assert "#" in mic_part, "audio must render a bar"
+    assert "#" not in spk_part, "the silent channel must stay flat"
+
+
+def test_level_meter_hides_the_speaker_column_when_absent(live):
+    m = live.LevelMeter(show_speaker=False, interval=0, stream=io.StringIO())
+    line = m.tick(now=1.0)
+    assert "speakers" not in line
+    assert "mic" in line
+
+
+def test_level_meter_throttles_redraws(live):
+    m = live.LevelMeter(interval=0.4, stream=io.StringIO())
+    assert m.tick(now=1.0) is not None
+    assert m.tick(now=1.2) is None, "must not redraw inside the interval"
+    assert m.tick(now=1.5) is not None
+
+
+def test_level_meter_describe_is_sticky_across_a_tick(live):
+    """tick() resets the per-interval peak, so describe must not use it."""
+    pytest.importorskip("numpy")
+    import numpy as np
+    m = live.LevelMeter(interval=0, stream=io.StringIO())
+    loud = (np.sin(np.arange(16000) / 40) * 20000).astype(np.int16).tobytes()
+    m.feed(0, loud)
+    m.feed(1, b"\x00\x00" * 100)
+    m.tick(now=1.0)
+    assert "audio present" in m.describe(0)
+    assert "SILENT" in m.describe(1)
+
+
+def test_level_meter_ignores_a_zero_length_buffer(live):
+    pytest.importorskip("numpy")
+    m = live.LevelMeter(interval=0, stream=io.StringIO())
+    m.feed(0, b"")
+    assert "SILENT" in m.describe(0)
+
+
+def test_level_meter_close_is_safe_when_nothing_was_drawn(live):
+    m = live.LevelMeter(stream=io.StringIO())
+    m.close()  # must not raise
+
+
+def test_transport_falls_back_when_legacy_kwarg_is_unsupported(live):
+    """Older `websockets` builds have no `legacy` parameter.
+
+    Passing it unconditionally raises TypeError, which would abort the
+    session before any audio is sent.
+    """
+    calls = []
+
+    class _Old:
+        legacy = "unsupported"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    def connect_new(url, **kw):
+        calls.append(kw)
+        return _Old()
+
+    def connect_old(url, **kw):
+        # A pre-legacy `websockets` build rejects the keyword outright.
+        if "legacy" in kw:
+            raise TypeError(
+                "connect() got an unexpected keyword argument 'legacy'")
+        calls.append(kw)
+        return _Old()
+
+    t = live.Transport("ws://x/asr-mcp", "tok", lambda m: None)
+    t._connect = connect_old
+    with t:
+        pass
+    assert "legacy" not in calls[0], "must retry without legacy"
+
+    t2 = live.Transport("ws://x/asr-mcp", "tok", lambda m: None)
+    t2._connect = connect_new
+    with t2:
+        pass
+    assert calls[1]["legacy"] is True
 
 
 # ── Capture: module vs instance attributes ─────────────────────────────────

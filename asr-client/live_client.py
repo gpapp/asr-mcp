@@ -581,6 +581,93 @@ def list_devices(args=None):
         print(f"Problem            : {reason}")
 
 
+class LevelMeter:
+    """Live capture level per channel, so a silent channel is obvious.
+
+    Without this, "no transcript" is ambiguous: it can mean the room was
+    quiet, the wrong device was opened, or the server is broken. A caller
+    can see immediately that the microphone column is flat while the
+    loopback moves. The first run on the tester's machine produced an empty
+    transcript with no way to tell a quiet room from a dead device.
+    """
+
+    WIDTH = 24
+    MIN_DB = -60.0
+
+    def __init__(self, show_speaker=True, interval=0.4, stream=None):
+        import math
+        self._math = math
+        self._stream = stream or sys.stderr
+        self._interval = float(interval)
+        self._show_speaker = bool(show_speaker)
+        self._peak = {0: 0.0, 1: 0.0}
+        self._ever = {0: False, 1: False}
+        self._last = 0.0
+        self._draw = False
+
+    def _db(self, rms):
+        if rms <= 0:
+            return self.MIN_DB
+        return max(self.MIN_DB, 20.0 * self._math.log10(rms))
+
+    def _bar(self, db):
+        frac = (db - self.MIN_DB) / -self.MIN_DB
+        n = int(round(frac * self.WIDTH))
+        n = max(0, min(self.WIDTH, n))
+        return "#" * n
+
+    def feed(self, channel, pcm):
+        import numpy as np
+        n = len(pcm) // 2
+        if n:
+            x = np.frombuffer(pcm, dtype=np.int16)[:n].astype("float32") / 32768.0
+            rms = float(np.sqrt(np.mean(x * x)))
+            if rms > 0.0:
+                self._ever[channel] = True
+            self._peak[channel] = max(self._peak.get(channel, 0.0), rms)
+
+    def tick(self, now=None):
+        """Redraw if the interval has elapsed. Returns the rendered line."""
+        import time
+        t = time.monotonic() if now is None else now
+        if t - self._last < self._interval:
+            return None
+        self._last = t
+        mic_db = self._db(self._peak.pop(0, 0.0))
+        self._peak[0] = 0.0
+        line = f"  mic {self._bar(mic_db):<{self.WIDTH}} {mic_db:6.1f} dB"
+        if self._show_speaker:
+            spk_db = self._db(self._peak.pop(1, 0.0))
+            self._peak[1] = 0.0
+            line += f"   speakers {self._bar(spk_db):<{self.WIDTH}} {spk_db:6.1f} dB"
+        try:
+            self._stream.write("\r" + line + " " * 8)
+            self._stream.flush()
+            self._draw = True
+        except Exception:
+            pass
+        return line
+
+    def close(self):
+        if self._draw:
+            try:
+                self._stream.write("\n")
+                self._stream.flush()
+            except Exception:
+                pass
+            self._draw = False
+
+    def describe(self, channel):
+        """Whether this channel EVER carried audio, not just right now.
+
+        Sticky on purpose: `tick` resets the per-interval peak, so a naive
+        peak check would report "silent" for a channel that was talking a
+        moment ago.
+        """
+        return ("audio present" if self._ever.get(channel)
+                else "SILENT - no audio reached this channel")
+
+
 class Capture:
     """One input stream (microphone or loopback) delivering mono 16 kHz PCM.
 
@@ -708,9 +795,11 @@ class Transport:
     """
 
     def __init__(self, url, token, on_message):
-        from websockets.sync.client import connect
-
-        self._connect = connect
+        # No import here: the docstring promises this class is constructible
+        # without the `websockets` package, which the pure-python tests rely
+        # on. `websockets` is imported in __enter__, i.e. only when a real
+        # connection is made. Tests may pre-set `_connect`.
+        self._connect = None
         self.url = url
         self.token = token
         self.on_message = on_message
@@ -719,12 +808,28 @@ class Transport:
         self.stats = None
 
     def __enter__(self):
-        self.ws = self._connect(
-            self.url,
-            additional_headers={"X-API-Key": self.token},
-            max_size=None,
-            ping_interval=20,
-        )
+        if self._connect is None:
+            from websockets.sync.client import connect
+            self._connect = connect
+        # legacy=True is required: current `websockets` deprecates calling
+        # connect() outside its own context manager. We keep the socket for
+        # the whole session, so we are deliberately the "legacy" caller.
+        try:
+            self.ws = self._connect(
+                self.url,
+                additional_headers={"X-API-Key": self.token},
+                max_size=None,
+                ping_interval=20,
+                legacy=True,
+            )
+        except TypeError:
+            # Older `websockets` builds have no `legacy` parameter.
+            self.ws = self._connect(
+                self.url,
+                additional_headers={"X-API-Key": self.token},
+                max_size=None,
+                ping_interval=20,
+            )
         return self
 
     def __exit__(self, *exc):
@@ -783,6 +888,17 @@ class LiveSession:
         self.server_stats = None
         self.streaming_failed = None
         self._lock = threading.Lock()
+
+    @property
+    def mic_seconds(self):
+        """Recorded microphone length, from the WAV on disk (0.0 if absent).
+
+        44-byte canonical WAV header + 16-bit mono at SAMPLE_RATE.
+        """
+        try:
+            return max(0, self.mic_path.stat().st_size - 44) / 2.0 / SAMPLE_RATE
+        except OSError:
+            return 0.0
 
     # -- paths -----------------------------------------------------------
     @property
@@ -886,6 +1002,12 @@ class LiveSession:
             ]
         if not items:
             print("\nNo transcribed text to re-attribute.", file=sys.stderr)
+            print(f"Turns sent: {self.turn_count}. The microphone recording is "
+                  f"{self.mic_seconds:.1f}s. If you spoke during the session, "
+                  f"capture or the server is the problem -- not "
+                  f"re-attribution. Re-run --devices to confirm the device, or "
+                  f"pass --loopback <n> if the speaker column stayed flat.",
+                  file=sys.stderr)
             return None
 
         print(f"\nRe-diarizing {self.mic_path.name} (no re-transcription) ...",
@@ -989,7 +1111,9 @@ def run_live(args):
                   f"'everyone else' lines are missing, re-run with "
                   f"--loopback <index> from --devices.", file=sys.stderr)
     print(f"Recording : {session.mic_path}")
-    print("Press Ctrl+C to stop.\n")
+    print("Press Ctrl+C to stop.")
+    print("Watch the levels below: a flat column means that channel captured "
+          "nothing.\n")
 
     mic_rec = ChannelRecorder(session.mic_path)
     spk_rec = ChannelRecorder(session.speaker_path) if loop_dev else None
@@ -1023,6 +1147,8 @@ def run_live(args):
         except Exception:
             pass
         raise ClientError(f"Could not open audio device: {e}") from None
+
+    levels = LevelMeter(show_speaker=loop_dev is not None)
 
     transport = None
     send_error = None
@@ -1060,9 +1186,11 @@ def run_live(args):
             try:
                 channel, pcm = out_q.get(timeout=0.2)
             except queue.Empty:
+                levels.tick()
                 continue
             if not pcm:
                 continue
+            levels.feed(channel, pcm)
             if channel == CHANNEL_MIC:
                 mic_rec.write(pcm)
                 turns = mic_det.feed(pcm)
@@ -1082,6 +1210,7 @@ def run_live(args):
         print("\nStopping ...")
     finally:
         stop.set()
+        levels.close()
         for c in captures:
             try:
                 c.stop()
