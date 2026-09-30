@@ -94,8 +94,8 @@
   },
   "debug": false,
   "live_attribution": {
-  "_comment": "Live (WebSocket) turn attribution. A mic turn is labelled from its input device and never embedding-matched against its own user's voiceprint. The gates are calibrated from measured ECAPA distances on real 2-6s excerpts against the 35-voiceprint menu: a GENUINE match scores combined 0.17-0.40 (conf 0.20-0.65) with margin 0.14-0.42, while a non-match scores 0.78-0.87 (conf 0.00) with margin 0.002-0.06. So min_match_confidence sits just under the genuine floor (0.25 = combined <= 0.375) and min_match_margin does the discriminating: 0.10 is below the weakest genuine margin (0.14) and above the worst non-match (0.06). The previous 0.60/0.05 pair rejected 11 of 13 genuine matches while admitting nothing the margin gate would have caught.",
-  "min_match_confidence": 0.15,
+  "_comment": "Live (WebSocket) turn attribution. A mic turn is labelled from its input device and never embedding-matched against its own user's voiceprint. min_match_confidence is 0.60 because an END-TO-END run measured a REAL false positive at conf 0.539: a 5s turn of an UNREGISTERED speaker was named as a registered one. The earlier value of 0.15 was calibrated against a negative population of CORRUPTED AUDIO (combined 0.78-0.87), which never measured the band a different-but-similar colleague actually occupies. A false name is worse than no name, so this stays conservative: live per-turn naming is a bonus, and the authoritative attribution is the client's shutdown re-diarization of the whole recording, which has minutes of context instead of one turn.",
+  "min_match_confidence": 0.6,
   "min_match_margin": 0.1,
     "min_turn_sec": 0.5,
     "max_turn_sec": 30.0,

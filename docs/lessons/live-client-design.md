@@ -98,7 +98,7 @@ casing drift, not wording). The fix is to add `--retranscribe` to
 | Turn shorter than `min_turn_sec` / longer than `max_turn_sec` | `UNKNOWN` (reason: `live_turn_too_short` / `live_turn_too_long`) |
 | **Mic channel** | `LOCAL_SPEAKER_LABEL` (default "You"), `speaker_source: "input_device"` |
 | Speaker channel, no voiceprints loaded | `UNKNOWN` (`no_voiceprints`) |
-| Speaker channel, best match below `min_match_confidence` (0.15) | `UNKNOWN` (`live_match_weak`) |
+| Speaker channel, best match below `min_match_confidence` (0.60) | `UNKNOWN` (`live_match_weak`) |
 | Speaker channel, runner-up too close (`min_match_margin` 0.10) | `UNKNOWN` (`live_match_ambiguous`) |
 | Otherwise | matched name, `speaker_source: "known_voiceprint"` |
 
@@ -107,42 +107,61 @@ carries the local user, who is by definition in their own voiceprints; matching
 that audio against the stored profile returns a confident answer that is wrong
 whenever they have more than one profile. The channel *is* the evidence.
 
-### The gates are calibrated, and the first calibration was wrong
+### The gates are calibrated, and the first calibration was wrong twice
 
-These gates originally shipped at `min_match_confidence: 0.60` /
+These gates first shipped at `min_match_confidence: 0.60` /
 `min_match_margin: 0.05`, on the reasoning that "live turns are 1–3 s, the low
 end for ECAPA, so the bar must be higher than the file path's 0.35". The bar
 was raised in the wrong direction, and by more than the width of the genuine
 distribution.
 
-Measured on real 2–6 s excerpts of the *correct* speakers, fed through the
-handler's own embedding hooks against the 35-voiceprint menu:
+I then "corrected" that to 0.15, using 2–6 s excerpts of the *correct* speakers
+against the 35-voiceprint menu:
 
 | population | combined distance | confidence | margin |
 |---|---|---|---|
 | **genuine** (13 excerpts, 6 speakers) | 0.174 – 0.402 | 0.196 – 0.65 | 0.141 – 0.417 |
-| **non-match** (corrupted audio, see below) | 0.780 – 0.870 | 0.00 | 0.002 – 0.062 |
+| **non-match** (corrupted audio) | 0.780 – 0.870 | 0.00 | 0.002 – 0.062 |
 
-A 0.60 confidence bar sits *above the entire genuine population*: it rejected
-11 of 13 real matches, which is exactly the "the correct speaker is found but
-not attributed" report. Meanwhile the margin gate at 0.05 was far too loose to
-compensate — a non-match scored a margin of 0.002.
+The second table looked convincing and was **invalid**: the negative population
+was corrupted audio, which is not a false positive. It only ever measured the
+extreme garbage band and said nothing about the band a *different but similar
+colleague* occupies.
 
-The two populations leave an **empty band**: no non-match exceeded confidence
-0.00, and no genuine match fell below 0.196. So the confidence floor now sits
-in that gap (0.15) as a sanity check only, and the **margin does the
-discriminating** (0.10 — below the weakest genuine margin of 0.141, above the
-worst non-match of 0.062). The shipped values are pinned to these measurements
-by `tests/test_live_attribution_gates.py`, which fails if either gate is moved
-back to a value that would misclassify a measured population.
+An end-to-end run through the real `handle_ws_stream` — real embedding hooks,
+real gates, real `pack_turn` frames, an unregistered speaker — then produced the
+thing the table could not have predicted:
 
-Caveat worth keeping: these excerpts come from the same source audio the
-voiceprints were built from, so they are a best case. Real loopback audio
-arrives through a different signal path (room, headset EQ, cross-talk) and will
-score worse. The non-match side is also only sampled at the extremes — nothing
-was measured in the 0.4–0.78 combined band, which is where a genuinely
-different-but-similar colleague would land. Treat the margin gate as the real
-safety mechanism, not the confidence floor.
+```
+Bob 5.0s on speaker -> 'Alice'  src=known_voiceprint  conf=0.539
+```
+
+A stranger was confidently named. conf 0.539 is *inside* the genuine range
+0.196–0.65, so no single confidence threshold separates the two populations.
+
+The gate is back at **0.60**, which rejects the measured false positive. This is
+a deliberate asymmetric trade: 6 s and 9 s turns of a genuinely registered
+speaker scored 0.22 and 0.19 and are now declined. A wrong name is the
+expensive error, the text is never withheld, and the authoritative attribution
+remains the client's shutdown re-diarization, which has minutes of context
+instead of one turn. `tests/test_live_attribution_gates.py` pins this: it
+asserts the measured stranger is rejected, that the *strongest* genuine match
+still gets a name (a gate that rejects everything is not a fix), and that the
+weak genuine matches are withheld on purpose so nobody "repairs" it by lowering
+the bar again.
+
+Two measurement gaps are still open and are stated rather than papered over:
+
+- **Margin is unvalidated.** The single-profile menu used in the end-to-end run
+  makes margin meaningless (there is no runner-up). Genuine margin 0.141–0.417
+  is measured; a false-positive margin is **not**. The 0.10 margin bar is
+  therefore unproven as a discriminator and should not be trusted yet.
+- **Contaminated profiles collapse recall.** Registering a voiceprint from a
+  two-person conversation blends both speakers; against that profile, genuine
+  audio of the registered person scored combined 0.55–0.94 (conf 0.00) — the
+  profile stops matching anyone, including its own owner. This is a data
+  quality problem upstream of the gates, but it means a low conf can mean "bad
+  profile" rather than "different person".
 
 ### The bug that produced the non-match population
 
