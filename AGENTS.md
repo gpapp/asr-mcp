@@ -123,10 +123,6 @@ Numbering below matches the `# Step N` comments in
 13.  Exact turn-boundary refinement from the raw VAD sections
 ```
 
-`merge_similar_speakers` and `close_match_threshold` exist in
-`clustering.py`/`thresholds.json` but are **not called** — the config keys are
-inert. Do not document them as active pipeline steps.
-
 ### Audio Format Support
 - Input: mp3, mp4, mkv, flac, ogg, m4a, wav, webm, opus
 - Auto-converts to WAV PCM 16kHz mono via ffmpeg before processing
@@ -136,7 +132,7 @@ inert. Do not document them as active pipeline steps.
 A third live client alongside `asr-client/live_client.py`, for `/live` in the SPA. It re-implements the wire protocol and the endpointing in JS, so both are drift-guarded by `tests/test_live_js_protocol.py` (constants vs. `protocol.py`, `DETECTOR_DEFAULTS` vs. `turn_detector.config()`, packed frames vs. `unpack_turn`, node-vs-server detector boundary equality, and `buildTranscript` vs. `transcribe_client.build_transcript`).
 
 - **Capture** — `getUserMedia` (mono, AEC/NS) → `AudioWorkletNode` (`live-worklet.js`) that resamples to 16 kHz, **levels the input** (auto-gain, see below) and posts 1024-sample int16 blocks. Channel 1 is `getDisplayMedia({audio, video: true})` tab/system audio — Chrome only returns tab audio when video is requested, and a failed display-media call degrades to mic-only with a visible note.
-- **Input levelling** — both live clients (the worklet and `live_client.py::AutoGain`) apply the same boost-only AGC before the int16 conversion, so the frames on the wire AND the WAV re-uploaded for re-attribution carry the same level: `TARGET_RMS 0.125` (-18 dBFS), `MIN_ENV 0.0008` (room tone left alone), `MAX_GAIN 16.0` (+24 dB), `ATTACK 0.5` / `RELEASE 0.02` (log-domain, so a quiet mic is pulled up fast and a loud one eased down without pumping), `PEAK_CEILING 0.98` per-block limiter. `desired = TARGET_RMS / rms` — dividing by the *already-gained* level fixes the loop at `sqrt(TARGET/rms)`, which looks like convergence and leaves a -40 dBFS mic at -32 dBFS. Boost-only: a hot source is never attenuated. `--no-agc` on the client; the gate is at 16x, not infinite.
+- **Input levelling** — both live clients apply the same boost-only AGC in the capture chain, before the int16 conversion, so the frames on the wire AND the WAV re-uploaded for re-attribution carry the same level: `TARGET_RMS 0.125`, `MIN_ENV 0.0008`, `MAX_GAIN 16.0`, log-domain attack/release, per-block peak ceiling. `desired = TARGET_RMS / rms` — dividing by the *already-gained* level settles at `sqrt(TARGET/rms)`, which looks like convergence and is not. Constants, mechanism and the `--no-agc` flag: lesson 37.
 - **Endpointing in JS** — `TurnDetector`/`TurnCoalescer` ports; the server runs neither on LVT1 frames (`handler.py:101` builds the `Turn` straight from the frame). One coalescer per channel, `poll()` every iteration.
 - **Auth** — the browser WS cannot set headers, so the session cookie is used; `?token=` is the fallback (from the Settings "Windows Client Token" card).
 - **Stop** — `MSG_FLUSH`, then wait for the server's `stats` frame (the drain signal) before building the transcript. A failed drain must not strand the tab: the transport buttons are restored in a `finally`, and a socket that dropped *after* transcripts arrived still gets downloads and the History save. Re-attribution via `/api/asr/attribution/upload` (no re-decode), optional `POST /api/asr/live/save` to History (text only — audio goes through the upload route, which is the capped one). Downloads are generated client-side: `.txt`, `.asr.json`, and per-channel `.wav`.
@@ -151,7 +147,7 @@ asr-mcp/
 │   ├── server.py              # FastAPI app + lifespan + auth routes
 │   ├── api/
 │   │   ├── router.py          # Combines sub-routers under /api
-│   │   ├── asr_router.py      # POST /asr/diarize, /transcribe, /diarize/upload, /transcribe/upload (SSE)
+│   │   ├── asr_router.py      # POST /asr/diarize, /transcribe, /transcribe/upload (SSE), /live/save, WS /ws/stream
 │   │   ├── speaker_router.py  # POST /speaker/register, /identify, GET /list, DELETE /{name}
 │   │   ├── voiceprint_router.py # CRUD + upload + merge + rename + rescan
 │   │   ├── transcript_router.py # User-scoped transcript CRUD + download
@@ -193,7 +189,7 @@ asr-mcp/
 │   │   ├── models.py          # SQLAlchemy: voiceprints, snippets, sessions, transcripts
 │   │   └── manager.py         # DatabaseManager, VoiceprintDB, SnippetDB, SessionDB, TranscriptDB
 │   ├── sessions/
-│   │   └── manager.py         # SessionManager (SQLite-backed)
+│   │   └── manager.py         # SessionManager (SQLite-backed) — initialized, no consumer (see History)
 │   ├── streaming/
 │   │   ├── turn_detector.py   # Adaptive energy turn detector + turn coalescer (lesson 31)
 │   │   ├── speech_gate.py    # Silero speech gate before ASR (fail-open)
@@ -211,7 +207,7 @@ asr-mcp/
 │   └── templates/
 │       ├── _nav.html          # SPA tab bar snippet (__NAV__ + __ACT_*__ markers)
 │       ├── login.html         # Dark-themed login form
-│       └── app.html           # Unified SPA: Transcribe / Voiceprints / History / Settings tabs
+│       └── app.html           # Unified SPA: Transcribe / Live / Voiceprints / History / Settings tabs
 ├── tests/                    # Pure-python unit tests (pytest, no GPU needed)
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt output, voiceprints
@@ -369,7 +365,6 @@ anything the rule covers.
 | # | Rule | Detail |
 |---|---|---|
 | 1 | Speaker labels are ALWAYS `Speaker N`, 1-indexed — never `SPEAKER_00` | [diarization](docs/lessons/diarization-and-speakers.md) |
-| 2 | If a model is loaded into `ModelState`, every call site must pass the session through | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 3 | Segments are speech-length, not window-length; windows are for embeddings only | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 4 | Merge nearby VAD regions (<0.5s gap) before splitting | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 11 | Reordering the pipeline requires updating ALL downstream code | [diarization](docs/lessons/diarization-and-speakers.md) |
@@ -431,3 +426,29 @@ anything the rule covers.
 - [docs/lessons/live-client-design.md](docs/lessons/live-client-design.md) — why the
   live client's final text comes from the live ASR cache rather than a re-transcription,
   the two rejected alternatives, and the trigger for revisiting the decision.
+
+## Historical notes (no longer true — kept so they are not re-introduced)
+
+These were once accurate and shaped the code. They are archived rather than
+deleted because each one explains a decision a reader would otherwise re-litigate.
+
+- **Lesson 2, "pass the session through every call site"** — superseded by
+  lesson 26. The current rule is the opposite: never pin a copy of
+  `state.*_session`, resolve it at call time (`VoiceprintService._emb_session`).
+  Threading a session through call sites was the old fix for the same
+  `'NoneType' has no attribute get_inputs` failure that pinning reintroduced.
+- **`merge_similar_speakers` / `close_match_threshold`** — the function is
+  defined in `diarization/clustering.py` and the key in `thresholds.json`, and
+  **neither is called**. Do not treat them as pipeline steps (step 5 uses
+  `AgglomerativeClustering` directly). They are leftovers from an earlier
+  post-clustering merge pass; the greedy merge in step 5 replaced them.
+- **`sessions/manager.py` (`SessionManager`)** — constructed and `initialize()`d
+  in `server.py` lifespan, but nothing reads it. The `sessions` table and this
+  module are the pre-`transcripts` design; the web UI's History tab is backed by
+  `transcripts`, not `sessions`. Remove the module and the lifespan call
+  together if you touch it.
+- **`POST /api/asr/stream`** — a 501 stub that predates the WebSocket endpoint
+  and still points clients at `/ws/stream`. Kept only so old clients get a
+  useful error instead of a 404.
+- **`/api/mcp/*`** — mounted and reachable, but the tools are not wired to the
+  transcription path. Present, not exercised.

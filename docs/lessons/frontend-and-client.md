@@ -19,7 +19,7 @@ Lessons 21, 22, 23, 24, 26 of `AGENTS.md`. CSS scoping, refined-segment display,
 - UI chrome (SPA tab bar) lives in `templates/_nav.html`, injected by `_render(name, active=...)` via `__NAV__` + `__ACT_*__` markers — edit the snippet, not `app.html`. All four page routes (`/gui`, `/voices`, `/transcriptions`, `/settings`) render `app.html`; tab switching is client-side (pushState + `activateTab`).
 
 ### 24. Paragraph Breaks at Pauses Must Snap to Sentence Ends
-- `_apply_paragraph_breaks()` (asr_router.py): RMS interior pauses ≥ `PARAGRAPH_PAUSE_SEC` (1.5s), map each to the nearest decoder split-token segment boundary, then snap to `[.!?…]` within **40 chars**.
+- `_apply_paragraph_breaks()` (asr_router.py): RMS interior pauses ≥ `PARAGRAPH_PAUSE_SEC` (3.0s), map each to the nearest decoder split-token segment boundary, then snap to `[.!?…]` within **40 chars**.
 - If no punctuation is close: break at the boundary anyway and append `.` (after stripping trailing `,;—`) so the break is still a sentence boundary.
 - **Why 40 chars**: a 120-char window snapped BACKWARD across the pause to an earlier sentence end, burying the pause mid-paragraph. Keep the snap window tight.
 
