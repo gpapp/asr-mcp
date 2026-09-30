@@ -400,6 +400,7 @@ anything the rule covers.
 | 20 | Last middleware added is outermost; do not reorder Session/Auth | [api](docs/lessons/api-sse-and-auth.md) |
 | 25 | `stage: "done"` finishes the job — progress events must not use it | [api](docs/lessons/api-sse-and-auth.md) |
 | 28 | `language` must be threaded router → prompt → decode, not forced to English | [api](docs/lessons/api-sse-and-auth.md) |
+| 38 | A proxy refuses the body before the app sees it — a 413 may be HTML, and a 409 means "wait", not "failed" | [api](docs/lessons/api-sse-and-auth.md) |
 
 ### Streaming, frontend and output
 | # | Rule | Detail |

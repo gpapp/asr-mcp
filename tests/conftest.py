@@ -63,6 +63,18 @@ def turn_detector():
 
 CLIENT_DIR = REPO_ROOT / "asr-client"
 CLIENT_MISSING_REASON = "asr-client/live_client.py not present (excluded from the server image)"
+TRANSCRIBE_MISSING_REASON = "asr-client/transcribe_client.py not present (excluded from the server image)"
+
+
+def _load_by_path(name, path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
 
 # The server image excludes asr-client/ (.dockerignore) — the client ships as a
 # standalone zip. Tests that compare the client against the server can only run
@@ -70,6 +82,11 @@ CLIENT_MISSING_REASON = "asr-client/live_client.py not present (excluded from th
 client_missing = pytest.mark.skipif(
     not (CLIENT_DIR / "live_client.py").is_file(),
     reason=CLIENT_MISSING_REASON,
+)
+
+transcribe_missing = pytest.mark.skipif(
+    not (CLIENT_DIR / "transcribe_client.py").is_file(),
+    reason=TRANSCRIBE_MISSING_REASON,
 )
 
 
@@ -81,13 +98,16 @@ def live():
     server-side and client-side cases without a module-wide skip mark that would
     also silence the server tests in the image.
     """
-    import importlib.util
-
     path = CLIENT_DIR / "live_client.py"
     if not path.is_file():
         pytest.skip(CLIENT_MISSING_REASON)
-    spec = importlib.util.spec_from_file_location("live_client_undertest", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    return _load_by_path("live_client_undertest", path)
+
+
+@pytest.fixture(scope="module")
+def client():
+    """transcribe_client.py imported by path. Same skip rationale as `live`."""
+    path = CLIENT_DIR / "transcribe_client.py"
+    if not path.is_file():
+        pytest.skip(TRANSCRIBE_MISSING_REASON)
+    return _load_by_path("transcribe_client_undertest", path)

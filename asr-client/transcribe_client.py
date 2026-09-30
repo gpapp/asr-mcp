@@ -1,7 +1,11 @@
 import http.client
 import json
+import os
 import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +17,26 @@ ENV_PATH = SCRIPT_DIR / ".env"
 
 SUPPORTED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm", ".opus", ".mkv", ".mp4"}
 
+#: Containers that usually carry a video track. Only the audio is transcribed,
+#: so these are converted locally before upload (see prepare_upload()).
+VIDEO_CONTAINERS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+
+#: The reverse proxy rejects bodies larger than this with an HTML 413 page
+#: before the request reaches the server, so the client can never see the
+#: server's own (identical) JSON limit.  Matches nginx `client_max_body_size`
+#: in nginx_snippet.conf.
+PROXY_MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+
+#: Above this, transcode to 16 kHz mono FLAC even when the source is already
+#: audio-only — that is what the server converts to anyway, and it usually
+#: shrinks a file several-fold. Below it, upload the original untouched.
+TRANSCODE_ABOVE_BYTES = 24 * 1024 * 1024
+
+#: How long to wait for a running job to finish before giving up, and how often
+#: to re-check. The server runs one transcription at a time.
+JOB_WAIT_TIMEOUT_SEC = 60 * 60
+JOB_POLL_INTERVAL_SEC = 5.0
+
 #: Shown instead of a speaker name when the server could not attribute the
 #: utterance to a confident speaker (see the server's uncertainty policy).
 UNKNOWN_SPEAKER_LABEL = "UNKNOWN"
@@ -21,10 +45,19 @@ USAGE = """Usage:
   transcribe <audio file> [more files...]   Transcribe files (writes <name>.txt next to each)
                                             Optional: --language <code|auto> (overrides .env LANGUAGE)
                                             Optional: --json (also write <name>.json with raw segments)
+                                            Optional: --no-convert (upload the original, never transcode)
+                                            Optional: --no-wait (fail instead of waiting for a busy server)
   status                                    Check server/token connectivity
   voiceprints                               List speakers and voiceprints
   voiceprint-add <name> <file> [start] [end]   Create/refine a voiceprint from audio
   voiceprint-refine <name>                  Rebuild a voiceprint from its snippets
+
+Video containers (.mp4/.mkv/.webm/...) and large files are converted to 16 kHz mono
+FLAC locally, so the transcript is identical but far less is uploaded. The converted
+file is kept next to the original so you can see what was sent.
+
+If the server is already transcribing something, this waits for it to finish
+(override with --no-wait). The server accepts one transcription at a time.
 
 Segments the server could not attribute to a confident speaker are written as
 [UNKNOWN (<reason>)] with their text kept — the .txt is never silently clean.
@@ -85,6 +118,73 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
+def _describe_http_error(code: int, body: str, headers=None) -> str:
+    """Turn an error body into a sentence a human can act on.
+
+    Three shapes arrive here:
+      * the server's JSON  {"detail": "..."} / {"error": "..."};
+      * nginx's HTML 413 page, which the client cannot parse and which used to
+        be dumped verbatim into the console;
+      * anything else, truncated.
+    """
+    ctype = (headers or {}).get("Content-Type", "") if headers else ""
+
+    detail = None
+    job = None
+    looks_json = "json" in ctype.lower() or body.lstrip().startswith(("{", "["))
+    if looks_json:
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                job = parsed.get("job")
+                for key in ("detail", "error", "message"):
+                    if parsed.get(key):
+                        detail = parsed[key]
+                        break
+                if detail is None and isinstance(parsed.get("detail"), list):
+                    detail = "; ".join(str(d) for d in parsed["detail"])
+        except ValueError:
+            pass
+
+    # --- nginx (and other proxies) reject oversized bodies before the app ---
+    # Only when the body is NOT the server's own JSON: if the server answered,
+    # the proxy is not what refused it.
+    if detail is None and (code in (413, 414) or "Request Entity Too Large" in body):
+        return (
+            f"HTTP {code}: the reverse proxy rejected the upload before it reached "
+            f"the server (proxy limit is {PROXY_MAX_UPLOAD_BYTES // (1024 * 1024)} MB). "
+            "Video files are usually the cause — the client strips the video track with "
+            "ffmpeg and transcodes to 16 kHz mono FLAC before uploading, which usually "
+            "shrinks such a file several-fold; pass --no-convert to disable that."
+        )
+
+    # --- a 409 carries the running job, which is the actionable part --------
+    if code == 409 and isinstance(job, dict):
+        who = job.get("filename") or "another file"
+        age = ""
+        started = job.get("started_at")
+        if isinstance(started, (int, float)):
+            mins = int(max(time.time() - started, 0) // 60)
+            age = f" (started {mins} min ago)" if mins else ""
+        lines = [f"HTTP 409: the server is already transcribing '{who}'{age}."]
+        if job.get("can_cancel"):
+            lines.append(
+                "That job is yours and can be cancelled from the web UI "
+                "(Transcription tab) if it is stuck."
+            )
+        return " ".join(lines)
+
+    if detail is None:
+        stripped = body.strip()
+        if "<" in stripped[:200] and ">" in stripped[:200]:
+            # An HTML page from a proxy: name the status, never echo the markup.
+            return f"HTTP {code}: the server or proxy returned an HTML error page"
+        detail = stripped[:300] or f"no error detail (HTTP {code})"
+    if not isinstance(detail, str):
+        detail = json.dumps(detail)
+    return f"HTTP {code}: {detail}"
+
+
 def _http_error_to_client_error(e: urllib.error.HTTPError) -> ClientError:
     if e.code in (301, 302, 303, 307, 308):
         loc = e.headers.get("Location", "")
@@ -93,16 +193,7 @@ def _http_error_to_client_error(e: urllib.error.HTTPError) -> ClientError:
             "and that TOKEN is valid"
         )
     body = e.read().decode("utf-8", "replace")
-    detail = body
-    try:
-        parsed = json.loads(body)
-        if isinstance(parsed, dict) and parsed.get("detail"):
-            detail = parsed["detail"]
-            if not isinstance(detail, str):
-                detail = json.dumps(detail)
-    except ValueError:
-        pass
-    return ClientError(f"HTTP {e.code}: {detail}")
+    return ClientError(_describe_http_error(e.code, body, e.headers))
 
 
 def open_request(method, url, *, data=None, headers=None, timeout=60):
@@ -354,19 +445,208 @@ def _write_sidecar(out_path: Path, result, done_evt, status, date_str):
     return sidecar
 
 
-def transcribe_file(base, token, path: Path, language: str = "auto"):
+def find_ffmpeg() -> str | None:
+    """Locate ffmpeg: PATH first, then the usual Windows install locations."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    for env in ("FFMPEG", "FFMPEG_PATH"):
+        cand = os.environ.get(env)
+        if cand and Path(cand).is_file():
+            return cand
+    local = SCRIPT_DIR / "ffmpeg.exe"
+    if local.is_file():
+        return str(local)
+    for base in (r"C:\Program Files\ffmpeg\bin", r"C:\ffmpeg\bin", r"C:\ProgramData\chocolatey\bin"):
+        cand = Path(base) / "ffmpeg.exe"
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def probe_has_video(path: Path) -> bool:
+    """True when the container holds a video stream (best effort)."""
+    exe = find_ffmpeg()
+    if not exe:
+        return False
+    try:
+        out = subprocess.run(
+            [exe, "-v", "quiet", "-print_format", "json", "-show_format", "-i", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if out.returncode not in (0, 1) or not out.stdout:
+            return False
+        for stream in json.loads(out.stdout).get("streams", []) or []:
+            if stream.get("codec_type") == "video":
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def convert_to_audio(path: Path, dest: Path | None = None) -> Path:
+    """Transcode to 16 kHz mono FLAC — the format the server wants anyway.
+
+    This is what keeps large video files off the wire: the server extracts and
+    resamples to 16 kHz mono itself, so converting here is lossless with
+    respect to what it will actually decode, and typically shrinks a file
+    several-fold. Raises ClientError with an actionable message.
+    """
+    exe = find_ffmpeg()
+    if not exe:
+        raise ClientError(
+            f"'{path.name}' needs converting but ffmpeg was not found. Install it "
+            "(https://www.gyan.dev/ffmpeg/builds/, then put ffmpeg.exe beside this "
+            "script or on PATH), or pass --no-convert to upload the original."
+        )
+    if dest is None:
+        dest = path.with_name(f"{path.stem}.16k.flac")
+    cmd = [exe, "-v", "error", "-y", "-i", str(path), "-vn",
+           "-ac", "1", "-ar", "16000", "-c:a", "flac", str(dest)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        raise ClientError(f"Converting '{path.name}' timed out") from None
+    if proc.returncode != 0 or not dest.is_file():
+        tail = (proc.stderr or "").strip().splitlines()
+        raise ClientError(
+            f"Could not convert '{path.name}': {tail[-1] if tail else 'ffmpeg failed'}"
+        )
+    return dest
+
+
+def prepare_upload(path: Path, convert: bool = True) -> Path:
+    """Return the file to actually upload.
+
+    Converts when the container holds video, or when the file is large enough
+    that the transcoded form is clearly worth making. A file that is already
+    small audio is uploaded untouched so the common case stays fast.
+    """
+    size = path.stat().st_size
+    ext = path.suffix.lower()
+    needs = ext in VIDEO_CONTAINERS or size > TRANSCODE_ABOVE_BYTES
+    if not convert or not needs:
+        if size > PROXY_MAX_UPLOAD_BYTES:
+            # Nothing we can do automatically; say so precisely.
+            raise ClientError(
+                f"'{path.name}' is {size / (1024 * 1024):.0f} MB, over the "
+                f"{PROXY_MAX_UPLOAD_BYTES // (1024 * 1024)} MB proxy limit, and "
+                "--no-convert prevents the client from shrinking it."
+            )
+        return path
+
+    if size <= PROXY_MAX_UPLOAD_BYTES and ext not in VIDEO_CONTAINERS:
+        # Already fits; converting a big audio file is not worth the wait.
+        return path
+
+    if ext in VIDEO_CONTAINERS and not probe_has_video(path):
+        # A mislabelled container: treat it as plain audio if it fits.
+        if size <= PROXY_MAX_UPLOAD_BYTES:
+            return path
+
+    dest = convert_to_audio(path)
+    before, after = size, dest.stat().st_size
+    print(f"  converted for upload: {before / (1024 * 1024):.0f} MB -> "
+          f"{after / (1024 * 1024):.0f} MB ({dest.name})")
+    if after >= PROXY_MAX_UPLOAD_BYTES:
+        raise ClientError(
+            f"'{path.name}' is still {after / (1024 * 1024):.0f} MB after stripping the "
+            f"video, over the {PROXY_MAX_UPLOAD_BYTES // (1024 * 1024)} MB proxy limit."
+        )
+    return dest
+
+
+def wait_for_idle(base, token, *, timeout=JOB_WAIT_TIMEOUT_SEC):
+    """Block until the server has no transcription running.
+
+    The server runs one job at a time (one GPU, one decoder), so a second
+    upload is refused with 409 while the first is in flight. Waiting here is
+    better than failing: the files were queued for a reason.
+
+    Uses GET /api/asr/activity/stream, which emits an immediate snapshot
+    ({"active": ..., "job": ...}) and then only start/finish transitions, with
+    a comment keep-alive every 20s.
+    """
+    if timeout <= 0:
+        return
+    url = f"{base}/api/asr/activity/stream"
+    deadline = time.monotonic() + timeout
+    announced = False
+    resp = None
+    try:
+        resp = open_request("GET", url, headers={"X-API-Key": token}, timeout=None)
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", "replace").strip()
+            if line.startswith(":"):
+                continue  # keep-alive
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            try:
+                evt = json.loads(payload)
+            except ValueError:
+                continue
+            if not evt.get("active"):
+                return
+            if not announced:
+                job = evt.get("job") or {}
+                who = job.get("filename")
+                started = job.get("started_at")
+                age = ""
+                if isinstance(started, (int, float)):
+                    mins = int(max(time.time() - started, 0) // 60)
+                    age = f", started {mins} min ago" if mins else ""
+                print(f"  server is busy transcribing '{who or 'a file'}'{age} — waiting "
+                      f"(up to {int(timeout // 60)} min)",
+                      file=sys.stderr)
+                announced = True
+            if time.monotonic() > deadline:
+                raise ClientError(
+                    f"Timed out after {int(timeout // 60)} min waiting for the server to "
+                    "finish the transcription it is already running"
+                )
+    except (ClientError, OSError, http.client.HTTPException) as e:
+        if isinstance(e, ClientError) and "Timed out" in str(e):
+            raise
+        # Cannot tell whether the server is busy; let the upload try and
+        # surface its own error rather than blocking on a broken stream.
+        return
+    finally:
+        if resp is not None:
+            resp.close()
+
+
+def transcribe_file(base, token, path: Path, language: str = "auto", *,
+                    convert: bool = True, wait: bool = True):
     label = path.name
     if path.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
         raise ClientError(f"Unsupported file type '{path.suffix}' ({label})")
     if not path.is_file():
         raise ClientError(f"File not found: {path}")
 
+    upload_path = prepare_upload(path, convert=convert)
+
     url = (f"{base}/api/asr/transcribe/upload?save=false"
            f"&language={urllib.parse.quote(language or 'auto')}")
-    body, ctype = encode_multipart("file", path)
-    resp = open_request("POST", url, data=body,
-                        headers={"X-API-Key": token, "Content-Type": ctype},
-                        timeout=None)
+    body, ctype = encode_multipart("file", upload_path)
+    try:
+        resp = open_request("POST", url, data=body,
+                            headers={"X-API-Key": token, "Content-Type": ctype},
+                            timeout=None)
+    except ClientError as e:
+        # A 409 means another transcription owns the server; wait for it and
+        # retry once rather than losing the file.
+        if wait and "HTTP 409" in str(e):
+            print(f"  server is busy; {e}", file=sys.stderr)
+            wait_for_idle(base, token)
+            body, ctype = encode_multipart("file", upload_path)
+            resp = open_request("POST", url, data=body,
+                                headers={"X-API-Key": token, "Content-Type": ctype},
+                                timeout=None)
+        else:
+            raise
 
     content_type = resp.headers.get("Content-Type", "")
     if "text/event-stream" not in content_type:
@@ -540,6 +820,10 @@ def cmd_transcribe(paths):
     if "--json" in args:
         _JSON_SIDECAR = True
         args = [a for a in args if a != "--json"]
+    convert = "--no-convert" not in args
+    args = [a for a in args if a != "--no-convert"]
+    wait = "--no-wait" not in args
+    args = [a for a in args if a != "--no-wait"]
     if not args:
         print("No files given.")
         print(USAGE)
@@ -550,7 +834,8 @@ def cmd_transcribe(paths):
         path = Path(raw).expanduser()
         print(f"Transcribing {path.name} (language={language}) ...")
         try:
-            written, status = transcribe_file(base, token, path, language=language)
+            written, status = transcribe_file(base, token, path, language=language,
+                                              convert=convert, wait=wait)
             for p in written:
                 print(f"  saved {p}")
             if status != "ok":
