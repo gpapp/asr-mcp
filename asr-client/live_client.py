@@ -1145,6 +1145,7 @@ class LiveSession:
         # Set by run_live(): {channel: TurnCoalescer}. Kept on the session so
         # the summary can report how many fragments were merged.
         self.coalescers = {}
+        self.pending_profiles = []   # learned speakers awaiting a name
         self._lock = threading.Lock()
 
     @property
@@ -1249,6 +1250,7 @@ class LiveSession:
                 "transcripts_received": self.transcript_count,
                 "turns_skipped_non_speech": self.skip_count,
                 "skipped": self.skipped,
+                "pending_profiles": self.pending_profiles,
                 "gaps": self.gaps,
                 "server_stats": self.server_stats,
                 "items": self.items,
@@ -1311,11 +1313,36 @@ class LiveSession:
                     f"server returned HTTP {status}: "
                     f"{(payload or {}).get('error', 'no error detail')}"
                 )
+            self.report_pending(payload)
             return payload
         except ClientError as e:
             print(f"Re-attribution failed: {e}", file=sys.stderr)
             print("The live transcript below is still valid.", file=sys.stderr)
             return None
+
+    def report_pending(self, payload):
+        """Tell the user which speakers were learned but not yet named.
+
+        The server created these profiles from the recording. They are excluded
+        from voiceprint matching until named, so their speech stays UNKNOWN on
+        this and every future run -- which is why it has to be said out loud
+        rather than left in the server log.
+        """
+        pending = (payload or {}).get("pending_profiles") or []
+        if not pending:
+            return
+        print(f"\nLearned {len(pending)} new speaker(s), not yet named. "
+              f"They are EXCLUDED from voiceprint matching until you name "
+              f"them, so their speech reads UNKNOWN for now:", file=sys.stderr)
+        for p in pending:
+            speech = p.get("total_duration_sec")
+            dur = f", {speech:.1f}s of speech" if isinstance(speech, (int, float)) else ""
+            print(f"  - {p.get('name')} ({p.get('snippet_count', 0)} snippets{dur})",
+                  file=sys.stderr)
+        print("Name them in the web UI, Voiceprints tab -> Unnamed speakers.",
+              file=sys.stderr)
+        with self._lock:
+            self.pending_profiles = pending
 
     def build_live_result(self):
         """Shape the live items like a transcribe result for build_transcript.

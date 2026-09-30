@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class DiarizeRequest(BaseModel):
@@ -112,6 +112,10 @@ class AttributionResponse(BaseModel):
     #: whole cost of the request.
     processing_time_sec: float = 0.0
     metadata: Optional[dict] = None
+    #: Unnamed speakers discovered in this recording. Each is a PENDING
+    #: profile: it has snippets but is excluded from voiceprint matching until
+    #: the user names it, so it can never be reported as an identity.
+    pending_profiles: list[dict] = []
     error: Optional[str] = None
 
 
@@ -202,11 +206,35 @@ class VoiceprintSpeakerInfo(BaseModel):
     has_voiceprint: bool = False
     pitch_hz: float = 0.0
     energy_rms: float = 0.0
+    #: True for an auto-learned profile the user has not named yet. Such a
+    #: profile accumulates snippets but is EXCLUDED from voiceprint matching,
+    #: so it can never be reported as an identity.
+    pending: bool = False
+    #: Where an auto-learned profile came from (recording name), and when it
+    #: was first seen. Only populated for pending profiles; empty otherwise.
+    source: str = ""
+    created_at: str = ""
 
 
 class VoiceprintSpeakerListResponse(BaseModel):
     speakers: list[VoiceprintSpeakerInfo]
     count: int
+
+
+class PendingProfileConfirm(BaseModel):
+    """Give an auto-learned (pending) profile a real name.
+
+    This is the only way a pending profile becomes matchable, and it is always
+    an explicit human action.
+    """
+    new_name: str = Field(..., min_length=1, max_length=255)
+
+
+class PendingProfileConfirmResponse(BaseModel):
+    ok: bool = False
+    name: Optional[str] = None
+    renamed_from: Optional[str] = None
+    error: Optional[str] = None
 
 
 class VoiceprintSnippetListResponse(BaseModel):

@@ -408,3 +408,48 @@ def test_no_wait_disables_the_retry(client, tmp_path, monkeypatch):
     with pytest.raises(client.ClientError):
         client.transcribe_file("http://x", "tok", src, "en", wait=False)
     assert len(posts) == 1
+
+def test_learned_speakers_are_reported_to_the_user(client, tmp_path, monkeypatch, capsys):
+    """A learned speaker is excluded from matching until named, so the next run
+    reads UNKNOWN for that person. Silence here reads as "the feature is broken"."""
+    src, _ = _fake(client, tmp_path, "a.wav", 1.0)
+
+    def fake_open(method, url, **kw):
+        return _Stream(_sse(
+            {"stage": "diarization_complete", "pending_profiles": [
+                {"name": "Pending 2026-09-30 12:45 Speaker_5 talk.wav",
+                 "snippet_count": 7},
+            ]},
+            {"stage": "done", "result": {
+                "results": [{"start": 0.0, "end": 1.0, "speaker": None,
+                             "uncertain": True, "text": "hello"}],
+                "segments": [{"start": 0.0, "end": 1.0, "speaker": None}],
+                "speakers": [],
+            }}))
+
+    monkeypatch.setattr(client, "open_request", fake_open)
+    monkeypatch.setattr(client, "encode_multipart",
+                        lambda *a, **kw: (b"", "text/plain"))
+    client.transcribe_file("http://x", "tok", src, "en")
+    out = capsys.readouterr().out
+    assert "Pending 2026-09-30" in out
+    assert "EXCLUDED" in out          # explains why they still read UNKNOWN
+    assert "Unnamed speakers" in out  # says where to act
+
+
+def test_no_learned_speakers_prints_nothing_extra(client, tmp_path, monkeypatch, capsys):
+    src, _ = _fake(client, tmp_path, "a.wav", 1.0)
+
+    def fake_open(method, url, **kw):
+        return _Stream(_sse({"stage": "done", "result": {
+            "results": [{"start": 0.0, "end": 1.0, "speaker": "Gergely Papp",
+                         "text": "hello"}],
+            "segments": [{"start": 0.0, "end": 1.0, "speaker": "Gergely Papp"}],
+            "speakers": ["Gergely Papp"],
+        }}))
+
+    monkeypatch.setattr(client, "open_request", fake_open)
+    monkeypatch.setattr(client, "encode_multipart",
+                        lambda *a, **kw: (b"", "text/plain"))
+    client.transcribe_file("http://x", "tok", src, "en")
+    assert "EXCLUDED" not in capsys.readouterr().out

@@ -119,6 +119,21 @@ instead.
 - `.env`, `.venv/`, and `__pycache__/` are ignored by git and are
   never included in the distributed zip.
 
+### New speakers
+
+If the server learns a speaker it has no voiceprint for, both clients say so:
+
+```
+  Learned 2 new speaker(s), not yet named: Pending 2026-09-30 12:45 Speaker_5 talk.mp4, ...
+  They are EXCLUDED from matching until named. Name them in the
+  web UI: Voiceprints tab -> Unnamed speakers.
+```
+
+That message matters: the learned snippets are saved, but the person still reads
+`UNKNOWN` in the transcript — and in every later run too — until you give them a
+name in the web UI. A learned profile is never auto-named, because a cluster has
+no identity to claim.
+
 ## Live mode (`transcribe.bat live`)
 
 Real-time transcription of a meeting. Requires `PyAudioWPatch`, `numpy`, `soxr`

@@ -1174,3 +1174,38 @@ def test_session_exposes_its_coalescers(tmp_path, monkeypatch, live):
     session.coalescers = {0: live.TurnCoalescer()}
     session.coalescers[0].merged = 3
     assert sum(c.merged for c in session.coalescers.values()) == 3
+
+
+def test_report_pending_tells_the_user_and_records_profiles(
+        tmp_path, monkeypatch, live, capsys):
+    """A learned speaker is invisible until named -- silence would make the
+    user think the feature does not work."""
+    s = _session(tmp_path, monkeypatch, live)
+    s.report_pending({"pending_profiles": [
+        {"name": "Pending 2026-09-30 12:45 Speaker_5 talk.wav",
+         "snippet_count": 7, "total_duration_sec": 42.5},
+    ]})
+    err = capsys.readouterr().err
+    assert "Pending 2026-09-30" in err
+    assert "EXCLUDED" in err          # the part that explains the UNKNOWN
+    assert "Voiceprints" in err       # where to go
+    assert "42.5s" in err
+    assert s.pending_profiles[0]["snippet_count"] == 7
+
+
+def test_report_pending_is_silent_when_nothing_was_learned(
+        tmp_path, monkeypatch, live, capsys):
+    s = _session(tmp_path, monkeypatch, live)
+    s.report_pending({})
+    s.report_pending({"pending_profiles": []})
+    s.report_pending(None)
+    assert capsys.readouterr().err == ""
+    assert s.pending_profiles == []
+
+
+def test_sidecar_records_pending_profiles(tmp_path, monkeypatch, live):
+    s = _session(tmp_path, monkeypatch, live)
+    s.pending_profiles = [{"name": "Pending x Speaker_3 y.wav"}]
+    s.write_sidecar()
+    payload = json.loads(s.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["pending_profiles"] == [{"name": "Pending x Speaker_3 y.wav"}]

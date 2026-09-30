@@ -281,3 +281,132 @@ trick, no GPU needed):
 - Side finding: whisper fails `cuda/int8_float16` *and* `int8` on a 4GB card
   when `ensure_ready()` has already taken the embedding arena, then silently
   runs on CPU. Unrelated to the policy, still open.
+
+## 39. A learned-but-unnamed speaker is a PENDING profile
+
+### The gap
+
+"Starting from the client does not learn new speakers." Two independent causes,
+both confirmed in code:
+
+1. `VoiceprintService.auto_collect_from_diarization` ended with
+   ```python
+   if is_spurious_speaker_name(speaker_name):
+       continue
+   if not self._db.get(speaker_name, user_id=user_id):
+       continue
+   ```
+   Auto-collect only ever **added snippets to an already-registered**
+   voiceprint. It never created one. A colleague who had never been registered
+   could therefore never be learned — a chicken-and-egg the user cannot break
+   from the client. (It was also not caused by the client's `save=false`;
+   auto-collect runs regardless.)
+2. The live WebSocket path did **no** auto-collect at all
+   (`grep -c auto_collect asr_mcp/streaming/handler.py` = 0). Its call sites
+   were only the three upload/path endpoints.
+
+### Why "just create the voiceprint" is the wrong fix
+
+The obvious fix — let a generic `Speaker N` cluster become a real voiceprint —
+re-introduces exactly the failure lesson 30 exists to prevent. A cluster has no
+identity; giving it a name means the next recording's nearest-neighbour vote can
+be won by a cluster that was never a person, and the false attribution comes
+back wearing a confident label. That is the `Gergely Papp`-at-99.3% bug from
+lesson 30, in a new place.
+
+### The shape that works: pending, then named
+
+An unknown speaker becomes a **pending profile** — snippets on disk, a name that
+says what it is, and a `pending` flag that keeps it out of every match until a
+human names it.
+
+- `voiceprints.pending BOOLEAN` + an additive `ALTER TABLE` migration in
+  `init_db`, mirroring the existing snippets migration.
+- `VoiceprintDB.save(..., pending=None)` where **`None` preserves the stored
+  flag**. A naive `pending=False` default let any rebuild silently *promote* a
+  pending profile — caught by a test. Promotion must be explicit.
+- `list_all(include_pending=False)` and `search()` exclude them;
+  `_load_known_speakers` — the single funnel for file diarization, live
+  attribution and re-attribution — passes `include_pending=False`. That one
+  line is what makes the guarantee hold everywhere.
+- `set_pending(name, True)` is called **after** `_auto_refine`, because
+  `_auto_refine` creates the row and a new row defaults to non-pending. Getting
+  this order wrong made a learned profile matchable from its first instant.
+- `is_pending_profile(name, voiceprint=None)` checks the `Pending ` **name
+  prefix** as well as the flag: the flag lives on the voiceprint row, so a
+  profile learned while the embedding session was unavailable (snippets but no
+  row) would otherwise be invisible.
+- `confirm_pending` refuses a name already used by a row *or* a snippet
+  directory, so confirming cannot clobber a real colleague's profile.
+
+### The cluster label belongs in the profile name
+
+`pending_profile_name()` puts the sanitised cluster label in the name:
+`Pending 2026-09-30 12:45 Speaker_5 talk.wav`. Without it, two speakers in one
+recording produced the *same* name and the second cluster's snippets were
+folded into the first person's profile. Two consequences followed:
+
+- the extend-rather-than-mint lookup must compare the **sanitised** label
+  (`Speaker_5`, not `Speaker 5`), or every re-run mints a `#2` profile;
+- `LEARN_MIN_SPEECH_SEC = 10.0` and `LEARN_MIN_SEGMENTS = 2` keep a cough or a
+  single bark from creating a profile at all.
+
+### Learning has its own eligibility test
+
+`uncertainty.eligible_for_learning(segment)` is deliberately **not**
+`is_uncertain_label()` — that also rejects generic `Speaker N`, which is the one
+label class learning exists to handle. It rejects: no name, `UNKNOWN`, `OVERLAP`,
+an explicit `uncertain` flag, and an explicit `speaker_confidence` below the
+threshold. Absence of confidence is treated as "no evidence of doubt"; only an
+explicitly low value rejects.
+
+The learning step is strictly additive: `learn_new=False` reproduces the old
+behaviour exactly, and registered-speaker collection is untouched.
+
+### The user has to be told, every time
+
+A pending profile is invisible by design — that person reads `UNKNOWN` in the
+transcript and on every future run until it is named. Silence makes the feature
+look broken, so:
+
+- the Voiceprints tab has an **Unnamed speakers** card with a name field and a
+  Save action (`GET /voiceprint/pending`, `POST /voiceprint/pending/{name}/confirm`);
+- `diarization_complete` (SSE) and `AttributionResponse` (live re-attribution)
+  both carry `pending_profiles`;
+- both clients print what was learned and say explicitly that it is **EXCLUDED**
+  from matching until named, and where to act.
+
+### Where learning can and cannot happen
+
+The WebSocket path itself cannot learn: it only sees short endpointed turns and
+never has the whole recording. Learning therefore happens at the two points that
+do — `transcribe/upload` and the client's shutdown re-attribution, both of which
+have the full audio.
+
+### Extending must be idempotent, and a rename must move the file paths
+
+Both of these were found by the real-model end-to-end run, not by the unit
+tests, and both are the kind of bug that looks like "the feature is flaky"
+rather than "the code is wrong".
+
+**Re-processing the same recording duplicated every snippet.** The extend path
+re-ran `add_snippet_from_segment` for each segment, which is keyed on
+`{hash(source_audio)}_{format_time_short(start_sec)}_{duration}` — so a second
+pass produced *the same filenames again* and a second row for each. The profile
+filled with duplicates and the embedding was computed over doubly-counted
+audio. The unit test that "the same recording extends one pending profile"
+passed throughout, because it asserted the number of **profiles** and never the
+number of snippets. `_learn_unknown_speaker` now skips a segment whose
+`hash_start` key is already present, and a pass that adds nothing still reports
+the profile (with `snippets: 0`) so a still-unnamed speaker stays visible.
+
+**Renaming copied `file_path` verbatim.** `_rename_snippet_dir` moves the
+directory with `Path.rename()` and then re-inserts each snippet row — passing
+the old `file_path` straight through, which is the obvious thing to write and
+is wrong. The row keeps pointing at a directory that no longer exists, so every
+later load of that snippet fails with `No such file or directory` and the
+profile cannot be re-refined. The path is now re-pointed at the new directory.
+
+The end-to-end check that caught both asserts the property a user actually
+cares about: after `confirm_pending`, every `file_path` in the database must be
+a file that exists on disk. Counting rows is not evidence.

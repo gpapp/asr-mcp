@@ -304,6 +304,37 @@ def eligible_for_auto_collect(segment: Any) -> bool:
     return True
 
 
+def eligible_for_learning(segment: Any) -> bool:
+    """Gate for LEARNING a new speaker from an unidentified cluster.
+
+    Deliberately more permissive than :func:`eligible_for_auto_collect` in
+    exactly one way: a generic ``Speaker N`` label is accepted, because the
+    whole point is to learn someone who has no name yet.
+
+    Everything that makes a label *unreliable* still rejects it: UNKNOWN,
+    OVERLAP, explicitly-suppressed segments, and low-confidence attributions.
+    Learning from a segment whose speaker identity the pipeline itself
+    distrusted would poison the new profile with the same wrong audio.
+    """
+    name = segment.get("speaker") if isinstance(segment, dict) else None
+    # NOT is_uncertain_label(): that also rejects generic "Speaker N", which is
+    # the one label class learning exists to handle. Only the labels that carry
+    # no speaker at all are rejected here.
+    if not name or is_unknown_label(name) or str(name).strip() == OVERLAP_SPEAKER:
+        return False
+    if isinstance(segment, dict) and segment.get("uncertain"):
+        return False
+    c = _cfg()
+    if c.get("auto_collect_requires_confidence", True):
+        conf = _as_float(segment.get("speaker_confidence")
+                         if isinstance(segment, dict) else None)
+        # A generic cluster label carries no speaker_confidence at all; absence
+        # is not evidence of doubt, so only an explicit low value rejects.
+        if conf is not None and conf < float(c.get("min_speaker_confidence", 0.35)):
+            return False
+    return True
+
+
 __all__ = [
     "UNKNOWN_SPEAKER",
     "OVERLAP_SPEAKER",
@@ -324,4 +355,5 @@ __all__ = [
     "apply_identity",
     "confidence_source_for",
     "eligible_for_auto_collect",
+    "eligible_for_learning",
 ]

@@ -194,6 +194,27 @@ nearest or most common speaker:
 - Known limitation: short recordings (<1 min) over-cluster, so one person's
   turns can come back `UNKNOWN`. See **[docs/uncertain-speakers.md](docs/uncertain-speakers.md)**.
 
+### Learning New Speakers
+
+A speaker who has no voiceprint yet is learned automatically — but as a
+**pending profile**, never as a voiceprint:
+
+- After a file upload or a live session's re-attribution, an unknown speaker
+  (≥10 s of speech across ≥2 segments) is saved as
+  `Pending <date> Speaker_5 <source>.flac` with its snippets, and the client
+  prints what it learned.
+- A pending profile is **excluded from every voiceprint match** — an unnamed
+  profile has no identity, so it can never win a nearest-neighbour vote. That
+  person's speech therefore still reads `UNKNOWN` (with the text kept) until
+  you name them.
+- Name them in the web UI: **Voiceprints → Unnamed speakers**, type a name and
+  press *Save name*. That is the only action that makes them recognisable, and
+  it also moves their snippets into a normal voiceprint.
+- Confirming refuses a name already in use, so it cannot overwrite a real
+  colleague's profile.
+- Re-running the same recording **extends** the existing pending profile
+  instead of creating a second one.
+
 ### Diarization Pipeline
 
 Step numbers match the `# Step N` comments in

@@ -12,6 +12,7 @@ from asr_mcp.api.schemas import (
     SpeakerSnippetInfo, VoiceprintSpeakerInfo,
     VoiceprintSpeakerListResponse, VoiceprintSnippetListResponse,
     RescanResponse,
+    PendingProfileConfirm, PendingProfileConfirmResponse,
 )
 from asr_mcp.api.security import get_current_user, validate_upload_filename
 from asr_mcp.config.settings import Settings, get_settings
@@ -43,6 +44,43 @@ async def list_speakers(
     speakers = service.list_speakers(user_id=user_id)
     items = [VoiceprintSpeakerInfo(**s) for s in speakers]
     return VoiceprintSpeakerListResponse(speakers=items, count=len(items))
+
+
+@router.get("/pending", response_model=VoiceprintSpeakerListResponse)
+async def list_pending_profiles(
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Auto-learned speakers still waiting for a name.
+
+    These profiles collect snippets and are excluded from matching. Renaming one
+    (POST /pending/{name}/confirm) is what makes it matchable.
+    """
+    service = _get_service(settings)
+    profiles = service.pending_profiles(user_id=user_id)
+    items = [VoiceprintSpeakerInfo(**p) for p in profiles]
+    return VoiceprintSpeakerListResponse(speakers=items, count=len(items))
+
+
+@router.post("/pending/{speaker_name}/confirm",
+             response_model=PendingProfileConfirmResponse)
+async def confirm_pending_profile(
+    speaker_name: str,
+    req: PendingProfileConfirm,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Name an auto-learned profile, making it a real, matchable voiceprint.
+
+    The only route that promotes a pending profile. Refuses a name that is
+    already taken so confirming cannot overwrite an existing profile.
+    """
+    service = _get_service(settings, ensure_gpu=True)
+    result = service.confirm_pending(speaker_name, req.new_name, user_id=user_id)
+    if not result.get("ok"):
+        return PendingProfileConfirmResponse(**result)
+    return PendingProfileConfirmResponse(ok=True, name=result["name"],
+                                         renamed_from=result["renamed_from"])
 
 
 @router.get("/speakers/{speaker_name}/snippets", response_model=VoiceprintSnippetListResponse)

@@ -493,6 +493,8 @@
                     <span class="status-count"></span>
                 </div>
 
+                <div id="pending-list" hidden></div>
+
                 <div id="speakers-list"></div>
             </div>
         </section>
@@ -1554,8 +1556,74 @@
 
         async function refresh() {
             const data = await apiFetch('/speakers');
-            speakersData = data.speakers || [];
+            // Pending profiles get their own card above; showing them here too
+            // would list the same snippets twice.
+            speakersData = (data.speakers || []).filter(s => !s.pending);
             renderSpeakers();
+            await refreshPending();
+        }
+
+        // Pending profiles: speakers the diarizer learned from a recording that
+        // you have not named yet. They are EXCLUDED from every voiceprint match
+        // (an unnamed profile has no identity to claim), so nothing appears under
+        // their name until you confirm it here.
+        async function refreshPending() {
+            const el = document.getElementById('pending-list');
+            let pending = [];
+            try {
+                const data = await apiFetch('/pending');
+                pending = data.pending || [];
+            } catch (e) {
+                el.hidden = true;
+                return;
+            }
+            if (!pending.length) {
+                el.hidden = true;
+                el.innerHTML = '';
+                return;
+            }
+            el.hidden = false;
+            el.innerHTML = `
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Unnamed speakers <span class="badge badge-gray">${pending.length}</span></h3>
+                        <div class="meta"><span>learned from recordings, not yet matched against anything</span></div>
+                    </div>
+                    <p class="note">Name these to make them recognisable. Until you do, their speech is attributed as
+                        <strong>UNKNOWN</strong> (the words are always kept) and they never win a voiceprint match.</p>
+                    ${pending.map(p => `
+                        <div class="row row-spread">
+                            <div class="meta">
+                                <strong>${escHtml(p.name)}</strong>
+                                <span>${p.snippet_count} snippets</span>
+                                <span>${formatDuration(p.total_duration_sec)}</span>
+                                <span>from ${escHtml(p.source || 'a recording')}</span>
+                            </div>
+                            <div class="row">
+                                <input type="text" placeholder="Speaker name" id="pending-name-${escHtml(p.name)}" maxlength="255">
+                                <button class="btn btn-primary btn-sm" onclick="confirmPending('${escHtml(p.name)}')">Save name</button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        async function confirmPending(pendingName) {
+            const input = document.getElementById('pending-name-' + pendingName);
+            const newName = (input ? input.value : '').trim();
+            if (!newName) { toast('Enter a name first', true); return; }
+            try {
+                const res = await apiFetch('/pending/' + encodeURIComponent(pendingName) + '/confirm', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ new_name: newName })
+                });
+                toast('"' + res.name + '" is now recognisable');
+                await refresh();
+            } catch (e) {
+                toast(e.message || 'Could not save the name', true);
+            }
         }
 
         function renderSpeakers() {

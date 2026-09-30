@@ -413,7 +413,8 @@ def _has_text(result):
     return any((r.get("text") or "").strip() for r in (result.get("results") or []))
 
 
-def _write_sidecar(out_path: Path, result, done_evt, status, date_str):
+def _write_sidecar(out_path: Path, result, done_evt, status, date_str,
+                  _pending_profiles=None):
     """Optional machine-readable sidecar next to the .txt transcript."""
     payload = {
         "generated_at": date_str,
@@ -423,6 +424,7 @@ def _write_sidecar(out_path: Path, result, done_evt, status, date_str):
         "total_speakers": result.get("total_speakers", 0),
         "uncertain_segments": result.get("uncertain_segments", 0),
         "audio_duration_sec": result.get("audio_duration_sec", 0),
+        "pending_profiles": _pending_profiles,
         "results": [
             {
                 "start": r.get("start"),
@@ -656,6 +658,7 @@ def transcribe_file(base, token, path: Path, language: str = "auto", *,
     result = None
     error = None
     done_evt = None
+    pending_profiles = []
     try:
         for raw_line in resp:
             line = raw_line.decode("utf-8", "replace").strip()
@@ -669,6 +672,10 @@ def transcribe_file(base, token, path: Path, language: str = "auto", *,
             except ValueError:
                 continue
             stage = evt.get("stage")
+            # Learned speakers arrive on diarization_complete, BEFORE done --
+            # that is the only stream that carries them, so remember them.
+            if evt.get("pending_profiles"):
+                pending_profiles.extend(evt["pending_profiles"])
             if stage == "error":
                 error = evt.get("error") or "unknown server error"
                 break
@@ -704,7 +711,8 @@ def transcribe_file(base, token, path: Path, language: str = "auto", *,
 
     written = [out_path]
     if get_json_sidecar():
-        written.append(_write_sidecar(out_path, result, done_evt, status, date_str))
+        written.append(_write_sidecar(out_path, result, done_evt, status,
+                                      date_str, pending_profiles))
 
     processing = (done_evt or {}).get("processing_time_sec")
     if processing:
@@ -714,6 +722,15 @@ def transcribe_file(base, token, path: Path, language: str = "auto", *,
         if speedup:
             summary += f" ({speedup:g}x realtime)"
         print(f"  {summary}")
+
+    if pending_profiles:
+        # Learned speakers are excluded from voiceprint matching until named,
+        # so this run (and every run until the user acts) reports them UNKNOWN.
+        # Saying so here is the only place the user is told.
+        print(f"  Learned {len(pending_profiles)} new speaker(s), not yet named: "
+              + ", ".join(p.get("name", "?") for p in pending_profiles))
+        print("  They are EXCLUDED from matching until named. Name them in the "
+              "web UI: Voiceprints tab -> Unnamed speakers.")
 
     results = result.get("results") or []
     n_uncertain = sum(1 for r in results if r.get("uncertain"))

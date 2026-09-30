@@ -68,7 +68,15 @@ class VoiceprintDB:
              pitch_hz: float = 0.0, pitch_std: float = 0.0, energy_rms: float = 0.0,
              spectral_centroid: float = 0.0, spectral_rolloff: float = 0.0,
              total_speech_sec: float = 0.0, sample_count: int = 0,
-             mfcc: Optional[dict] = None):
+             mfcc: Optional[dict] = None, pending: Optional[bool] = None):
+        """Insert or update a voiceprint row.
+
+        ``pending=None`` means PRESERVE the current flag. That is the safe
+        default: save() is called from four places (register, refine, auto-
+        refine, merge) and a naive rebuild must never silently promote an
+        auto-learned profile into a matchable identity. Promotion is an explicit
+        user action via ``set_pending``/``confirm_pending``.
+        """
         with self._db.get_session() as session:
             existing = session.query(VoiceprintModel).filter_by(
                 user_id=user_id, name=name
@@ -79,6 +87,8 @@ class VoiceprintDB:
             if existing:
                 existing.embedding = emb_bytes
                 existing.mfcc = mfcc_bytes
+                if pending is not None:
+                    existing.pending = bool(pending)
                 existing.pitch_hz = pitch_hz
                 existing.pitch_std = pitch_std
                 existing.energy_rms = energy_rms
@@ -100,6 +110,7 @@ class VoiceprintDB:
                     spectral_rolloff=spectral_rolloff,
                     total_speech_sec=total_speech_sec,
                     sample_count=sample_count,
+                    pending=bool(pending) if pending is not None else False,
                     created_at=now,
                     updated_at=now,
                 )
@@ -115,10 +126,33 @@ class VoiceprintDB:
                 return None
             return self._row_to_dict(vp)
 
-    def list_all(self, user_id: str = DEFAULT_USER) -> dict[str, dict]:
+    def list_all(self, user_id: str = DEFAULT_USER,
+                 include_pending: bool = True) -> dict[str, dict]:
+        """Every profile, or only the ones that may be matched against.
+
+        ``include_pending=False`` is what the matcher must use: a profile the
+        user has not named yet carries no identity, so letting it win a
+        nearest-neighbour vote would be the exact false attribution the
+        uncertainty policy exists to prevent.
+        """
         with self._db.get_session() as session:
-            rows = session.query(VoiceprintModel).filter_by(user_id=user_id).all()
+            q = session.query(VoiceprintModel).filter_by(user_id=user_id)
+            if not include_pending:
+                q = q.filter(VoiceprintModel.pending.is_(False))
+            rows = q.all()
             return {row.name: self._row_to_dict(row) for row in rows}
+
+    def set_pending(self, name: str, pending: bool,
+                    user_id: str = DEFAULT_USER) -> bool:
+        with self._db.get_session() as session:
+            vp = session.query(VoiceprintModel).filter_by(
+                user_id=user_id, name=name).first()
+            if not vp:
+                return False
+            vp.pending = bool(pending)
+            vp.updated_at = datetime.datetime.utcnow()
+            session.commit()
+            return True
 
     def delete(self, name: str, user_id: str = DEFAULT_USER) -> bool:
         with self._db.get_session() as session:
@@ -152,7 +186,7 @@ class VoiceprintDB:
             return session.query(VoiceprintModel).filter_by(user_id=user_id).count()
 
     def search(self, embedding: np.ndarray, user_id: str = DEFAULT_USER, top_k: int = 5) -> list[tuple[str, float, dict]]:
-        all_vps = self.list_all(user_id=user_id)
+        all_vps = self.list_all(user_id=user_id, include_pending=False)
         results = []
         for name, vp_dict in all_vps.items():
             dist = 1.0 - float(np.dot(embedding, vp_dict["embedding"]) /
@@ -164,6 +198,9 @@ class VoiceprintDB:
     def _row_to_dict(self, vp: VoiceprintModel) -> dict:
         return {
             "user_id": vp.user_id,
+            "name": vp.name,
+            "pending": bool(vp.pending),
+            "created_at": vp.created_at,
             "pitch_hz": vp.pitch_hz or 0.0,
             "pitch_std": vp.pitch_std or 0.0,
             "energy_rms": vp.energy_rms or 0.0,

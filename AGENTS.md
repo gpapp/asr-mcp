@@ -272,13 +272,15 @@ asr-mcp/
 | `/api/speaker/identify` | POST | API key | Identify speaker from audio |
 | `/api/speaker/list` | GET | API key | List all voiceprints |
 | `/api/speaker/{name}` | DELETE | API key | Delete voiceprint |
-| `/api/voiceprint/speakers` | GET | Session | List speakers (web UI) |
+| `/api/voiceprint/speakers` | GET | Session | List speakers (web UI); each entry carries `pending` |
 | `/api/voiceprint/speakers/{speaker_name}/snippets` | GET | Session | List snippets for a speaker |
 | `/api/voiceprint/speakers/{speaker_name}/rename` | POST | Session | Rename speaker |
 | `/api/voiceprint/speakers/merge` | POST | Session | Merge speakers |
 | `/api/voiceprint/upload` | POST | Session | Register voiceprint from upload |
 | `/api/voiceprint/rescan` | POST | Session | Rescan voices directory |
 | `/api/voiceprint/rescan/stream` | POST | Session | Rescan as an SSE stream |
+| `/api/voiceprint/pending` | GET | Session | Learned-but-unnamed speakers awaiting a name |
+| `/api/voiceprint/pending/{speaker_name}/confirm` | POST | Session | Give a pending profile a real name — the only route that makes it matchable |
 | `/api/voiceprint/snippets/{snippet_id}` | DELETE | Session | Delete one snippet |
 | `/api/voiceprint/snippets/{snippet_id}/audio` | GET | Session | Stream snippet audio (FLAC) |
 | `/api/voiceprint/speakers/{speaker_name}` | DELETE | Session | Delete a voiceprint |
@@ -372,6 +374,7 @@ anything the rule covers.
 | 30 | Uncertain speaker: suppress the IDENTITY, keep the text; one policy module, `uncertainty.enabled: false` is the rollback | [diarization](docs/lessons/diarization-and-speakers.md) · [user docs](docs/uncertain-speakers.md) |
 | 32 | `num_speakers` selects a DIFFERENT clustering path (hard k, no greedy merge) | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 33 | Verify diarization on a SHORT clip too — 52-min files hide over-clustering | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 39 | A learned-but-unnamed speaker is a PENDING profile: excluded from every match until the user names it, and the client must say so out loud | [diarization](docs/lessons/diarization-and-speakers.md) |
 
 ### ASR decoding internals (Cohere ONNX)
 | # | Rule | Detail |

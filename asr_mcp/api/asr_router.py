@@ -790,14 +790,51 @@ async def _sse_put(queue: asyncio.Queue, evt) -> None:
     await asyncio.sleep(0.01)
 
 
+def _auto_collect(vp_service, *, audio_path, segments, user_id, source_id,
+                  log_prefix="") -> dict:
+    """Run collect+learn and log both outcomes in one place.
+
+    ``learn_new=True`` is what makes a previously-unknown colleague appear in
+    the Voiceprints tab as a PENDING profile. It is deliberately not a
+    voiceprint until named, so this can never turn an unidentified cluster
+    into a confident label later.
+    """
+    out = vp_service.auto_collect_from_diarization(
+        audio_path=audio_path, segments=segments, user_id=user_id,
+        source_id=source_id, learn_new=True,
+    ) or {}
+    collected = out.get("collected") or []
+    created = out.get("pending_created") or []
+    extended = out.get("pending_extended") or []
+    if collected:
+        logger.info("%sAuto-collected %d snippets for user %s",
+                    log_prefix, len(collected), user_id)
+    for prof in created:
+        logger.info("%sLearned new speaker %r from cluster %r (%.1fs) -- PENDING, "
+                    "not matchable until named",
+                    log_prefix, prof["name"], prof["cluster"], prof["speech_sec"])
+    for prof in extended:
+        logger.info("%sAdded %.1fs to pending profile %r (now %d snippet(s))",
+                    log_prefix, prof["speech_sec"], prof["name"], prof["snippets"])
+    out["pending_total"] = len(created) + len(extended)
+    return out
+
+
 def _load_known_speakers(settings, user_id: str) -> dict:
-    """Load all stored voiceprints from DB for speaker matching."""
+    """Load all stored voiceprints from DB for speaker matching.
+
+    This is the SINGLE funnel for every matching path (file diarization, live
+    attribution, re-attribution), so it is also where pending profiles are
+    excluded: a profile the user has not named yet has no identity, and letting
+    it win a nearest-neighbour vote is precisely the false attribution the
+    uncertainty policy exists to prevent.
+    """
     try:
         from asr_mcp.db.manager import DatabaseManager, VoiceprintDB
         from asr_mcp.voiceprint.service import is_spurious_speaker_name
         db = DatabaseManager(settings.db_path)
         vp_db = VoiceprintDB(db)
-        all_vps = vp_db.list_all(user_id=user_id)
+        all_vps = vp_db.list_all(user_id=user_id, include_pending=False)
         valid_vps = {}
         for name, vp in all_vps.items():
             if is_spurious_speaker_name(name):
@@ -850,11 +887,8 @@ async def diarize_endpoint(
         db = DatabaseManager(settings.db_path)
         vp_service = VoiceprintService(settings.data_dir, db)
         vp_service.set_voices_dir(settings.voices_dir)
-        collected = vp_service.auto_collect_from_diarization(
-            audio_path=req.wav_path, segments=segments, user_id=user_id,
-        )
-        if collected:
-            logger.info("Auto-collected %d snippets for user %s", len(collected), user_id)
+        _auto_collect(vp_service, audio_path=req.wav_path, segments=segments,
+                      user_id=user_id, source_id=None)
     except Exception as e:
         logger.warning("Auto-collect failed: %s", e)
 
@@ -952,14 +986,10 @@ async def diarize_upload(
                 db = DatabaseManager(settings.db_path)
                 vp_service = VoiceprintService(settings.data_dir, db)
                 vp_service.set_voices_dir(settings.voices_dir)
-                collected = vp_service.auto_collect_from_diarization(
-                    audio_path=str(wav_path), segments=segments, user_id=user_id,
-                    source_id=file.filename,
-                )
-                logger.info(
-                    "Auto-collected %d snippets from %d segments for user %s",
-                    len(collected), len(segments), user_id,
-                )
+                _auto_collect(vp_service, audio_path=str(wav_path),
+                              segments=segments, user_id=user_id,
+                              source_id=file.filename,
+                              log_prefix="[%s] " % file.filename)
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
 
@@ -1175,19 +1205,24 @@ async def transcribe_upload(
                 except Exception as e:
                     logger.warning("Failed to save transcription: %s", e)
 
+            pending_profiles = []
             try:
                 from asr_mcp.db.manager import DatabaseManager
                 from asr_mcp.voiceprint.service import VoiceprintService
                 db = DatabaseManager(settings.db_path)
                 vp_service = VoiceprintService(settings.data_dir, db)
                 vp_service.set_voices_dir(settings.voices_dir)
-                collected = vp_service.auto_collect_from_diarization(
-                    audio_path=str(wav_path), segments=segments, user_id=user_id,
+                learned = _auto_collect(
+                    vp_service, audio_path=str(wav_path),
+                    segments=segments, user_id=user_id,
                     source_id=file.filename,
-                )
-                logger.info(
-                    "Auto-collected %d snippets from %d segments for user %s",
-                    len(collected), len(segments), user_id,
+                    log_prefix="[%s] " % file.filename)
+                # Surfaced to the client: a learned speaker stays invisible until it is
+                # named, so the user has to be told or their next run will still
+                # read UNKNOWN for that person.
+                pending_profiles = (
+                    (learned.get("pending_created") or [])
+                    + (learned.get("pending_extended") or [])
                 )
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
@@ -1236,6 +1271,10 @@ async def transcribe_upload(
                 "uncertain_segments": sum(
                     1 for s in display_segments if s.get("uncertain")
                 ),
+                # Speakers learned from this file but not yet named by the
+                # user. They are excluded from matching, so the client must
+                # say so out loud or the next run reads the same as this one.
+                "pending_profiles": pending_profiles,
             })
 
             state.unload_embedding()
@@ -1541,12 +1580,18 @@ async def _attribute_items_against_audio(
     vad_threshold: float = None,
     known_speakers: Optional[dict] = None,
     metadata: Optional[dict] = None,
+    learn_new: bool = True,
 ) -> AttributionResponse:
     """Diarize ``audio_path``, then map already-transcribed ``items`` onto turns.
 
     Shared by ``POST /attribution`` (server-side path) and
     ``POST /attribution/upload`` (the client uploads its local recording) so
     both routes share exactly one attribution implementation.
+
+    ``/attribution/upload`` is the only server-side hook the LIVE client has:
+    it runs on shutdown with the whole recording, which is why speaker
+    learning (``learn_new``) lives here. The WebSocket path itself cannot
+    learn -- it only ever sees short turns and has no whole-file audio.
     """
     import numpy as np
 
@@ -1591,6 +1636,29 @@ async def _attribute_items_against_audio(
 
     audio_dur = float(diarization.get("audio_duration_sec", 0.0) or 0.0)
     segments = diarization.get("segments", [])
+
+    # Learn unknown speakers from this recording. Unnamed speakers become
+    # PENDING profiles: they accumulate snippets and are excluded from
+    # matching until the user names them, so learning a colleague can never
+    # produce a confident misattribution.
+    pending_profiles: list[dict] = []
+    if learn_new and segments:
+        try:
+            from asr_mcp.db.manager import DatabaseManager
+            from asr_mcp.voiceprint.service import VoiceprintService
+            db = DatabaseManager(settings.db_path)
+            vp_service = VoiceprintService(settings.data_dir, db)
+            vp_service.set_voices_dir(settings.voices_dir)
+            learned = _auto_collect(
+                vp_service, audio_path=audio_path, segments=segments,
+                user_id=user,
+                source_id=(metadata or {}).get("uploaded_filename"),
+                log_prefix="[re-attribute] ",
+            )
+            pending_profiles = (learned.get("pending_created") or []) + \
+                (learned.get("pending_extended") or [])
+        except Exception as e:
+            logger.warning("Speaker learning failed during re-attribution: %s", e)
 
     # No turns: fall back to one unknown turn over the whole timeline, so the
     # text survives with an explicit uncertain identity (uncertainty policy:
@@ -1648,6 +1716,7 @@ async def _attribute_items_against_audio(
     )
     return AttributionResponse(
         results=results,
+        pending_profiles=pending_profiles,
         total_time_sec=processing,
         audio_duration_sec=audio_dur,
         total_speakers=len(speakers),

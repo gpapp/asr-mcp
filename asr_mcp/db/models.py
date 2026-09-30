@@ -1,6 +1,7 @@
 import datetime
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Float,
@@ -32,6 +33,11 @@ class VoiceprintModel(Base):
     spectral_rolloff = Column(Float, nullable=True)
     total_speech_sec = Column(Float, default=0.0)
     sample_count = Column(Integer, default=0)
+    # A pending profile was created by auto-learning from an unidentified
+    # cluster. It collects snippets but is EXCLUDED from voiceprint matching
+    # until the user gives it a name, so learning someone can never produce a
+    # confident misattribution (uncertainty policy, lesson 30).
+    pending = Column(Boolean, default=False, nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -88,8 +94,14 @@ def init_db(db_path: str) -> sessionmaker:
     engine = create_engine(f"sqlite:///{db_path}", echo=False)
     Base.metadata.create_all(engine)
     with engine.connect() as conn:
+        # Additive migrations for databases created before a column existed.
         cols = {row[1] for row in conn.execute(text("PRAGMA table_info(snippets)"))}
         for name, decl in (("file_mtime", "REAL"), ("file_size", "INTEGER")):
             if name not in cols:
                 conn.execute(text(f"ALTER TABLE snippets ADD COLUMN {name} {decl}"))
+        vp_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(voiceprints)"))}
+        if "pending" not in vp_cols:
+            conn.execute(text(
+                "ALTER TABLE voiceprints ADD COLUMN pending BOOLEAN NOT NULL DEFAULT 0"))
+        conn.commit()
     return sessionmaker(bind=engine)

@@ -1,5 +1,7 @@
+import datetime
 import hashlib
 import logging
+import os
 import re
 import shutil
 import time
@@ -11,7 +13,9 @@ import soundfile as sf
 import torch
 
 from asr_mcp.db.manager import DatabaseManager, SnippetDB, VoiceprintDB, DEFAULT_USER
-from asr_mcp.speaker.uncertainty import eligible_for_auto_collect
+from asr_mcp.speaker.uncertainty import (
+    eligible_for_auto_collect, eligible_for_learning, is_generic_speaker,
+)
 from asr_mcp.speaker.embedding import (
     extract_embedding, batch_embed_files, compute_pitch, compute_energy,
 )
@@ -25,6 +29,50 @@ AUTO_COLLECT_MAX_TOTAL_SEC = 1200.0
 AUTO_COLLECT_MAX_SEGMENT_SEC = 300.0
 AUTO_COLLECT_MIN_SPEAKER_SEGMENTS = 2
 MIN_SNIPPET_DURATION = 1.5
+
+# Learning an unknown speaker. A pending profile is created from a generic
+# "Speaker N" cluster, collects snippets, and is EXCLUDED from voiceprint
+# matching until the user names it -- so learning a colleague can never produce
+# a confident misattribution (lesson 30).
+PENDING_PREFIX = "Pending"
+LEARN_MIN_SPEECH_SEC = 10.0
+LEARN_MIN_SEGMENTS = 2
+
+
+def is_pending_profile(name: str, voiceprint: dict | None = None) -> bool:
+    """Is this an auto-learned profile still waiting for a name?
+
+    Checks the stored ``pending`` flag AND the name prefix. The prefix check
+    matters because the flag lives on the voiceprints row, and that row is only
+    written by ``_auto_refine`` -- so if embedding was unavailable when a
+    speaker was learned, its snippets exist with no row and would otherwise be
+    invisible. A directory named "Pending ..." is a pending profile by
+    construction, and both signals say "not matchable" anyway.
+    """
+    if str(name).startswith(PENDING_PREFIX + " "):
+        return True
+    return bool((voiceprint or {}).get("pending"))
+
+
+def pending_profile_name(source_id: str, cluster: str = "") -> str:
+    """A unique, human-readable placeholder name for an unnamed profile.
+
+    The CLUSTER label is part of the name on purpose. Without it, two different
+    speakers in the same recording produce the same name (same minute, same
+    source stem) and the second cluster silently extends the first one's
+    profile -- merging two people. Including "Speaker 5" keeps one profile per
+    cluster per recording, which is also what makes the extend-rather-than-
+    create rule below safe.
+    """
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    parts = [PENDING_PREFIX, stamp]
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", cluster or "").strip("_")
+    if label:
+        parts.append(label)
+    stem = _origin_prefix(source_id)
+    if stem:
+        parts.append(stem)
+    return " ".join(parts)[:120]
 
 
 def _origin_prefix(audio_path: str) -> str:
@@ -165,6 +213,7 @@ class VoiceprintService:
                 "snippet_count": sn["count"],
                 "total_duration_sec": round(sn["total_duration"], 2),
                 "has_voiceprint": bool(vp),
+                "pending": is_pending_profile(name, vp),
                 "pitch_hz": round(vp.get("pitch_hz", 0), 1),
                 "energy_rms": round(vp.get("energy_rms", 0), 4),
             })
@@ -527,26 +576,52 @@ class VoiceprintService:
         segments: list[dict],
         user_id: str = DEFAULT_USER,
         source_id: str | None = None,
-    ) -> list[dict]:
+        learn_new: bool = False,
+    ) -> dict:
+        """Grow voiceprints from a diarization result.
+
+        Two distinct behaviours, deliberately separated:
+
+        * **collect** -- add snippets to an ALREADY-NAMED voiceprint. Only ever
+          touches profiles that are registered and not pending.
+        * **learn** (``learn_new=True``) -- create a *pending* profile for a
+          generic ``Speaker N`` cluster that spoke long enough to be a person
+          rather than a cough. The profile collects snippets immediately but
+          is excluded from matching (see ``_load_known_speakers``) until the
+          user names it, so this can never invent an identity.
+
+        Returns ``{"collected": [...], "pending_created": [...],
+        "pending_extended": [...]}``. (Earlier versions returned a bare list;
+        the three call sites only used ``len()``, and returning the breakdown is
+        what lets the API tell the user a new profile is waiting for a name.)
+        """
         if source_id is None:
             source_id = audio_path
         collected = []
+        pending_created = []
+        pending_extended = []
         speaker_totals = {}
         for name, info in self._snippets.all_speakers(user_id=user_id).items():
             speaker_totals[name] = info["total_duration"]
 
         by_speaker: dict[str, list[dict]] = {}
+        to_learn: dict[str, list[dict]] = {}
         skipped_uncertain = 0
         for seg in segments:
             sp = seg.get("speaker", "")
             if not sp:
                 continue
+            dur = seg.get("end", 0) - seg.get("start", 0)
             # Uncertainty policy: never feed UNKNOWN / OVERLAP / generic
             # "Speaker N" / suppressed or low-confidence segments into the DB.
             if not eligible_for_auto_collect(seg):
                 skipped_uncertain += 1
+                # ...but a generic "Speaker N" that survived every other check
+                # is a candidate to LEARN, not to collect.
+                if learn_new and is_generic_speaker(sp) and eligible_for_learning(seg):
+                    if dur >= AUTO_COLLECT_MIN_DURATION:
+                        to_learn.setdefault(sp, []).append(seg)
                 continue
-            dur = seg.get("end", 0) - seg.get("start", 0)
             if dur < AUTO_COLLECT_MIN_DURATION:
                 continue
             by_speaker.setdefault(sp, []).append(seg)
@@ -614,7 +689,193 @@ class VoiceprintService:
 
             self._auto_refine(speaker_name, user_id=user_id)
 
-        return collected
+        for cluster, segs in to_learn.items():
+            outcome = self._learn_unknown_speaker(
+                cluster=cluster, segs=segs, audio_path=audio_path,
+                user_id=user_id, source_id=source_id,
+            )
+            if outcome.get("name"):
+                (pending_extended if outcome.get("existing")
+                 else pending_created).append(outcome)
+
+        return {
+            "collected": collected,
+            "pending_created": pending_created,
+            "pending_extended": pending_extended,
+        }
+
+    def _learn_unknown_speaker(
+        self,
+        cluster: str,
+        segs: list[dict],
+        audio_path: str,
+        user_id: str = DEFAULT_USER,
+        source_id: str | None = None,
+    ) -> dict:
+        """Create or extend a PENDING profile for an unidentified cluster.
+
+        Extends an existing pending profile when one already covers this source
+        audio, so a colleague who speaks in every meeting accumulates into ONE
+        profile instead of a new "Pending ..." per session.
+        """
+        if source_id is None:
+            source_id = audio_path
+        speech = sum(max(0.0, seg["end"] - seg["start"]) for seg in segs)
+        if len(segs) < LEARN_MIN_SEGMENTS or speech < LEARN_MIN_SPEECH_SEC:
+            return {}
+        # Prefer extending a pending profile created from this same recording.
+        prefix = _origin_prefix(source_id)
+        # Compare the SANITISED label: the name stores "Speaker_5", so a naive
+        # "Speaker 5" in cand would never match and every re-run would mint a
+        # "#2" profile instead of extending.
+        label = re.sub(r"[^A-Za-z0-9._-]+", "_", cluster or "").strip("_")
+        rows = self._db.list_all(user_id=user_id, include_pending=True)
+        known = set(rows) | set(self._snippets.all_speakers(user_id=user_id))
+        target = None
+        for cand in sorted(known):
+            if not is_pending_profile(cand, rows.get(cand)):
+                continue
+            if prefix in cand and (not label or label in cand):
+                target = cand
+                break
+        existing = bool(target)
+        if not target:
+            target = pending_profile_name(source_id, cluster)
+            n = 2
+            while self._db.get(target, user_id=user_id):
+                target = f"{pending_profile_name(source_id, cluster)} #{n}"
+                n += 1
+        added = []
+        # Extending must be IDEMPOTENT: the same recording re-processed must not
+        # add the same snippet twice, or the profile fills with duplicates and
+        # the embedding is computed over doubly-counted audio.
+        have = {os.path.basename(x["file_path"])
+                for x in self._snippets.list_by_speaker(target, user_id=user_id)}
+        src_hash = generate_segment_hash(audio_path)
+        for seg in sorted(segs, key=lambda x: x["start"]):
+            # Mirror add_snippet()'s filename exactly (minus the duration part):
+            # the hash is of the source audio and the time part of the start.
+            key = f"{src_hash}_{format_time_short(seg['start'])}"
+            if any(n.startswith(key + "_") for n in have):
+                continue
+            have.add(key)
+            r = self.add_snippet_from_segment(
+                speaker_name=target, wav_path=audio_path,
+                start_sec=seg["start"], end_sec=seg["end"], user_id=user_id,
+                source_audio=source_id,
+            )
+            if "error" not in r:
+                added.append(r)
+        if not added:
+            # Nothing new (a repeat of the same recording). Still report the
+            # profile: the user needs to know this speaker is STILL unnamed,
+            # and silently returning nothing hides a pending profile that is
+            # accumulating nothing. `snippets: 0` keeps it honest.
+            if not existing:
+                return {}
+            return {"name": target, "cluster": cluster, "snippets": 0,
+                    "speech_sec": round(speech, 1), "existing": True}
+        # Build the profile so it is ready the moment the user names it. This
+        # writes a voiceprint row flagged pending, which matching ignores.
+        try:
+            self._auto_refine(target, user_id=user_id)
+        except Exception as e:
+            logger.warning("Pending profile refine failed for %s: %s", target, e)
+        # MUST be set AFTER the refine: _auto_refine CREATES the row, and a new
+        # row defaults to pending=False. Without this the profile would be
+        # matchable from its very first moment -- the exact false attribution
+        # this whole feature exists to avoid.
+        self._db.set_pending(target, True, user_id=user_id)
+        logger.info(
+            "Learned new speaker: %s (%s, %d segment(s), %.1fs) -- PENDING, "
+            "excluded from matching until it is named",
+            target, cluster, len(added), speech,
+        )
+        return {"name": target, "cluster": cluster, "snippets": len(added),
+                "speech_sec": round(speech, 1), "existing": existing}
+
+    def _rename_snippet_dir(self, old_name: str, new_name: str,
+                            user_id: str = DEFAULT_USER) -> bool:
+        """Move a speaker's snippets + DB rows to a new name."""
+        old_dir = self._voices_dir / user_id / old_name
+        new_dir = self._voices_dir / user_id / new_name
+        if old_dir.exists() and not new_dir.exists():
+            new_dir.parent.mkdir(parents=True, exist_ok=True)
+            old_dir.rename(new_dir)
+        moved = 0
+        for sn in self._snippets.list_by_speaker(old_name, user_id=user_id):
+            try:
+                # Re-point at the NEW directory. Copying file_path verbatim is
+                # the obvious thing and it is wrong: the directory just moved,
+                # so every later load of that snippet 404s on disk.
+                old_path = sn["file_path"]
+                new_path = str(new_dir / os.path.basename(old_path)) \
+                    if str(old_dir) in old_path else old_path
+                self._snippets.add(
+                    speaker_name=new_name, file_path=new_path,
+                    duration_sec=sn.get("duration_sec", 0.0), user_id=user_id,
+                    source_audio=sn.get("source_audio"),
+                    start_sec=sn.get("start_sec"), end_sec=sn.get("end_sec"),
+                    file_mtime=sn.get("file_mtime"), file_size=sn.get("file_size"))
+                self._snippets.delete(sn["id"], user_id=user_id)
+                moved += 1
+            except Exception as e:
+                logger.warning("Could not move snippet %s: %s", sn.get("id"), e)
+        return bool(moved or new_dir.exists())
+
+    def pending_profiles(self, user_id: str = DEFAULT_USER) -> list[dict]:
+        """Unnamed profiles awaiting a name, newest first."""
+        out = []
+        vps = self._db.list_all(user_id=user_id, include_pending=True)
+        totals = self._snippets.all_speakers(user_id=user_id)
+        # Union of rows and snippet dirs: a profile learned while embedding was
+        # unavailable has snippets but no row.
+        for name in sorted(set(vps) | set(totals)):
+            vp = vps.get(name, {})
+            if not is_pending_profile(name, vp):
+                continue
+            sn = totals.get(name, {})
+            out.append({
+                "name": name,
+                "snippet_count": sn.get("count", 0),
+                "total_duration_sec": round(sn.get("total_duration", 0.0), 2),
+                "created_at": vp.get("created_at"),
+            })
+        return out
+
+    def confirm_pending(self, pending_name: str, new_name: str,
+                        user_id: str = DEFAULT_USER) -> dict:
+        """Give a pending profile a real name, making it matchable.
+
+        Refuses a name that is already taken (unless it is the same pending
+        profile being renamed) so confirming can never silently overwrite a
+        colleague's existing profile.
+        """
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return {"error": "A name is required"}
+        vp = self._db.get(pending_name, user_id=user_id)
+        sn = self._snippets.all_speakers(user_id=user_id).get(pending_name)
+        if not vp and not sn:
+            return {"error": f"No pending profile named {pending_name!r}"}
+        if not is_pending_profile(pending_name, vp):
+            return {"error": f"{pending_name!r} is not a pending profile"}
+        if new_name != pending_name and (
+                self._db.get(new_name, user_id=user_id)
+                or new_name in self._snippets.all_speakers(user_id=user_id)):
+            return {"error": f"A voiceprint named {new_name!r} already exists"}
+        # The snippets are what make the profile usable, so they move whenever
+        # the name changes -- whether or not a voiceprint row existed to rename.
+        self._rename_snippet_dir(pending_name, new_name, user_id=user_id)
+        if not self._db.rename(pending_name, new_name, user_id=user_id):
+            if not (self._db.get(new_name, user_id=user_id)
+                    or new_name in self._snippets.all_speakers(user_id=user_id)):
+                return {"error": f"Could not rename {pending_name!r}"}
+        self._db.set_pending(new_name, False, user_id=user_id)
+        self._auto_refine(new_name, user_id=user_id)
+        logger.info("Pending profile %r confirmed as %r (now matchable)",
+                    pending_name, new_name)
+        return {"ok": True, "name": new_name, "renamed_from": pending_name}
 
     def _auto_refine(self, speaker_name: str, user_id: str = DEFAULT_USER, progress_callback=None):
         if self._emb_session() is None:
@@ -675,6 +936,8 @@ class VoiceprintService:
         pitch_hz, pitch_std = compute_pitch(combined, SAMPLE_RATE)
         energy_rms = compute_energy(combined)
 
+        # pending is left as None here on purpose: VoiceprintDB.save preserves
+        # the stored flag, so an auto-refine cannot promote a pending profile.
         self._db.save(
             name=speaker_name, user_id=user_id,
             embedding=new_embedding,
