@@ -410,3 +410,39 @@ profile cannot be re-refined. The path is now re-pointed at the new directory.
 The end-to-end check that caught both asserts the property a user actually
 cares about: after `confirm_pending`, every `file_path` in the database must be
 a file that exists on disk. Counting rows is not evidence.
+
+### 39a. A learner is often someone you already have — offer the merge, not the rename
+
+`confirm_pending` refuses a name that is already taken. That is correct — it
+means confirming can never overwrite a colleague's existing profile — but it is
+the *wrong answer* in the most likely case, which is that the pending profile
+holds 25 seconds of a person who has been registered for months. The user is
+then stuck between three bad options: name them something new (two profiles for
+one person, and the uncertainty policy will split their speech between two
+names forever), merge them (impossible from the UI, because the merge dialog
+builds its lists from `speakersData`, which filters out pending profiles), or
+delete the profile and throw away the audio that was just collected.
+
+So `pending_candidates` scores a pending profile's embedding against every
+*registered* profile and returns them ranked, with the
+`live_attribution.min_match_confidence` / `min_match_margin` gates applied as an
+advisory `likely` flag. The UI turns each likely candidate into a one-click
+"Merge into <name>", and `merge_pending_into` reuses `merge_speakers` so the
+snippets move, the pending profile ceases to exist, and the target is
+re-refined over the larger corpus. The merge dialog now also lists pending
+profiles as merge *sources* (a pending profile is never offered as a target —
+merging one unnamed profile into another just produces a second unnamed
+profile).
+
+Three rules this shape depends on:
+
+- **Never a pending profile as a candidate.** A pending profile has no
+  identity to lend; letting it win a nearest-neighbour vote is exactly what the
+  uncertainty policy forbids.
+- **The `likely` flag is advisory only.** Nothing merges without an explicit
+  POST. A profile-vs-profile score is a cleaner comparison than a 3-second live
+  turn, which is why the live gates are conservative here — but the two scales
+  are not the same and the number must not be read as a live-turn confidence.
+- **`merge_pending_into` re-checks `is_pending_profile`.** Without it, a named
+  profile could be passed as the source and a colleague's audio moved into
+  someone else's profile.

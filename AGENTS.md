@@ -281,6 +281,8 @@ asr-mcp/
 | `/api/voiceprint/rescan/stream` | POST | Session | Rescan as an SSE stream |
 | `/api/voiceprint/pending` | GET | Session | Learned-but-unnamed speakers awaiting a name |
 | `/api/voiceprint/pending/{speaker_name}/confirm` | POST | Session | Give a pending profile a real name — the only route that makes it matchable |
+| `/api/voiceprint/pending/{speaker_name}/candidates` | GET | Session | Registered speakers this pending profile resembles, ranked, each with `likely` |
+| `/api/voiceprint/pending/{speaker_name}/merge` | POST | Session | Fold a pending profile into an existing speaker (`{"into": "<name>"}`) |
 | `/api/voiceprint/snippets/{snippet_id}` | DELETE | Session | Delete one snippet |
 | `/api/voiceprint/snippets/{snippet_id}/audio` | GET | Session | Stream snippet audio (FLAC) |
 | `/api/voiceprint/speakers/{speaker_name}` | DELETE | Session | Delete a voiceprint |
@@ -374,7 +376,7 @@ anything the rule covers.
 | 30 | Uncertain speaker: suppress the IDENTITY, keep the text; one policy module, `uncertainty.enabled: false` is the rollback | [diarization](docs/lessons/diarization-and-speakers.md) · [user docs](docs/uncertain-speakers.md) |
 | 32 | `num_speakers` selects a DIFFERENT clustering path (hard k, no greedy merge) | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 33 | Verify diarization on a SHORT clip too — 52-min files hide over-clustering | [diarization](docs/lessons/diarization-and-speakers.md) |
-| 39 | A learned-but-unnamed speaker is a PENDING profile: excluded from every match until the user names it, and the client must say so out loud | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 39 | A learned-but-unnamed speaker is a PENDING profile: excluded from every match until the user names it (or merges it into someone they already have), and the client must say so out loud | [diarization](docs/lessons/diarization-and-speakers.md) |
 
 ### ASR decoding internals (Cohere ONNX)
 | # | Rule | Detail |

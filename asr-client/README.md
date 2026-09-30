@@ -121,6 +121,13 @@ instead.
 
 ### New speakers
 
+A speaker the server hears who you have not added becomes an **unnamed
+profile**: snippets are collected, but it is excluded from every voiceprint
+match until you name it — an unnamed profile has no identity to claim. The
+client tells you when this happened, and the web UI (Voiceprints tab → Unnamed
+speakers) is where you resolve it. If the profile turns out to be somebody you
+already added, merge it rather than naming it again.
+
 If the server learns a speaker it has no voiceprint for, both clients say so:
 
 ```

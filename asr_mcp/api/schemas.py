@@ -237,6 +237,45 @@ class PendingProfileConfirmResponse(BaseModel):
     error: Optional[str] = None
 
 
+class PendingMergeRequest(BaseModel):
+    """Fold a pending profile into a speaker who is ALREADY registered.
+
+    Naming is wrong here: giving an already-registered person a second profile
+    makes the uncertainty policy split their speech between two names forever.
+    Merging moves the snippets into the existing profile and re-refines it.
+    """
+    into: str = Field(..., min_length=1, max_length=255)
+
+
+class PendingMergeResponse(BaseModel):
+    ok: bool = False
+    status: Optional[str] = None
+    #: The profile the snippets were moved into.
+    name: Optional[str] = None
+    #: The pending profile that no longer exists.
+    renamed_from: Optional[str] = None
+    snippets_moved: int = 0
+    error: Optional[str] = None
+
+
+class PendingCandidate(BaseModel):
+    """A registered speaker a pending profile resembles."""
+    name: str
+    distance: float = 0.0
+    confidence: float = 0.0
+    margin: float = 0.0
+    snippet_count: int = 0
+    #: Clears the live-attribution confidence and margin gates. Advisory only:
+    #: the user decides, the system never merges on its own.
+    likely: bool = False
+
+
+class PendingCandidatesResponse(BaseModel):
+    pending: str
+    candidates: list[PendingCandidate] = []
+    error: Optional[str] = None
+
+
 class VoiceprintSnippetListResponse(BaseModel):
     speaker_name: str
     snippets: list[SpeakerSnippetInfo]

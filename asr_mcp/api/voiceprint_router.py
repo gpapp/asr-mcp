@@ -13,6 +13,8 @@ from asr_mcp.api.schemas import (
     VoiceprintSpeakerListResponse, VoiceprintSnippetListResponse,
     RescanResponse,
     PendingProfileConfirm, PendingProfileConfirmResponse,
+    PendingCandidate, PendingCandidatesResponse, PendingMergeRequest,
+    PendingMergeResponse,
 )
 from asr_mcp.api.security import get_current_user, validate_upload_filename
 from asr_mcp.config.settings import Settings, get_settings
@@ -81,6 +83,53 @@ async def confirm_pending_profile(
         return PendingProfileConfirmResponse(**result)
     return PendingProfileConfirmResponse(ok=True, name=result["name"],
                                          renamed_from=result["renamed_from"])
+
+
+@router.get("/pending/{speaker_name}/candidates",
+             response_model=PendingCandidatesResponse)
+async def pending_profile_candidates(
+    speaker_name: str,
+    limit: int = 5,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Which registered speakers does this pending profile resemble?
+
+    A learner is very often someone who is already registered. The UI uses
+    this to offer a one-click "merge into this person" instead of forcing a
+    rename that would create a second profile for one person. Purely advisory
+    -- nothing is ever merged without an explicit POST.
+    """
+    service = _get_service(settings)
+    return PendingCandidatesResponse(
+        pending=speaker_name,
+        candidates=[PendingCandidate(**c)
+                    for c in service.pending_candidates(speaker_name, user_id=user_id,
+                                                         limit=limit)],
+    )
+
+
+@router.post("/pending/{speaker_name}/merge", response_model=PendingMergeResponse)
+async def merge_pending_profile(
+    speaker_name: str,
+    req: PendingMergeRequest,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Fold a pending profile into an EXISTING speaker and re-refine them.
+
+    The resolution when the learner turns out to be someone already
+    registered. Snippets move, the pending profile ceases to exist, and the
+    target profile is rebuilt over the larger corpus.
+    """
+    service = _get_service(settings, ensure_gpu=True)
+    result = service.merge_pending_into(speaker_name, req.into, user_id=user_id)
+    if result.get("error"):
+        return PendingMergeResponse(error=result["error"])
+    return PendingMergeResponse(ok=True, status=result.get("status"),
+                                name=result.get("into"),
+                                renamed_from=result.get("from"),
+                                snippets_moved=result.get("snippets_moved", 0))
 
 
 @router.get("/speakers/{speaker_name}/snippets", response_model=VoiceprintSnippetListResponse)

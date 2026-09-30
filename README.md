@@ -215,6 +215,15 @@ A speaker who has no voiceprint yet is learned automatically — but as a
 - Re-running the same recording **extends** the existing pending profile
   instead of creating a second one.
 
+#### "Is this someone I already added?"
+
+Every pending profile is scored against your registered speakers. When one
+looks like somebody you already have, the card offers a **Merge into …** button
+instead of making you invent a second name for the same person — two profiles
+for one person would split their speech between two names in every transcript.
+Merging moves the snippets into the existing profile and rebuilds it. Nothing
+is ever merged automatically; the flag is a suggestion.
+
 ### Diarization Pipeline
 
 Step numbers match the `# Step N` comments in

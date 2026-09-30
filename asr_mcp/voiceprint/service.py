@@ -843,6 +843,95 @@ class VoiceprintService:
             })
         return out
 
+    def pending_candidates(self, pending_name: str, user_id: str = DEFAULT_USER,
+                           limit: int = 5) -> list[dict]:
+        """Which registered speakers does this pending profile resemble?
+
+        A pending profile is very often a person who is ALREADY registered --
+        the user themselves picked up by the loopback, or a colleague they
+        registered months ago. ``confirm_pending`` rightly refuses a name that
+        is already taken, but the correct action there is a merge, not a
+        rename, and the user has no way to reach one: the merge dialog only
+        lists named speakers.
+
+        Returns every registered profile ranked by combined distance, with the
+        live-turn gates applied as advisory flags rather than a filter -- the
+        caller decides what to show.  ``likely`` marks the candidates that
+        clear ``live_attribution.min_match_confidence`` /
+        ``min_match_margin``; a pending profile scored against a *profile* is
+        a cleaner comparison than a 3s live turn is, so those bars are
+        conservative.
+
+        Returns ``[]`` when the profile has no embedding yet (learned while the
+        embedding session was unavailable); there is nothing to compare.
+        """
+        from asr_mcp.streaming.attribution import config as live_cfg
+        from asr_mcp.speaker.matcher import find_best_match
+
+        vp = self._db.get(pending_name, user_id=user_id)
+        emb = (vp or {}).get("embedding")
+        if emb is None or len(emb) == 0:
+            return []
+        # Registered profiles only: a pending profile has no identity to lend.
+        registered = self._db.list_all(user_id=user_id, include_pending=False)
+        if not registered:
+            return []
+        _, _, _, distances = find_best_match(
+            emb, (vp or {}).get("pitch_hz", 0.0), (vp or {}).get("energy_rms", 0.0),
+            registered,
+        )
+        ranked = sorted(distances.items(), key=lambda kv: kv[1]["combined"])
+        cfg = live_cfg()
+        min_conf = float(cfg["min_match_confidence"])
+        min_margin = float(cfg["min_match_margin"])
+        out = []
+        for i, (name, d) in enumerate(ranked[:max(1, limit)]):
+            runner_up = ranked[i + 1][1]["combined"] if i + 1 < len(ranked) else 1.0
+            margin = runner_up - d["combined"]
+            out.append({
+                "name": name,
+                "distance": round(d["combined"], 4),
+                "confidence": round(d.get("confidence", 0.0), 3),
+                "margin": round(margin, 4),
+                "snippet_count": self._snippets.all_speakers(
+                    user_id=user_id).get(name, {}).get("count", 0),
+                "likely": bool(d.get("confidence", 0.0) >= min_conf and margin >= min_margin),
+            })
+        return out
+
+    def merge_pending_into(self, pending_name: str, target_name: str,
+                           user_id: str = DEFAULT_USER) -> dict:
+        """Fold a pending profile into an EXISTING speaker.
+
+        The pending profile's snippets become the target's, the pending profile
+        ceases to exist, and the target is re-refined over the larger corpus.
+        This is the correct resolution when the learner turns out to be someone
+        already registered: naming them would create a second profile for one
+        person, and the uncertainty policy would then split their speech
+        between two names forever.
+        """
+        pending_name = (pending_name or "").strip()
+        target_name = (target_name or "").strip()
+        if not pending_name or not target_name:
+            return {"error": "Both a pending profile and a target speaker are required"}
+        if pending_name == target_name:
+            return {"error": "A pending profile cannot be merged into itself"}
+        vp = self._db.get(pending_name, user_id=user_id)
+        if not vp and pending_name not in self._snippets.all_speakers(user_id=user_id):
+            return {"error": f"No pending profile named {pending_name!r}"}
+        if not is_pending_profile(pending_name, vp):
+            return {"error": f"{pending_name!r} is not a pending profile"}
+        if not self._db.get(target_name, user_id=user_id) and \
+                target_name not in self._snippets.all_speakers(user_id=user_id):
+            return {"error": f"No speaker named {target_name!r} to merge into"}
+        result = self.merge_speakers(target_name, pending_name, user_id=user_id)
+        if result.get("error"):
+            return result
+        logger.info("Pending profile %r merged into existing speaker %r (%d snippets)",
+                    pending_name, target_name, result.get("snippets_moved", 0))
+        return {**result, "status": "merged_into_existing",
+                "from": pending_name, "into": target_name}
+
     def confirm_pending(self, pending_name: str, new_name: str,
                         user_id: str = DEFAULT_USER) -> dict:
         """Give a pending profile a real name, making it matchable.

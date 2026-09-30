@@ -1567,12 +1567,51 @@
         // you have not named yet. They are EXCLUDED from every voiceprint match
         // (an unnamed profile has no identity to claim), so nothing appears under
         // their name until you confirm it here.
+        //
+        // A learner is very often someone who is ALREADY registered, so each
+        // profile is scored against the named speakers and the likely ones get a
+        // "merge" button. Merging is the correct resolution there: renaming would
+        // give one person two profiles and the transcript would split between them.
+        let pendingCandidates = {};
+        let pendingData = [];
+
+        async function loadPendingCandidates(pending) {
+            const out = {};
+            await Promise.all(pending.map(async p => {
+                try {
+                    const d = await apiFetch('/pending/' + encodeURIComponent(p.name) + '/candidates');
+                    out[p.name] = d.candidates || [];
+                } catch (e) { out[p.name] = []; }
+            }));
+            return out;
+        }
+
+        function renderPendingCandidates(name) {
+            const cands = (pendingCandidates[name] || []).filter(c => c.likely);
+            if (!cands.length) return '';
+            return `<div class="note">Looks like an existing speaker &mdash; merging keeps one profile per person,
+                        naming a second one would split their speech between two names.</div>`
+                + cands.map(c => `
+                    <div class="row row-spread">
+                        <div class="meta">
+                            <strong>${escHtml(c.name)}</strong>
+                            <span>match ${(c.confidence * 100).toFixed(0)}%</span>
+                            <span>${c.snippet_count} snippets already</span>
+                        </div>
+                        <button class="btn btn-warning btn-sm" onclick="mergePending('${escHtml(name)}', '${escHtml(c.name)}')">
+                            Merge into ${escHtml(c.name)}
+                        </button>
+                    </div>`).join('');
+        }
+
         async function refreshPending() {
             const el = document.getElementById('pending-list');
             let pending = [];
             try {
+                // The response field is `speakers` (VoiceprintSpeakerListResponse).
                 const data = await apiFetch('/pending');
-                pending = data.pending || [];
+                pending = data.speakers || [];
+                pendingData = pending;
             } catch (e) {
                 el.hidden = true;
                 return;
@@ -1582,6 +1621,7 @@
                 el.innerHTML = '';
                 return;
             }
+            pendingCandidates = await loadPendingCandidates(pending);
             el.hidden = false;
             el.innerHTML = `
                 <div class="card">
@@ -1604,6 +1644,7 @@
                                 <button class="btn btn-primary btn-sm" onclick="confirmPending('${escHtml(p.name)}')">Save name</button>
                             </div>
                         </div>
+                        ${renderPendingCandidates(p.name)}
                     `).join('')}
                 </div>
             `;
@@ -1623,6 +1664,23 @@
                 await refresh();
             } catch (e) {
                 toast(e.message || 'Could not save the name', true);
+            }
+        }
+
+        async function mergePending(pendingName, targetName) {
+            if (!confirm('Merge "' + pendingName + '" into "' + targetName + '"?\n\n'
+                + 'Its snippets move into "' + targetName + '", which is then rebuilt over the larger set. '
+                + 'The unnamed profile disappears. This cannot be undone.')) return;
+            try {
+                const res = await apiFetch('/pending/' + encodeURIComponent(pendingName) + '/merge', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ into: targetName })
+                });
+                toast('Merged ' + (res.snippets_moved || 0) + ' snippet(s) into "' + targetName + '"');
+                await refresh();
+            } catch (e) {
+                toast(e.message || 'Could not merge the profile', true);
             }
         }
 
@@ -1816,10 +1874,15 @@
             const dialog = document.getElementById('mergeDialog');
             const primary = document.getElementById('mergePrimary');
             const secondary = document.getElementById('mergeSecondary');
-            const names = speakersData.map(s => s.name);
-            if (names.length < 2) { toast('Need at least two speakers to merge', true); return; }
-            primary.innerHTML = names.map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('');
-            secondary.innerHTML = names.map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('');
+            // Unnamed (pending) profiles are offered as merge SOURCES only: they
+            // have no identity yet, so merging one into another pending profile
+            // would just produce a second unnamed profile.
+            const named = speakersData.map(s => s.name);
+            const all = named.concat((pendingData || []).map(p => p.name));
+            if (all.length < 2) { toast('Need at least two speakers to merge', true); return; }
+            const opt = n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`;
+            primary.innerHTML = named.map(opt).join('');
+            secondary.innerHTML = all.map(opt).join('');
             if (names.length > 1) secondary.selectedIndex = 1;
             dialog.classList.remove('hidden');
         }

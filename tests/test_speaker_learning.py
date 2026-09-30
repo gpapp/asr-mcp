@@ -360,3 +360,103 @@ def test_confirm_pending_refuses_to_overwrite_someone(service, db):
 @pytest.mark.parametrize("bad", ["", "   ", None])
 def test_confirm_pending_requires_a_name(service, db, bad):
     assert "name is required" in service.confirm_pending("Pending x", bad, user_id="u")["error"]
+
+
+# --------------------------------------------------------------------------
+# "Is this learner someone I already have?" -- candidates + merge
+# --------------------------------------------------------------------------
+#
+# confirm_pending REFUSES a name that is already taken, which is safe but is the
+# wrong answer when the learner is a person who is already registered: renaming
+# gives one person two profiles and the uncertainty policy then splits their
+# speech between two names forever. The correct resolution is a merge, and
+# until now there was no way to reach one from the UI.
+
+def _learn(service, cluster="Speaker 5", source="meeting.wav", n=3, user="u"):
+    out = service.auto_collect_from_diarization(
+        audio_path="/tmp/meeting.wav", segments=_segs(cluster, n=n),
+        user_id=user, source_id=source, learn_new=True,
+    )
+    return (out["pending_created"] + out["pending_extended"])[0]["name"]
+
+
+def test_candidates_rank_the_nearest_registered_speaker_first(service, db):
+    from asr_mcp.db.manager import VoiceprintDB
+    vp_db = VoiceprintDB(db)
+    ref_a, ref_b = _unit(11), _unit(22)
+    vp_db.save("Alice", ref_a, user_id="u", total_speech_sec=30)
+    vp_db.save("Bob", ref_b, user_id="u", total_speech_sec=30)
+
+    pending = _learn(service)
+    # Point the learned profile squarely at Alice.
+    vp_db.save(pending, ref_a, user_id="u", total_speech_sec=20, pending=True)
+
+    cands = service.pending_candidates(pending, user_id="u")
+    assert [c["name"] for c in cands][:2] == ["Alice", "Bob"]
+    assert cands[0]["distance"] < cands[1]["distance"]
+    assert cands[0]["likely"] is True
+    # Never a pending profile as a candidate: an unnamed profile has no
+    # identity to lend.
+    assert all(not c["name"].startswith("Pending ") for c in cands)
+
+
+def test_candidates_are_empty_without_an_embedding_or_registered_speakers(service, db):
+    from asr_mcp.db.manager import VoiceprintDB
+    pending = _learn(service)
+    vp_db = VoiceprintDB(db)
+    # No registered speaker at all -> nothing to compare against.
+    assert service.pending_candidates(pending, user_id="u") == []
+    # Now a registered speaker, but the pending profile has no embedding
+    # (learned while the embedding session was unavailable). get() hands back a
+    # copy, so the row has to be blanked with SQL.
+    vp_db.save("Alice", _unit(11), user_id="u", total_speech_sec=30)
+    import sqlalchemy as sa
+    with db.get_session() as s:
+        s.execute(sa.text("UPDATE voiceprints SET embedding = x'' WHERE name = :n"),
+                  {"n": pending})
+        s.commit()
+    assert service.pending_candidates(pending, user_id="u") == []
+
+
+def test_merging_a_pending_profile_into_an_existing_speaker(service, db):
+    from asr_mcp.db.manager import VoiceprintDB
+    vp_db = VoiceprintDB(db)
+    vp_db.save("Ismael", _unit(11), user_id="u", total_speech_sec=30)
+    pending = _learn(service, n=3)
+    snips_before = len(service.list_snippets("Ismael", user_id="u"))
+
+    out = service.merge_pending_into(pending, "Ismael", user_id="u")
+    assert out.get("error") is None, out
+    assert out["status"] == "merged_into_existing"
+    assert out["snippets_moved"] == 3
+
+    # The pending profile is gone from every view...
+    assert pending not in vp_db.list_all(user_id="u", include_pending=True)
+    assert all(p["name"] != pending for p in service.pending_profiles(user_id="u"))
+    # ...and its snippets now belong to the real speaker, on disk.
+    moved = service.list_snippets("Ismael", user_id="u")
+    assert len(moved) == snips_before + 3
+    assert all(Path(s["file_path"]).exists() for s in moved)
+    # Ismael is still one ordinary, matchable profile.
+    assert "Ismael" in vp_db.list_all(user_id="u", include_pending=False)
+
+
+def test_merge_refuses_the_awkward_cases(service, db):
+    from asr_mcp.db.manager import VoiceprintDB
+    vp_db = VoiceprintDB(db)
+    vp_db.save("Ismael", _unit(11), user_id="u", total_speech_sec=30)
+    pending = _learn(service)
+
+    assert "into itself" in service.merge_pending_into(pending, pending, user_id="u")["error"]
+    assert "No speaker named" in service.merge_pending_into(pending, "Nobody", user_id="u")["error"]
+    assert "No pending profile" in service.merge_pending_into("Pending nope", "Ismael",
+                                                              user_id="u")["error"]
+    # A NAMED profile is not a pending profile: this must not be able to move
+    # a colleague's audio around. Needs a distinct target or the into-itself
+    # guard fires first.
+    vp_db.save("Bob", _unit(22), user_id="u", total_speech_sec=30)
+    assert "not a pending profile" in service.merge_pending_into("Ismael", "Bob",
+                                                                 user_id="u")["error"]
+    # Still pending after all those refusals, and still intact.
+    assert any(p["name"] == pending for p in service.pending_profiles(user_id="u"))
+    assert len(service.list_snippets(pending, user_id="u")) == 3
