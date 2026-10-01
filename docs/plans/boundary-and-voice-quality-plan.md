@@ -1,10 +1,11 @@
 # Boundary refinement & new-voice learning — improvement plan
 
-**Status:** **P0–P4 implemented** (2026-10-01). Every phase shipped behind a config flag with a
-documented rollback. The P0 A/B measurement that the plan was written to enable is in
-**section 2** — it resolved the open question rather than leaving it open. What did *not* get
-proven is stated in section 2 as well: `spectral_change` never fired on real material, and the
-`learning` distance thresholds remain calibrated on one file.
+**Status:** **P0–P4 implemented** (2026-10-01), in `c01b4fd`. Every phase shipped behind a
+config flag with a documented rollback. The P0 A/B measurement that the plan was written to
+enable is in **section 2** — it resolved the open question rather than leaving it open. **25 of
+27 steps are done; the step-by-step status, the two that are not, and why they matter are in
+section 3.** What did *not* get proven is stated in section 2 as well: `spectral_change` never
+fired on real material, and the `learning` distance thresholds remain calibrated on one file.
 **Origin:** review request — *"review how boundaries are refined, consider finding better methods. also review new voice creation … to ensure boundaries are found. create todo, ensure it works"* and *"for live transcriptions as well as pre-recorded"*.
 
 **Scope:** how speaker/turn boundaries are decided, and how a new voice is learned, on
@@ -279,6 +280,39 @@ So the first phase makes refinement measurable rather than continuing to argue a
 Each phase ships behind a config flag with a documented rollback, and is verified on ZO249
 **and** on the short ground-truth clips — a long file alone never surfaced these bugs (lesson 33).
 
+### Step status
+
+| # | Step | Status |
+|---|------|--------|
+| 1 | `boundary_refine` made real | **done** — `acoustic`, `spectral_novelty`, `lookaround_sec`, `min_gap_sec`, `min_section_sec`, `dip_ratio`, `min_dip_sec`, 4 spectral keys |
+| 2 | Per-boundary `method` + `shift_sec` logging | **done** — DEBUG per boundary, `BoundaryStats.summary()` at INFO from all four call sites |
+| 3 | A/B on ZO249 + 4 clips | **done** — section 2, with three recorded negatives |
+| 4 | P0 tests | **done** — `tests/test_boundary_engine.py`, 45 tests, frozen pre-P1 arithmetic as the oracle |
+| 5–9 | P1 one engine, one VAD pass, no deleted audio | **done** — `speaker/boundary.py`; `Diarizer.run` returns `raw_vad_sections`; three thin callers |
+| 10–17 | P2 learn from set B | **done** — with the step-11 correction above |
+| 18–20, 23 | P3 live defects | **done** — silence padding, `TimelineGuard`, WAV tail fixed, 22 tests |
+| 21 | P3 server-side turn-edge trim | **done** — `speech_gate.trim_turn_edges`, trims before the gate |
+| **22** | **Re-measure `min_match_confidence` against a real non-matcher population** | **NOT DONE** |
+| 24–26 | P4 UI bugs, docs, dead config | **done** — lessons 40/41/42; 5 dead keys removed |
+| **27** | **Rollout notes** | **PARTIAL** — the P0 A/B numbers are in section 2; the per-phase before/after attribution counts are **NOT recorded** |
+
+**Two gaps, both honest rather than forgotten:**
+
+- **Step 22.** `min_match_confidence` is still `0.60`, unchanged, and `min_match_margin: 0.10`
+  is **still unvalidated**: a single-profile menu has no runner-up, so the margin gate has
+  never been tested against a real false positive. The `0.60` value rests on a single measured
+  false positive (a 5 s turn of an unregistered speaker named at conf 0.539), not on a
+  measured population. Until it is done, live per-turn naming should be treated as a bonus and
+  the shutdown re-diarization as authoritative — which is what the `thresholds.json` comment
+  already says.
+- **Step 27.** No fixture speaker-count table exists for this work, so the effect of P2 on the
+  short ground-truth clips is **unmeasured**. That matters because of one deliberate
+  consequence: learning now reads *turns* rather than segments, and turns are coarser, so a
+  cluster whose segments all sit within `turn_merge_gap_sec` arrives as a single span →
+  `unverified:too_few_segments` → nothing learned, where previously it was. That is fail-closed
+  working as designed (a blend must not be learned), but it can *reduce* learning on some
+  material and no run has quantified by how much. Rollback: `learning.fail_closed: false`.
+
 ### P0 — Make boundary refinement measurable (prerequisite)
 
 1. Make `thresholds.json → boundary_refine` **real**: `acoustic: on|off`, `lookaround_sec`,
@@ -313,8 +347,11 @@ Each phase ships behind a config flag with a documented rollback, and is verifie
 
 10. Move `_auto_collect` **after** `_prepare_turns` in both `run_transcribe` and
     `_attribute_items_against_audio`, and cut snippets from **set B**.
-11. Trim each snippet to the VAD sections actually inside it (and pad to whole sections), so
-    a boundary cannot cut a phoneme.
+11. Trim each snippet to the VAD sections actually inside it so a boundary cannot cut a
+    phoneme. **Inward only** — turns abut by design (lesson 17), so padding *outward* to a
+    section edge would pull in the neighbour's speech and duplicate it. An edge that lands
+    inside a speech section is left where it is; only leading and trailing silence is
+    removed. *(This corrects the plan's original wording, which asked for outward padding.)*
 12. Extend pending profiles by **embedding distance** to existing pending profiles; the
     source-stem name match becomes the fallback, not the primary key.
 13. Fix the `Speaker_1` ⊂ `Speaker_10` substring collision, and make the `" #2"` collision
@@ -345,6 +382,7 @@ Each phase ships behind a config flag with a documented rollback, and is verifie
     both paths.
 22. Re-measure `min_match_confidence` (0.60) against a real non-matcher population before
     changing it, and record the genuine/false-positive margin distributions.
+    **NOT DONE — the only substantive gap in this plan.**
 23. Tests: coalescer padding makes declared span == samples actually sent; a
     `start_sample` discontinuity is detected and reported; the tail is not duplicated;
     JS / Python / server detectors remain bit-equal; a live session's refined boundaries
@@ -361,7 +399,8 @@ Each phase ships behind a config flag with a documented rollback, and is verifie
     `thresholds.json` provenance comments (including the ZO249 numbers from F4).
 26. Remove or wire up the dead configuration listed in F6.
 27. Rollout notes: record the A/B numbers from P0 step 3 here, and the before/after
-    attribution counts for every phase.
+    attribution counts for every phase. *(A/B numbers: done, section 2. Before/after
+    attribution counts: **not recorded** — see the step-status table.)*
 
 ---
 
@@ -376,11 +415,31 @@ why it is written down here rather than quietly attempted.
 
 ---
 
-## 5. Outstanding, independent of the above
+## 5. Housekeeping — closed
+
+Both items that were outstanding when this plan was written are done:
 
 - The ZO249-phase work (`uncertainty.naming_blocked_reason` + the second-pass naming gate +
-  `_split_cluster_by_cohesion` + the `learning` config section) is **verified but not
-  committed**; 230 tests pass in-image, 301 pass locally.
-- The `memories` API token is still set to the test token `sha256("podcast-test-token-2026")`.
-  The original is `eaa702985a2819e20fc7a118135e7cbe9474efdb02c51ab5f96e943058ea841b` /
-  `2026-09-28 07:40:08.825719` and **must be restored before finishing**.
+  `_split_cluster_by_cohesion` + the `learning` config section) shipped with the rest of P0–P4.
+- The `memories` API token was restored to
+  `eaa702985a2819e20fc7a118135e7cbe9474efdb02c51ab5f96e943058ea841b` /
+  `2026-09-28 07:40:08.825719`; the test token is gone and the `default` and `tester` rows were
+  never touched.
+
+## 6. What is still worth doing
+
+Not commitments — the honest residue, in the order it would pay off:
+
+1. **Step 22: measure the live match gates against a real non-matcher population.** The single
+   highest-value remaining item, because a false name is worse than no name and the current
+   value is justified by one anecdote. Needs several *distinct unregistered* speakers, not
+   corrupted audio — the earlier calibration failed precisely by measuring the wrong population.
+2. **Step 27: the per-phase attribution counts on the ground-truth clips**, which would quantify
+   the `unverified:too_few_segments` consequence described in section 3.
+3. **Calibrate `spectral_change` or remove it.** It never fired on any real material tested, its
+   thresholds are reasoned defaults, and its only evidence is a synthetic pure tone. Either move
+   `spectral_min_ratio` / `spectral_min_abs` against real gaps or drop the method and keep the
+   four-step chain.
+4. **The four `learning` distance thresholds are all the same uncalibrated `0.32`**, taken from
+   one file. They are all set to *refuse* rather than assert, so they fail safe, but a second
+   file with known speaker counts would do more than another test.
