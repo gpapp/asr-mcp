@@ -76,6 +76,14 @@ _DEFAULTS: dict[str, Any] = {
     # A short-duration speaker is still a real participant if it holds at least
     # this share of the recording's speech.
     "ghost_max_share": 0.25,
+    # If the clusterer put more than this share of all speaker windows into a
+    # single cluster, the clusters no longer correspond to people, so NO cluster
+    # may be renamed to a known voiceprint.  A tight embedding match to one
+    # profile cannot certify a cluster that mixes two speakers -- measured on a
+    # real 2-speaker podcast, the WRONG cluster scored the better match
+    # (dist 0.105 vs 0.237), so no confidence threshold can catch this.  See
+    # AGENTS.md lesson 40.
+    "max_share_for_naming": 0.75,
 }
 
 
@@ -104,6 +112,52 @@ def policy_enabled() -> bool:
 
 def retain_uncertain_text() -> bool:
     return bool(_cfg().get("retain_uncertain_text", True))
+
+
+def naming_blocked_reason(
+    cluster_sizes, cfg: Optional[dict] = None
+) -> Optional[str]:
+    """Why known-voiceprint naming must be withheld, or None to allow it.
+
+    ``cluster_sizes`` is an iterable of per-cluster window counts.  When the
+    clusterer puts more than ``max_share_for_naming`` of every window into a
+    single cluster, the clusters no longer correspond to people, so a tight
+    embedding match to one profile says nothing about who is in that cluster.
+
+    Measured on a real 2-host podcast with inserted clips from several other
+    speakers (ZO249, 3439s) forced to ``num_speakers=2``: the cluster holding
+    84.8% of the windows and the one holding 15.2% were BOTH renamed to the
+    same known speaker, and the *wrong* cluster scored the better match
+    (combined 0.105 vs 0.237) — so no confidence or margin threshold can catch
+    this, and a one-to-one claim check would only have moved the wrong name
+    onto 85% of the audio instead of 100%.
+
+    A single cluster is NOT blocked: one cluster is the normal, correct result
+    for a genuinely single-speaker recording, and there is no evidence of
+    collapse to act on.
+    """
+    conf = dict(_cfg())
+    if cfg:
+        conf.update(cfg)
+    try:
+        max_share = float(conf.get("max_share_for_naming", 0.75))
+    except (TypeError, ValueError):
+        max_share = 0.75
+
+    # NOTE: no `cluster_sizes or []` -- the caller passes a numpy bincount and
+    # truth-testing an array raises "truth value of an array is ambiguous".
+    if cluster_sizes is None:
+        cluster_sizes = []
+    sizes = [int(s) for s in cluster_sizes if int(s) > 0]
+    if len(sizes) < 2:
+        return None
+    total = sum(sizes)
+    if total <= 0:
+        return None
+    largest = max(sizes) / total
+    if largest > max_share:
+        return "cluster_collapse_%.0f%%" % round(100.0 * largest)
+    return None
 
 
 # ── Label classification ────────────────────────────────────────────────────
@@ -356,4 +410,5 @@ __all__ = [
     "confidence_source_for",
     "eligible_for_auto_collect",
     "eligible_for_learning",
+    "naming_blocked_reason",
 ]

@@ -87,7 +87,8 @@ def _restore_embedding_module():
             sys.modules["asr_mcp.speaker.embedding"] = before
 
 
-def _run(clustering, emb_a, emb_b, *, spk_a, spk_b, level_a=1.0, level_b=2.0):
+def _run(clustering, emb_a, emb_b, *, spk_a, spk_b, level_a=1.0, level_b=2.0,
+        allow_renaming=True):
     """Run the second pass with two unknown clusters and ONE known voiceprint."""
     _install_fake_embedding({level_a: emb_a, level_b: emb_b})
 
@@ -115,7 +116,9 @@ def _run(clustering, emb_a, emb_b, *, spk_a, spk_b, level_a=1.0, level_b=2.0):
                            "unknown_merge_threshold": 0.25,
                            "min_speaker_duration_sec": 1.0}}
     out, out_profiles = clustering.collapse_unknown_speakers_second_pass(
-        segments, audio, SR, known, profiles, state=object(), cfg=cfg
+        segments, audio, SR, known, profiles, state=object(), cfg=cfg,
+        allow_renaming=allow_renaming,
+        blocked_reason=None if allow_renaming else "cluster_collapse_85%",
     )
     return out, out_profiles
 
@@ -187,6 +190,46 @@ def test_disabled_second_pass_returns_segments_untouched(clustering):
         state=object(), cfg={"second_pass": {"enabled": False}},
     )
     assert [s["speaker"] for s in out] == ["Speaker 1", "Speaker 2"]
+
+
+# --- Run-level naming block ----------------------------------------------
+#
+# ZO249, `?num_speakers=2`: the cluster holding 84.8% of all windows is a blend
+# of the host and several inserted clips, yet it matched Gergely Papp at
+# combined 0.197 / conf 0.61 — which CLEARS min_identity_confidence.  The
+# confidence gate therefore cannot catch it, and gating only step 9
+# (match_known_speakers_full) merely moved the false name here, to step 12.
+# `uncertainty.naming_blocked_reason` decides this for the whole run and the
+# decision is threaded into both steps.
+
+
+def test_run_level_block_withholds_the_rename(clustering):
+    """A blocked run names nobody, however well the cluster matches."""
+    out, _ = _run(clustering, EMB_SAME_A, EMB_SAME_B,
+                  spk_a="Speaker 1", spk_b="Speaker 2",
+                  allow_renaming=False)
+    speakers = {s["speaker"] for s in out}
+    assert "Gergely Papp" not in speakers
+    assert all(s.startswith("Speaker ") for s in speakers)
+
+
+def test_run_level_block_still_merges_duplicates(clustering):
+    """Steps 5 and 6 assert no identity, so they must still run.
+
+    Two clusters 0.02 apart are the same person split in two; folding them is
+    safe without a name, and skipping it would leave a phantom speaker.
+    """
+    out, _ = _run(clustering, EMB_SAME_A, EMB_SAME_B,
+                  spk_a="Speaker 1", spk_b="Speaker 2",
+                  allow_renaming=False)
+    assert len({s["speaker"] for s in out}) == 1
+
+
+def test_naming_is_not_blocked_by_default(clustering):
+    """The gate must not be a blanket refusal: a strong match still names."""
+    out, _ = _run(clustering, EMB_SAME_A, EMB_SAME_B,
+                  spk_a="Speaker 1", spk_b="Speaker 2")
+    assert "Gergely Papp" in {s["speaker"] for s in out}
 
 
 # --- Identification gate -------------------------------------------------

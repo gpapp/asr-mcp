@@ -196,3 +196,43 @@ def test_apply_identity_uses_diarization_source_for_generic_names(uncertainty):
     uncertainty.apply_identity(segs, "Speaker 3", "Speaker 1")
     assert segs[0]["speaker_source"] == "diarization_cluster"
     assert "speaker_confidence" not in segs[0], "no evidence -> no claim"
+
+
+# --------------------------------------------------------------------------
+# naming_blocked_reason: a collapsed cluster may not be named at all
+# --------------------------------------------------------------------------
+#
+# Measured on ZO249 (3439s, 2 hosts + inserted clips) forced to
+# num_speakers=2: 1376 windows -> 2 clusters, c0=84.8% / c1=15.2%. BOTH were
+# renamed to the same known speaker, and the WRONG cluster scored the better
+# match (combined 0.105 vs 0.237) -- so neither a confidence threshold nor a
+# one-to-one claim check catches it. Only refusing to name can.
+
+def test_a_balanced_cluster_allows_naming(uncertainty):
+    assert uncertainty.naming_blocked_reason([600, 300, 200]) is None
+
+
+def test_a_collapsed_cluster_blocks_naming(uncertainty):
+    reason = uncertainty.naming_blocked_reason([1167, 209])
+    assert reason is not None
+    assert "cluster_collapse" in reason
+    assert "85" in reason
+
+
+def test_a_single_cluster_is_never_blocked(uncertainty):
+    # One cluster is the correct result for a genuinely single-speaker
+    # recording, so there is no evidence of collapse to act on.
+    assert uncertainty.naming_blocked_reason([1000]) is None
+    assert uncertainty.naming_blocked_reason([]) is None
+    assert uncertainty.naming_blocked_reason(None) is None
+
+
+def test_the_naming_block_threshold_is_configurable(uncertainty):
+    # ZO249's default-path balance (56.3% largest) must not be blocked...
+    assert uncertainty.naming_blocked_reason([775, 601]) is None
+    # ...but it is blocked once the operator tightens the limit.
+    assert uncertainty.naming_blocked_reason([775, 601], {"max_share_for_naming": 0.5})
+
+
+def test_zero_sized_clusters_are_ignored(uncertainty):
+    assert uncertainty.naming_blocked_reason([10, 0, 0]) is None

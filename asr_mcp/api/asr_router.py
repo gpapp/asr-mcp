@@ -27,7 +27,10 @@ from asr_mcp.speaker.attribution import (
     attribute_items, attribute_span, speaker_for_span,
 )
 from asr_mcp.speaker.uncertainty import SOURCE_UNKNOWN, setting
-from asr_mcp.speaker.vad import split_at_energy_dips
+# NOTE: ``speaker.vad`` is deliberately NOT imported at module level. It pulls in
+# torch, which would make this router unimportable (and therefore untestable)
+# without the ML stack. The boundary engine it used to import from is
+# ``speaker/boundary.py``, which is numpy-only.
 
 logger = logging.getLogger("asr_mcp.api.asr_router")
 router = APIRouter(prefix="/asr", tags=["ASR"])
@@ -348,59 +351,25 @@ def _transcribe_file(audio_np, turns, sample_rate=16000, progress_cb=None, langu
 
 def _gap_boundary(audio, gap_start_sec, gap_end_sec, sample_rate=16000,
                   frame_ms=20.0, dip_ratio=0.35, min_dip_sec=0.12):
-    """Pick the cut point inside a gap: the centre of its quietest pause.
+    """Deprecated shim — the energy chain now lives in ``speaker/boundary.py``.
 
-    Frame RMS energies are computed over the gap; the longest run below
-    *dip_ratio* of the peak (same heuristic as split_at_energy_dips) is the
-    real inter-speaker pause and the cut goes to its centre, so the boundary
-    never lands mid-word. Falls back to the single quietest frame, then to
-    the midpoint, when no dip is found (continuous speech or no audio).
+    ``cut_between`` reproduces this arithmetic exactly; this wrapper only exists
+    so nothing out-of-tree breaks. The returned value is the midpoint when there
+    is nothing to decide.
     """
-    import numpy as np
+    from asr_mcp.speaker.boundary import energy_dip_cut, quietest_frame_cut
 
-    mid = (gap_start_sec + gap_end_sec) / 2.0
-    if audio is None or len(audio) == 0:
-        return mid
-    s = max(0, int(gap_start_sec * sample_rate))
-    e = min(len(audio), int(gap_end_sec * sample_rate))
-    frame_len = max(1, int(frame_ms / 1000 * sample_rate))
-    if e - s < 2 * frame_len:
-        return mid
-    chunk = audio[s:e].astype(np.float32)
-    energies = [
-        float(np.sqrt(np.mean(chunk[i:i + frame_len] ** 2)))
-        for i in range(0, len(chunk) - frame_len + 1, frame_len)
-    ]
-    if not energies:
-        return mid
-    max_e = max(energies)
-    if max_e < 1e-8:
-        return mid
-    thresh = max_e * dip_ratio
-    runs = []
-    i = 0
-    while i < len(energies):
-        if energies[i] < thresh:
-            j = i
-            while j < len(energies) and energies[j] < thresh:
-                j += 1
-            runs.append((i, j))
-            i = j
-        else:
-            i += 1
-    min_frames = max(1, int(round(min_dip_sec * 1000 / frame_ms)))
-    eligible = [r for r in runs if r[1] - r[0] >= min_frames]
-    if eligible:
-        centre_idx = len(energies) / 2.0
-        best = max(
-            eligible,
-            key=lambda r: (r[1] - r[0], -abs((r[0] + r[1]) / 2.0 - centre_idx)),
+    cut = energy_dip_cut(
+        audio, gap_start_sec, gap_end_sec, sample_rate,
+        dip_ratio=dip_ratio, min_dip_sec=min_dip_sec, frame_ms=frame_ms,
+    )
+    if cut is None:
+        cut = quietest_frame_cut(
+            audio, gap_start_sec, gap_end_sec, sample_rate, frame_ms=frame_ms,
         )
-        cut_frame = (best[0] + best[1]) // 2
-    else:
-        cut_frame = min(range(len(energies)), key=lambda k: energies[k])
-    cut_sample = s + cut_frame * frame_len + frame_len // 2
-    return min(max(cut_sample / sample_rate, gap_start_sec), gap_end_sec)
+    if cut is None:
+        return (gap_start_sec + gap_end_sec) / 2.0
+    return cut
 
 
 def _raw_vad_sections(audio, sample_rate):
@@ -513,44 +482,32 @@ def _speaker_refs(turns, audio, sample_rate, known_speakers=None):
 
 
 def _best_split(owners, weights):
-    """Best cut index k (before section k) minimising weighted disagreements.
+    """Deprecated shim — see ``asr_mcp.speaker.boundary.best_split``."""
+    from asr_mcp.speaker.boundary import best_split
 
-    owners[i] = 0 for the left turn's speaker, 1 for the right turn's.
-    Cost of cut k: right-owned sections left of k plus left-owned sections
-    right of k, weighted by embedding-distance margin (confident mistakes
-    cost more). Same-speaker boundaries (all one side) collapse to k = n.
-    """
-    n = len(owners)
-    if n == 0:
-        return 0
-    best_k, best_cost = 0, float("inf")
-    for k in range(n + 1):
-        cost = 0.0
-        for i in range(k):
-            if owners[i] == 1:
-                cost += weights[i]
-        for i in range(k, n):
-            if owners[i] == 0:
-                cost += weights[i]
-        if cost < best_cost - 1e-12:
-            best_cost = cost
-            best_k = k
-    return best_k
+    return best_split(list(owners), list(weights))
 
 
-def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None):
+def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None,
+                                sections=None, stats=None):
     """Exact turn boundaries from uncollapsed VAD sections + voiceprints.
 
-    For every gap between consecutive turns: collect the raw VAD sections
-    spanning it, embed each one, attribute it to the better-matching adjacent
-    turn speaker (known voiceprint or reference embedding of that speaker's
-    own turn audio), find the ownership split, then extend both turns to a
-    single shared cut at the exact start of the first right-owned section
-    (or the gap end when the gap belongs entirely to the left speaker).
-    Full timeline coverage is preserved; gaps without usable sections or
-    references are left for the energy-dip fallback in _prepare_turns.
+    Thin caller of ``speaker/boundary.py::refine_gap``: this function supplies the
+    raw VAD sections, the two speaker references and a section embedder, and the
+    engine owns the ownership split, the fallback chain and the clamping.  The
+    same arithmetic used to be written out here for a third time (with a
+    different lookaround and a different minimum section length than the
+    pipeline's copy, so the two disagreed on the same gap).
+
+    ``sections`` lets the caller hand over the Silero pass the diarizer already
+    made over this file. When it is ``None`` (the ``/attribution`` path where no
+    diarizer ran) the module-level ``_raw_vad_sections`` fallback is used, which
+    produces the identical list.
+
+    Gaps without usable sections or references are still closed — by the energy
+    chain instead of by the caller — so the timeline stays fully covered.
     """
-    import numpy as np
+    from asr_mcp.speaker.boundary import BoundaryStats, refine_gap
 
     if not turns or audio is None or len(audio) == 0 or len(turns) < 2:
         return turns
@@ -563,11 +520,12 @@ def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None):
     if not gaps:
         return turns
 
-    try:
-        sections = _raw_vad_sections(audio, sample_rate)
-    except Exception as e:
-        logger.warning("Uncollapsed VAD failed during boundary refinement: %s", e)
-        return turns
+    if sections is None:
+        try:
+            sections = _raw_vad_sections(audio, sample_rate)
+        except Exception as e:
+            logger.warning("Uncollapsed VAD failed during boundary refinement: %s", e)
+            return turns
     if not sections:
         return turns
 
@@ -576,10 +534,15 @@ def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None):
     except Exception as e:
         logger.warning("Speaker reference embeddings failed: %s", e)
         return turns
-    if not refs:
-        return turns
 
     sections = sorted(sections, key=lambda s: s["start"])
+    own_stats = stats is None
+    stats = stats if stats is not None else BoundaryStats()
+
+    def _embed(selected):
+        return [_embed_section(audio, sec["start"], sec["end"], sample_rate)
+                for sec in selected]
+
     refined = 0
     for i, gap_start, gap_end in gaps:
         left = turns[i]
@@ -588,72 +551,84 @@ def _refine_boundaries_with_vad(turns, audio, sample_rate, known_speakers=None):
         ref_r = refs.get(right.get("speaker"))
         if ref_l is None or ref_r is None:
             continue
-        gap_secs = [
-            s for s in sections
-            if s["end"] > gap_start and s["start"] < gap_end
-        ]
-        owners, weights, valid = [], [], []
-        for s in gap_secs:
-            emb = _embed_section(audio, s["start"], s["end"], sample_rate)
-            if emb is None:
-                continue
-            sa = float(np.dot(emb, ref_l))
-            sb = float(np.dot(emb, ref_r))
-            owners.append(0 if sa >= sb else 1)
-            weights.append(abs(sa - sb) + 1e-3)
-            valid.append(s)
-        if not valid:
-            continue
-        k = _best_split(owners, weights)
-        if k < len(valid):
-            cut = float(valid[k]["start"])
-            cut = min(max(cut, gap_start), gap_end)
-        else:
-            cut = gap_end
-        n_left = sum(1 for o in owners if o == 0)
-        logger.info(
-            "Boundary refinement %d: %.2f-%.2fs, %d VAD sections "
-            "(%d left / %d right), cut at %.2fs",
-            i, gap_start, gap_end, len(valid), n_left, len(valid) - n_left, cut,
+        refine_gap(
+            left, right, audio,
+            {
+                "sections": sections,
+                "embed_sections": _embed,
+                "left": ref_l,
+                "right": ref_r,
+                "left_start": float(left["start"]),
+                "right_end": float(right["end"]),
+                "sample_rate": sample_rate,
+                "stats": stats,
+            },
         )
-        left["end"] = float(cut)
-        right["start"] = float(cut)
         refined += 1
     if refined:
-        logger.info("Refined %d/%d turn boundaries via VAD voiceprint attribution",
+        logger.info("Refined %d/%d turn boundaries via the boundary engine",
                     refined, len(gaps))
+    if own_stats and len(stats):
+        logger.info(stats.summary())
+    return turns
+
+
+def _close_residual_gaps(turns, audio, sample_rate, stats=None):
+    """Close every gap still open with the boundary engine's energy chain.
+
+    No VAD sections and no references are offered on purpose: this is the pass
+    that runs for boundaries the VAD pass could not decide, and it must never
+    repeat the (expensive, identity-based) work that pass already did.
+    """
+    from asr_mcp.speaker.boundary import refine_gap
+
+    if not turns:
+        return turns
+    for i in range(len(turns) - 1):
+        if float(turns[i + 1]["start"]) - float(turns[i]["end"]) <= 1e-3:
+            continue
+        refine_gap(
+            turns[i], turns[i + 1], audio,
+            {"sample_rate": sample_rate, "stats": stats},
+        )
     return turns
 
 
 def _prepare_turns(segments, audio_duration_sec=None, audio=None,
-                   sample_rate=16000, known_speakers=None):
+                   sample_rate=16000, known_speakers=None,
+                   raw_vad_sections=None):
     """Merge diarized segments into turns, split long ones, close gaps.
 
     Boundaries are first refined exactly: every gap is stepped through using
     uncollapsed VAD sections attributed to the adjacent speaker by voiceprint
-    similarity (_refine_boundaries_with_vad), so each turn is extended to the
-    exact length of its attributed speech. Any gap still open (no VAD
-    sections, no references, VAD failure) falls back to the energy-dip cut
-    (_gap_boundary). Every second of the timeline ends up covered by exactly
-    one transcription turn. Edges are extended to the file start/end as well.
+    similarity (``_refine_boundaries_with_vad``), so each turn is extended to the
+    exact length of its attributed speech. Any gap still open (no VAD sections,
+    no references, VAD failure) is closed by the same boundary engine's fallback
+    chain (``_close_residual_gaps``). Every second of the timeline ends up covered
+    by exactly one transcription turn. Edges are extended to the file start/end as
+    well.
+
+    ``raw_vad_sections`` is the diarizer's Silero pass for this file. Passing it
+    saves a second full-file VAD run; omitting it falls back to the router's own
+    pass, which returns the same sections.
     """
+    from asr_mcp.speaker.boundary import BoundaryStats
+
     turns = _merge_into_turns(segments)
     split = []
     for t in turns:
         split.extend(_split_long_turn(t))
+    stats = BoundaryStats()
     try:
         split = _refine_boundaries_with_vad(
             split, audio, sample_rate, known_speakers,
+            sections=raw_vad_sections, stats=stats,
         )
     except Exception as e:
         logger.warning("VAD voiceprint boundary refinement failed: %s", e)
-    for i in range(len(split) - 1):
-        gap_start = split[i]["end"]
-        gap_end = split[i + 1]["start"]
-        if gap_end - gap_start > 1e-3:
-            cut = _gap_boundary(audio, gap_start, gap_end, sample_rate)
-            split[i]["end"] = cut
-            split[i + 1]["start"] = cut
+    _close_residual_gaps(split, audio, sample_rate, stats=stats)
+    if len(stats):
+        logger.info(stats.summary())
     if split and audio_duration_sec is not None:
         if split[0]["start"] > 1e-3:
             split[0]["start"] = 0.0
@@ -724,13 +699,14 @@ def _merge_consecutive_same_speaker_results(results, max_gap_sec=None):
 
 
 def _transcribe_diarized(audio_np, segments, sample_rate=16000, known_speakers=None,
-                         language="auto"):
+                         language="auto", raw_vad_sections=None):
     turns = _prepare_turns(
         segments,
         audio_duration_sec=len(audio_np) / sample_rate,
         audio=audio_np,
         sample_rate=sample_rate,
         known_speakers=known_speakers,
+        raw_vad_sections=raw_vad_sections,
     )
     _switch_to_backend_phase()
     all_results = _transcribe_file(audio_np, turns or segments, sample_rate,
@@ -790,22 +766,41 @@ async def _sse_put(queue: asyncio.Queue, evt) -> None:
     await asyncio.sleep(0.01)
 
 
-def _auto_collect(vp_service, *, audio_path, segments, user_id, source_id,
-                  log_prefix="") -> dict:
+async def _auto_collect(vp_service, *, audio_path, segments, user_id, source_id,
+                       log_prefix="", vad_sections=None) -> dict:
     """Run collect+learn and log both outcomes in one place.
 
     ``learn_new=True`` is what makes a previously-unknown colleague appear in
     the Voiceprints tab as a PENDING profile. It is deliberately not a
     voiceprint until named, so this can never turn an unidentified cluster
     into a confident label later.
+
+    ``segments`` must be the boundary set the transcript is attributed on — the
+    **turns**, not the raw diarization segments (phase P2 of
+    docs/plans/boundary-and-voice-quality-plan.md, finding F1). A snippet cut
+    on a boundary the transcript never shows is embedded verbatim, and that
+    embedding is then preferred as a reference for cutting the *next* run's
+    boundaries, so the error compounds.
+
+    ``vad_sections`` (the diarizer's uncollapsed Silero pass for this file) is
+    what the learner trims each snippet edge onto, so an edge cannot land in
+    the middle of a phoneme.
+
+    The heavy work runs in an executor (lesson 19): every caller is an
+    ``async def`` request body.
     """
-    out = vp_service.auto_collect_from_diarization(
+    from asr_mcp.voiceprint.utils import AudioSegmentSource
+
+    out = await vp_service.auto_collect_from_diarization_async(
         audio_path=audio_path, segments=segments, user_id=user_id,
         source_id=source_id, learn_new=True,
+        vad_sections=vad_sections,
+        source=AudioSegmentSource(audio_path),
     ) or {}
     collected = out.get("collected") or []
     created = out.get("pending_created") or []
     extended = out.get("pending_extended") or []
+    skipped = out.get("learn_skipped") or []
     if collected:
         logger.info("%sAuto-collected %d snippets for user %s",
                     log_prefix, len(collected), user_id)
@@ -816,6 +811,9 @@ def _auto_collect(vp_service, *, audio_path, segments, user_id, source_id,
     for prof in extended:
         logger.info("%sAdded %.1fs to pending profile %r (now %d snippet(s))",
                     log_prefix, prof["speech_sec"], prof["name"], prof["snippets"])
+    for miss in skipped:
+        logger.info("%sDid NOT learn cluster %r: %s",
+                    log_prefix, miss.get("cluster"), miss.get("reason"))
     out["pending_total"] = len(created) + len(extended)
     return out
 
@@ -880,6 +878,8 @@ async def diarize_endpoint(
         return DiarizeResponse(segments=[], total_time_sec=0, error=result["error"])
 
     segments = result.get("segments", [])
+    # Not part of the response; the Silero sections belong to turn refinement.
+    result.pop("raw_vad_sections", None)
 
     try:
         from asr_mcp.db.manager import DatabaseManager
@@ -887,8 +887,8 @@ async def diarize_endpoint(
         db = DatabaseManager(settings.db_path)
         vp_service = VoiceprintService(settings.data_dir, db)
         vp_service.set_voices_dir(settings.voices_dir)
-        _auto_collect(vp_service, audio_path=req.wav_path, segments=segments,
-                      user_id=user_id, source_id=None)
+        await _auto_collect(vp_service, audio_path=req.wav_path,
+                            segments=segments, user_id=user_id, source_id=None)
     except Exception as e:
         logger.warning("Auto-collect failed: %s", e)
 
@@ -980,16 +980,20 @@ async def diarize_upload(
             )
 
             segments = result.get("segments", [])
+            # Popped before the whole dict is streamed: raw_vad_sections is
+            # hundreds of VAD sections and is consumed by turn refinement, not by
+            # the client.
+            result.pop("raw_vad_sections", None)
             try:
                 from asr_mcp.db.manager import DatabaseManager
                 from asr_mcp.voiceprint.service import VoiceprintService
                 db = DatabaseManager(settings.db_path)
                 vp_service = VoiceprintService(settings.data_dir, db)
                 vp_service.set_voices_dir(settings.voices_dir)
-                _auto_collect(vp_service, audio_path=str(wav_path),
-                              segments=segments, user_id=user_id,
-                              source_id=file.filename,
-                              log_prefix="[%s] " % file.filename)
+                await _auto_collect(vp_service, audio_path=str(wav_path),
+                                    segments=segments, user_id=user_id,
+                                    source_id=file.filename,
+                                    log_prefix="[%s] " % file.filename)
             except Exception as e:
                 logger.warning("Auto-collect failed: %s", e)
 
@@ -1059,6 +1063,7 @@ async def transcribe_endpoint(
     language = str(req.language or "auto").strip().lower() or "auto"
 
     segments = diarization.get("segments", [])
+    raw_vad_sections = diarization.pop("raw_vad_sections", None)
     if not segments:
         _switch_to_backend_phase()
         result = transcribe_audio_sync(audio=audio_np, language=language)
@@ -1069,7 +1074,8 @@ async def transcribe_endpoint(
 
     results = _transcribe_diarized(audio_np, segments, sr,
                                    known_speakers=known_speakers,
-                                   language=language)
+                                   language=language,
+                                   raw_vad_sections=raw_vad_sections)
 
     total_time = sum(r.inference_time_sec for r in results)
     return TranscribeResponse(results=results, total_time_sec=total_time)
@@ -1152,6 +1158,11 @@ async def transcribe_upload(
 
             segments = diarization.get("segments", [])
             audio_dur = diarization.get("audio_duration_sec", 0.0)
+            # The diarizer already ran Silero over this file; reuse its sections
+            # instead of running the same model over the same audio a second time.
+            # Popped because ``diarization`` is persisted verbatim as the
+            # transcript record and these are hundreds of sections, not content.
+            raw_vad_sections = diarization.pop("raw_vad_sections", None)
 
             def _done_event(result):
                 processing = round(time.monotonic() - job_t0, 1)
@@ -1205,28 +1216,6 @@ async def transcribe_upload(
                 except Exception as e:
                     logger.warning("Failed to save transcription: %s", e)
 
-            pending_profiles = []
-            try:
-                from asr_mcp.db.manager import DatabaseManager
-                from asr_mcp.voiceprint.service import VoiceprintService
-                db = DatabaseManager(settings.db_path)
-                vp_service = VoiceprintService(settings.data_dir, db)
-                vp_service.set_voices_dir(settings.voices_dir)
-                learned = _auto_collect(
-                    vp_service, audio_path=str(wav_path),
-                    segments=segments, user_id=user_id,
-                    source_id=file.filename,
-                    log_prefix="[%s] " % file.filename)
-                # Surfaced to the client: a learned speaker stays invisible until it is
-                # named, so the user has to be told or their next run will still
-                # read UNKNOWN for that person.
-                pending_profiles = (
-                    (learned.get("pending_created") or [])
-                    + (learned.get("pending_extended") or [])
-                )
-            except Exception as e:
-                logger.warning("Auto-collect failed: %s", e)
-
             turns = []
             if segments:
                 try:
@@ -1236,10 +1225,47 @@ async def transcribe_upload(
                         audio=audio_np,
                         sample_rate=sr or 16000,
                         known_speakers=known_speakers or None,
+                        raw_vad_sections=raw_vad_sections,
                     )
                 except Exception as e:
                     logger.warning("Boundary refinement failed: %s", e)
                     turns = list(segments)
+
+            # LEARN FROM THE BOUNDARIES THE TRANSCRIPT USES (phase P2, finding
+            # F1).  This used to run BEFORE _prepare_turns and cut snippets at
+            # the raw diarization-segment boundary -- a boundary the transcript
+            # never shows, and two of whose three placements are an arithmetic
+            # midpoint, so a mid-word cut was the NORMAL case.  Because a
+            # learned embedding is preferred as a reference for cutting future
+            # boundaries (pipeline._get_speaker_ref, _speaker_refs), that fed
+            # itself run over run.  ``turns`` is set B, the set display_segments
+            # is overwritten with and attribute_items runs on; ``segments`` (set
+            # A) is the fallback for when refinement produced nothing.
+            pending_profiles = []
+            learn_spans = turns or list(segments)
+            if learn_spans:
+                try:
+                    from asr_mcp.db.manager import DatabaseManager
+                    from asr_mcp.voiceprint.service import VoiceprintService
+                    db = DatabaseManager(settings.db_path)
+                    vp_service = VoiceprintService(settings.data_dir, db)
+                    vp_service.set_voices_dir(settings.voices_dir)
+                    learned = await _auto_collect(
+                        vp_service, audio_path=str(wav_path),
+                        segments=learn_spans, user_id=user_id,
+                        source_id=file.filename,
+                        log_prefix="[%s] " % file.filename,
+                        vad_sections=raw_vad_sections,
+                    )
+                    # Surfaced to the client: a learned speaker stays invisible until it is
+                    # named, so the user has to be told or their next run will still
+                    # read UNKNOWN for that person.
+                    pending_profiles = (
+                        (learned.get("pending_created") or [])
+                        + (learned.get("pending_extended") or [])
+                    )
+                except Exception as e:
+                    logger.warning("Auto-collect failed: %s", e)
             display_segments = [
                 {
                     "start": t["start"],
@@ -1636,29 +1662,8 @@ async def _attribute_items_against_audio(
 
     audio_dur = float(diarization.get("audio_duration_sec", 0.0) or 0.0)
     segments = diarization.get("segments", [])
-
-    # Learn unknown speakers from this recording. Unnamed speakers become
-    # PENDING profiles: they accumulate snippets and are excluded from
-    # matching until the user names them, so learning a colleague can never
-    # produce a confident misattribution.
-    pending_profiles: list[dict] = []
-    if learn_new and segments:
-        try:
-            from asr_mcp.db.manager import DatabaseManager
-            from asr_mcp.voiceprint.service import VoiceprintService
-            db = DatabaseManager(settings.db_path)
-            vp_service = VoiceprintService(settings.data_dir, db)
-            vp_service.set_voices_dir(settings.voices_dir)
-            learned = _auto_collect(
-                vp_service, audio_path=audio_path, segments=segments,
-                user_id=user,
-                source_id=(metadata or {}).get("uploaded_filename"),
-                log_prefix="[re-attribute] ",
-            )
-            pending_profiles = (learned.get("pending_created") or []) + \
-                (learned.get("pending_extended") or [])
-        except Exception as e:
-            logger.warning("Speaker learning failed during re-attribution: %s", e)
+    # Reuse the diarizer's Silero pass (see the note in run_transcribe).
+    raw_vad_sections = diarization.pop("raw_vad_sections", None)
 
     # No turns: fall back to one unknown turn over the whole timeline, so the
     # text survives with an explicit uncertain identity (uncertainty policy:
@@ -1676,9 +1681,37 @@ async def _attribute_items_against_audio(
             audio=audio_np,
             sample_rate=sr if audio_np is not None else 16000,
             known_speakers=known_speakers,
+            raw_vad_sections=raw_vad_sections,
         )
     else:
         turns = [{"start": 0.0, "end": audio_dur, "speaker": None}]
+
+    # Learn unknown speakers from this recording, AFTER the turns exist and FROM
+    # the turns (phase P2, finding F1) -- the same boundary set the text below is
+    # attributed on and the same set the caller was shown. Unnamed speakers
+    # become PENDING profiles: they accumulate snippets and are excluded from
+    # matching until the user names them, so learning a colleague can never
+    # produce a confident misattribution.
+    pending_profiles: list[dict] = []
+    learn_spans = turns or list(segments)
+    if learn_new and learn_spans:
+        try:
+            from asr_mcp.db.manager import DatabaseManager
+            from asr_mcp.voiceprint.service import VoiceprintService
+            db = DatabaseManager(settings.db_path)
+            vp_service = VoiceprintService(settings.data_dir, db)
+            vp_service.set_voices_dir(settings.voices_dir)
+            learned = await _auto_collect(
+                vp_service, audio_path=audio_path, segments=learn_spans,
+                user_id=user,
+                source_id=(metadata or {}).get("uploaded_filename"),
+                log_prefix="[re-attribute] ",
+                vad_sections=raw_vad_sections,
+            )
+            pending_profiles = (learned.get("pending_created") or []) + \
+                (learned.get("pending_extended") or [])
+        except Exception as e:
+            logger.warning("Speaker learning failed during re-attribution: %s", e)
 
     starts = [float(t["start"]) for t in turns]
     runs = attribute_items(items, turns, starts)

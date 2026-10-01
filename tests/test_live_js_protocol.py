@@ -119,9 +119,15 @@ def test_js_detector_defaults_match_server_config():
         f"live.js sets keys the server does not know: {set(js) - set(server)}"
     )
     # The server's streaming section also carries knobs that have no browser
-    # equivalent (its own queue, VAD gate and overflow policy). Every other key
-    # must be mirrored, or the browser silently falls back to its own default
-    # and moves turn boundaries away from the server's.
+    # equivalent. Three groups, all deliberately server-side:
+    #   * the decode queue and its overflow policy,
+    #   * the Silero speech gate and the edge trim that runs just before it --
+    #     both need the VAD model, which lives on the server.  The client
+    #     declares the boundary; the SERVER moves it, and reports the refined
+    #     span back, so the client never needs these knobs.
+    #   * the timeline guard that validates the client's declared start_sample.
+    # Every other key must be mirrored, or the browser silently falls back to
+    # its own default and moves turn boundaries away from the server's.
     server_only = set(server) - set(js)
     assert server_only == {
         "queue_size",             # server-side decode queue
@@ -130,6 +136,13 @@ def test_js_detector_defaults_match_server_config():
         "speech_gate_enabled",    # ditto
         "min_speech_prob",        # ditto
         "min_speech_ratio",       # ditto
+        "edge_trim_enabled",      # server-side Silero edge refinement
+        "edge_frame_threshold",   # ditto
+        "edge_max_trim_sec",      # ditto
+        "edge_max_trim_ratio",    # ditto
+        "timeline_overlap_tolerance_sec",   # server-side timeline guard
+        "timeline_max_lead_sec",            # ditto
+        "timeline_max_lead_ratio",          # ditto
     }, f"unmirrored server endpointing keys: {server_only}"
 
 
@@ -505,12 +518,14 @@ def test_finish_sends_the_open_turn_before_the_flush_frame():
     header = proto.TURN_HEADER_SIZE
 
     assert result["openBefore"] is True, "harness signal ended mid-turn"
-    # The two tones merge into one 31744-sample turn (the 0.5s gap is inside
-    # merge_gap_sec), plus a 24-byte header, so 63512 bytes of frame.
+    # The two tones merge into one 34304-sample turn -- 19456 + a 2560-sample
+    # silence pad for the 0.5s gap (inside merge_gap_sec) + 12288 -- plus a
+    # 24-byte header, so 68632 bytes of frame. The pad is what keeps the tail's
+    # audio on its true timeline; see TurnCoalescer in turn_detector.py.
     assert result["turns"] == 1, f"expected the flushed turn to be sent, got {result}"
-    assert result["turnBytes"] == [header + 31744 * 2], (
+    assert result["turnBytes"] == [header + 34304 * 2], (
         f"the flushed turn lost audio: {result['turnBytes']} "
-        f"(want [{header + 31744 * 2}])"
+        f"(want [{header + 34304 * 2}])"
     )
     assert result["control"] == 1, "MSG_FLUSH must follow the turns, not precede them"
 

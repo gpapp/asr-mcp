@@ -30,6 +30,15 @@ pytest.importorskip("torch", reason="voiceprint service imports torch")
 from asr_mcp.db.manager import DatabaseManager, VoiceprintDB  # noqa: E402
 
 
+# The ``service`` fixture writes a real 400 s WAV and records it here. Since
+# phase P2 the learner slices that file in memory through ``AudioSegmentSource``,
+# which resolves ``load_audio`` in ``voiceprint.utils`` -- so a test that passes
+# a made-up path no longer gets a stubbed segment, it gets a failed decode that
+# surfaces as "unverified:too_few_embeddings". Tests therefore read the real path
+# from here instead of inventing one.
+_WAV: dict = {}
+
+
 def _unit(seed: int = 0) -> np.ndarray:
     """A deterministic, L2-normalised embedding vector.
 
@@ -179,12 +188,17 @@ def service(db, tmp_path, monkeypatch):
         voices_dir = tmp_path / "voices"
     S.voices_dir.mkdir()
 
-    # 60s of deterministic audio; the slice is what matters, not the content.
+    # 400s of deterministic audio.  Since phase P2 the learner slices this file
+    # IN MEMORY through the request-wide ``AudioSegmentSource`` instead of
+    # calling ``load_audio_segment`` per span, so the spans below have to exist
+    # in the real audio (the blend fixtures reach t=258s) or the snippet comes
+    # back empty and is dropped by the duration floor.
     wav = tmp_path / "meeting.wav"
-    t = np.arange(60 * 16000) / 16000
+    t = np.arange(400 * 16000) / 16000
     import soundfile as sf
     sf.write(str(wav), (np.sin(2 * np.pi * 220 * t) * 0.2).astype(np.float32),
              16000, subtype="PCM_16")
+    _WAV["path"] = str(wav)
 
     monkeypatch.setattr(svc, "load_audio_segment",
                         lambda p, a, b: (__import__("torch").from_numpy(
@@ -202,8 +216,10 @@ def service(db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(svc, "batch_embed_files", fake_batch_embed_files)
 
-    def fake_load_audio(path):
-        # 3s of "audio" so it clears MIN_SNIPPET_DURATION (1.5s).
+    def fake_load_audio(path, target_sr=16000):
+        # 3s of "audio" so it clears MIN_SNIPPET_DURATION (1.5s). The span is
+        # ignored on purpose: AudioSegmentSource slices the returned array
+        # itself, so one fixed buffer exercises "decode once, slice many".
         import torch
         n = 3 * 16000
         return torch.from_numpy(
@@ -223,13 +239,22 @@ def service(db, tmp_path, monkeypatch):
 
 
 def _segs(speaker, n=3, dur=6.0, start=0.0):
+    """Segments for ``speaker``.
+
+    ``n`` is either a count (``n=3`` -> three 6 s spans 20 s apart) or an
+    explicit sequence of ``(start, end)`` pairs, which is what the trimming and
+    decode-count tests need so they can state the exact expected span.
+    """
+    if isinstance(n, (list, tuple)):
+        return [{"speaker": speaker, "start": float(a), "end": float(b)}
+                for a, b in n]
     return [{"speaker": speaker, "start": start + i * 20.0,
              "end": start + i * 20.0 + dur} for i in range(n)]
 
 
 def test_an_unknown_speaker_becomes_a_pending_profile(service, db):
     out = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=_segs("Speaker 5"),
+        audio_path=_WAV["path"], segments=_segs("Speaker 5"),
         user_id="u", source_id="meeting.wav", learn_new=True,
     )
     assert out["collected"] == [], "a generic cluster must never be collected"
@@ -255,7 +280,7 @@ def test_learning_reports_nothing_for_a_cough(service):
     """Under the duration/segment floor nothing is created."""
     segs = [{"speaker": "Speaker 3", "start": 0.0, "end": 4.0}]
     out = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=segs, user_id="u",
+        audio_path=_WAV["path"], segments=segs, user_id="u",
         source_id="meeting.wav", learn_new=True)
     assert out["pending_created"] == []
     assert out["pending_extended"] == []
@@ -264,7 +289,7 @@ def test_learning_reports_nothing_for_a_cough(service):
 def test_learning_is_off_unless_asked(service, db):
     """The default stays exactly as it was: collect-only."""
     out = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=_segs("Speaker 5"),
+        audio_path=_WAV["path"], segments=_segs("Speaker 5"),
         user_id="u", source_id="meeting.wav")
     assert out["pending_created"] == []
     assert out["pending_extended"] == []
@@ -274,12 +299,12 @@ def test_learning_is_off_unless_asked(service, db):
 def test_the_same_recording_extends_one_pending_profile(service, db):
     segs = _segs("Speaker 5", n=3, start=0.0) + _segs("Speaker 6", n=3, start=90.0)
     first = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=segs, user_id="u",
+        audio_path=_WAV["path"], segments=segs, user_id="u",
         source_id="meeting.wav", learn_new=True)
     assert len(first["pending_created"]) == 2
     # A second pass over the same recording must not mint two more profiles.
     second = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=segs, user_id="u",
+        audio_path=_WAV["path"], segments=segs, user_id="u",
         source_id="meeting.wav", learn_new=True)
     assert second["pending_created"] == []
     assert len(second["pending_extended"]) == 2
@@ -296,12 +321,12 @@ def test_extending_a_profile_does_not_duplicate_snippets(service, db):
     """
     segs = _segs("Speaker 5", n=3, start=0.0)
     service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=segs, user_id="u",
+        audio_path=_WAV["path"], segments=segs, user_id="u",
         source_id="meeting.wav", learn_new=True)
     first = service.list_snippets(service.pending_profiles(user_id="u")[0]["name"],
                                   user_id="u")
     service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=segs, user_id="u",
+        audio_path=_WAV["path"], segments=segs, user_id="u",
         source_id="meeting.wav", learn_new=True)
     second = service.list_snippets(service.pending_profiles(user_id="u")[0]["name"],
                                    user_id="u")
@@ -318,7 +343,7 @@ def test_renaming_a_profile_repoints_snippet_paths_at_disk(service, db, tmp_path
     load of that snippet fails with "No such file or directory".
     """
     out = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=_segs("Speaker 5"),
+        audio_path=_WAV["path"], segments=_segs("Speaker 5"),
         user_id="u", source_id="meeting.wav", learn_new=True)
     name = out["pending_created"][0]["name"]
     assert service.confirm_pending(name, "Ismael", user_id="u")["ok"] is True
@@ -335,7 +360,7 @@ def test_renaming_a_profile_repoints_snippet_paths_at_disk(service, db, tmp_path
 
 def test_confirm_pending_renames_and_unlocks(service, db):
     out = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=_segs("Speaker 5"),
+        audio_path=_WAV["path"], segments=_segs("Speaker 5"),
         user_id="u", source_id="meeting.wav", learn_new=True)
     name = out["pending_created"][0]["name"]
     assert service.confirm_pending(name, "  Ismael  ", user_id="u")["ok"] is True
@@ -349,7 +374,7 @@ def test_confirm_pending_refuses_to_overwrite_someone(service, db):
     vp_db = VoiceprintDB(db)
     vp_db.save("Gergely Papp", _unit(1), user_id="u", total_speech_sec=30)
     out = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=_segs("Speaker 5"),
+        audio_path=_WAV["path"], segments=_segs("Speaker 5"),
         user_id="u", source_id="meeting.wav", learn_new=True)
     name = out["pending_created"][0]["name"]
     res = service.confirm_pending(name, "Gergely Papp", user_id="u")
@@ -374,7 +399,7 @@ def test_confirm_pending_requires_a_name(service, db, bad):
 
 def _learn(service, cluster="Speaker 5", source="meeting.wav", n=3, user="u"):
     out = service.auto_collect_from_diarization(
-        audio_path="/tmp/meeting.wav", segments=_segs(cluster, n=n),
+        audio_path=_WAV["path"], segments=_segs(cluster, n=n),
         user_id=user, source_id=source, learn_new=True,
     )
     return (out["pending_created"] + out["pending_extended"])[0]["name"]
@@ -460,3 +485,345 @@ def test_merge_refuses_the_awkward_cases(service, db):
     # Still pending after all those refusals, and still intact.
     assert any(p["name"] == pending for p in service.pending_profiles(user_id="u"))
     assert len(service.list_snippets(pending, user_id="u")) == 3
+
+
+# --------------------------------------------------------------------------
+# A cluster is not a person
+# --------------------------------------------------------------------------
+#
+# Measured on a real 2-host podcast with inserted clips from several other
+# speakers (ZO249, 3439s, default path): the cluster the pipeline called
+# "Speaker 6" was a blend of TWO voices. Three of its spans ranked a
+# registered colleague nearest (cosine 0.533 / 0.567 / 0.589) and three others
+# ranked the host nearest (0.386 / 0.531 / 0.516), the two groups sitting
+# 0.368-0.448 apart while each group was 0.175-0.291 apart internally. The
+# run learned a single pending profile from that cluster (89 snippets, 606s).
+#
+# Learning it as one profile asserts ONE name for two people -- and the
+# blended profile is then consumed by _refine_boundaries_with_vad and by the
+# second pass, so it corrupts the turn boundaries of every LATER run too, not
+# just the printed label. Hence the cohesion split.
+
+def _two_voice_segment_stubs(monkeypatch, svc, sep=0.60, jitter=0.02):
+    """Make the embedding a deterministic function of the segment's group.
+
+    ``AudioSegmentSource`` (the request-wide loader the learner now uses for
+    BOTH the cohesion embeddings and the snippet audio) returns a tensor of
+    constant ``group`` so ``extract_embedding`` can map it back to a voice.
+    Segments before 100s are voice A, the rest voice B.
+
+    ``sep`` is the cosine DISTANCE between the two voices (0.42 on the real
+    ZO249 measurement, which straddles the 0.32 threshold); ``jitter`` is the
+    within-group spread (0.18-0.29 measured, kept small here so the intent of
+    each test is unambiguous).
+    """
+    import torch
+
+    class FakeSource:
+        """Stands in for AudioSegmentSource: no decode, no real audio."""
+
+        def __init__(self, path, target_sr=16000):
+            self.path = path
+            self.loads = 0
+
+        def segment(self, start, end):
+            group = 0.0 if int(start) < 100 else 100.0
+            n = max(1, int((end - start) * 16000))
+            return torch.from_numpy(
+                np.full((1, n), group, dtype=np.float32)
+            ), 16000
+
+    monkeypatch.setattr(svc, "AudioSegmentSource", FakeSource)
+
+    def _voice(sign):
+        # Two unit vectors at cosine distance `sep`: tilt +/-s off a shared
+        # axis. cos = v0^2 - s^2 = (1 - s^2) - s^2 = 1 - 2s^2, so the
+        # distance is 2s^2 and s = sqrt(sep/2).
+        s = float(np.sqrt(sep / 2.0))
+        v = np.zeros(8, dtype=np.float32)
+        v[0] = np.sqrt(max(0.0, 1.0 - s * s))
+        v[2] = sign * s
+        return v / np.linalg.norm(v)
+
+    def fake_extract_embedding(waveform, sr, *a, **kw):
+        group = float(np.asarray(waveform).reshape(-1)[0])
+        seed = 1 if group == 0.0 else 2
+        v = _voice(1.0 if group == 0.0 else -1.0)
+        if jitter:
+            r = np.random.default_rng(seed).normal(0, 1, 8).astype(np.float32)
+            v = v + jitter * (r / np.linalg.norm(r))
+        return (v / np.linalg.norm(v)).astype(np.float32)
+
+    monkeypatch.setattr(svc, "extract_embedding", fake_extract_embedding)
+
+
+def _blended_segs(speaker="Speaker 6", n_each=3, dur=6.0):
+    """Three spans of voice A, then three of voice B, inside ONE cluster."""
+    segs = []
+    for i in range(n_each):
+        segs.append({"speaker": speaker, "start": float(i * 20),
+                     "end": float(i * 20 + dur)})
+    for i in range(n_each):
+        segs.append({"speaker": speaker, "start": 200.0 + i * 20,
+                     "end": 200.0 + i * 20 + dur})
+    return segs
+
+
+def test_a_blended_cluster_is_learned_as_two_separate_profiles(service, db, monkeypatch):
+    pytest.importorskip("sklearn")
+    from asr_mcp.voiceprint import service as svc
+
+    _two_voice_segment_stubs(monkeypatch, svc)
+    out = service.auto_collect_from_diarization(
+        audio_path=_WAV["path"], segments=_blended_segs(),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    created = out["pending_created"]
+    assert len(created) == 2, created
+    # Neither profile may hold audio from both voices.
+    for prof in created:
+        assert prof["snippets"] == 3, prof
+    # And no snippet of one group may sit in the other's profile.
+    all_snips = []
+    for prof in created:
+        all_snips += list(service.list_snippets(prof["name"], user_id="u"))
+    assert len(all_snips) == 6
+    starts = sorted(s["start_sec"] for s in all_snips)
+    assert sum(1 for s in starts if s < 100) == 3
+    assert sum(1 for s in starts if s >= 200) == 3
+
+
+def test_a_cohesive_cluster_is_still_learned_as_a_single_profile(service, db, monkeypatch):
+    pytest.importorskip("sklearn")
+    from asr_mcp.voiceprint import service as svc
+
+    _two_voice_segment_stubs(monkeypatch, svc, sep=0.10, jitter=0.01)
+    out = service.auto_collect_from_diarization(
+        audio_path=_WAV["path"], segments=_blended_segs(),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    assert len(out["pending_created"]) == 1
+    # The plain cluster label, with no "#2" subgroup suffix.
+    assert out["pending_created"][0]["cluster"] == "Speaker 6"
+    assert out["pending_created"][0]["snippets"] == 6
+
+
+def test_the_cohesion_check_is_skipped_without_an_embedding_session(service, db, monkeypatch):
+    """No session -> learn as one profile rather than silently learning nothing."""
+    from asr_mcp.voiceprint import service as svc
+
+    monkeypatch.setattr(svc.VoiceprintService, "_emb_session", lambda self: None)
+    out = service.auto_collect_from_diarization(
+        audio_path=_WAV["path"], segments=_blended_segs(),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    # Phase P2 made this FAIL CLOSED rather than learn the whole cluster
+    # unchecked: "cannot tell whether this is one person" must not become
+    # "here is a profile for it".
+    assert out["pending_created"] == []
+    assert [m["reason"] for m in out["learn_skipped"]] == [
+        "unverified:no_embedding_session"]
+
+
+def test_cluster_splitting_can_be_disabled(service, db, monkeypatch):
+    pytest.importorskip("sklearn")
+    from asr_mcp.voiceprint import service as svc
+
+    _two_voice_segment_stubs(monkeypatch, svc)
+    monkeypatch.setattr(svc, "_learning_cfg",
+                        lambda: {"split_clusters": False, "max_intra_cluster_dist": 0.32})
+    out = service.auto_collect_from_diarization(
+        audio_path=_WAV["path"], segments=_blended_segs(),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    assert len(out["pending_created"]) == 1
+    assert out["pending_created"][0]["snippets"] == 6
+
+
+# --------------------------------------------------------------------------
+# Phase P2 — learn from the boundaries the transcript uses
+# --------------------------------------------------------------------------
+#
+# The stubbed-loader twin of these lives in tests/test_learning_boundaries.py,
+# which runs everywhere.  What is here needs the REAL database: the snippet
+# rows, the ``purity`` column and its migration, and the real
+# AudioSegmentSource slicing the real WAV.
+#
+# tests/test_learning_boundaries.py cannot check any of this: it substitutes a
+# dict-backed VoiceprintDB, so "the snippet row records the trimmed span" and
+# "the purity survives a real SQL round trip" are exactly the assertions it is
+# unable to make.
+
+def _sections(spans, pad):
+    """VAD sections sitting inside each span, starting ``pad`` seconds in."""
+    return [{"start": float(a) + pad, "end": float(b)} for a, b in spans]
+
+
+def test_snippet_rows_record_the_trimmed_span(service, db, tmp_path):
+    spans = [(0.0, 20.0), (25.0, 45.0), (50.0, 70.0)]
+    out = service.auto_collect_from_diarization(
+        audio_path=str(tmp_path / "meeting.wav"),
+        segments=_segs("Speaker 5", spans), user_id="u",
+        source_id="meeting.wav", learn_new=True,
+        vad_sections=_sections(spans, 1.5),
+    )
+    assert len(out["pending_created"]) == 1
+    name = out["pending_created"][0]["name"]
+    snips = sorted(service.list_snippets(name, user_id="u"),
+                   key=lambda x: x["start_sec"])
+    assert len(snips) == 3
+    for sn, (a, b) in zip(snips, spans):
+        # The edge moved onto the VAD section: 1.5s of leading silence removed,
+        # and the file was decoded ONCE for the whole request.
+        assert sn["start_sec"] == pytest.approx(a + 1.5)
+        assert sn["end_sec"] == pytest.approx(b)
+        assert out["audio_loads"] == 1
+
+
+def test_one_load_audio_per_request(service, db, tmp_path, monkeypatch):
+    """89 snippets must not mean 89 whole-file decodes."""
+    from asr_mcp.voiceprint import utils as vutils
+
+    real_load = vutils.load_audio
+    calls = []
+
+    def counting_load(path, target_sr=16000):
+        calls.append(str(path))
+        return real_load(path, target_sr=target_sr)
+
+    monkeypatch.setattr(vutils, "load_audio", counting_load)
+    spans = [(float(i * 20), float(i * 20 + 18)) for i in range(12)]
+    out = service.auto_collect_from_diarization(
+        audio_path=str(tmp_path / "meeting.wav"),
+        segments=_segs("Speaker 5", spans), user_id="u",
+        source_id="meeting.wav", learn_new=True,
+    )
+    assert len(out["pending_created"]) == 1
+    name = out["pending_created"][0]["name"]
+    assert service._snippets.count(name, user_id="u") == 12
+    assert len(calls) == 1, calls
+    assert out["audio_loads"] == 1
+
+
+def test_purity_is_stored_in_the_database_and_survives_a_refine(service, db,
+                                                                 tmp_path):
+    spans = [(float(i * 20), float(i * 20 + 18)) for i in range(3)]
+    out = service.auto_collect_from_diarization(
+        audio_path=str(tmp_path / "meeting.wav"),
+        segments=_segs("Speaker 5", spans), user_id="u",
+        source_id="meeting.wav", learn_new=True,
+    )
+    prof = out["pending_created"][0]
+    name = prof["name"]
+    assert prof["purity"]["intra_max"] is not None
+    # A real SQL round trip, not the in-memory dict the other module uses.
+    row = VoiceprintDB(db).get(name, user_id="u")
+    assert row["purity"] == prof["purity"]
+    # A plain refine (delete a snippet, refine, re-add) must not erase it.
+    service._auto_refine(name, user_id="u")
+    assert VoiceprintDB(db).get(name, user_id="u")["purity"] == prof["purity"]
+
+
+def test_purity_column_is_added_to_a_pre_existing_database(tmp_path):
+    """The migration, for the same reason as the ``pending`` one below."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE voiceprints ("
+                "user_id VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, "
+                "embedding BLOB NOT NULL, mfcc BLOB, pitch_hz FLOAT, "
+                "pitch_std FLOAT, energy_rms FLOAT, spectral_centroid FLOAT, "
+                "spectral_rolloff FLOAT, total_speech_sec FLOAT, "
+                "sample_count INTEGER, pending BOOLEAN NOT NULL DEFAULT 0, "
+                "created_at DATETIME, updated_at DATETIME, "
+                "PRIMARY KEY (user_id, name))")
+    con.execute("INSERT INTO voiceprints (user_id, name, embedding) "
+                "VALUES ('u', 'Old Speaker', X'00000000')")
+    con.commit()
+    con.close()
+
+    mgr = DatabaseManager(str(path))
+    try:
+        row = VoiceprintDB(mgr).get("Old Speaker", user_id="u")
+        assert row is not None
+        assert row["purity"] == {}
+    finally:
+        mgr.close()
+
+
+def test_learn_caps_apply_to_the_learn_path(service, tmp_path, monkeypatch):
+    from asr_mcp.voiceprint import service as svc
+
+    cfg = dict(svc._learning_cfg())
+    cfg.update(max_snippet_sec=10.0, max_profile_total_sec=40.0)
+    monkeypatch.setattr(svc, "_learning_cfg", lambda: cfg)
+
+    spans = [(0.0, 35.0), (40.0, 60.0), (70.0, 90.0)]
+    out = service.auto_collect_from_diarization(
+        audio_path=str(tmp_path / "meeting.wav"),
+        segments=_segs("Speaker 5", spans), user_id="u",
+        source_id="meeting.wav", learn_new=True,
+    )
+    assert len(out["pending_created"]) == 1
+    name = out["pending_created"][0]["name"]
+    snips = service.list_snippets(name, user_id="u")
+    assert snips
+    assert max(x["duration_sec"] for x in snips) <= 10.0 + 1e-6
+    assert sum(x["duration_sec"] for x in snips) <= 40.0 + 1e-6
+
+
+def test_the_same_colleague_in_a_second_recording_extends_one_profile(service,
+                                                                      db,
+                                                                      tmp_path):
+    """F4: the extend lookup must be the VOICE, not the source filename.
+
+    The two calls differ in ``source_id`` (two different recordings) AND in the
+    cluster label (``Speaker 5`` vs ``Speaker 10`` — re-running with a different
+    ``num_speakers`` renumbers the clusters).  Keying on the source stem, as the
+    pre-P2 code did, mints a second pending profile here, and the second
+    ``confirm`` is then refused because the name is taken.
+    """
+    import shutil
+
+    wav = tmp_path / "meeting.wav"
+    first = service.auto_collect_from_diarization(
+        audio_path=str(wav), segments=_segs("Speaker 5", n=3),
+        user_id="u", source_id="first-recording.wav", learn_new=True)
+    assert len(first["pending_created"]) == 1
+    name = first["pending_created"][0]["name"]
+
+    # A genuinely different file, as a second upload would be: the snippet
+    # filename hashes the source path, so sharing one would make the second
+    # pass look like a repeat of the first.
+    wav2 = tmp_path / "other.wav"
+    shutil.copy(str(wav), str(wav2))
+    spans = [(float(i * 20), float(i * 20 + 18)) for i in range(3)]
+    second = service.auto_collect_from_diarization(
+        audio_path=str(wav2), segments=_segs("Speaker 10", spans),
+        user_id="u", source_id="second-recording.wav", learn_new=True)
+    assert second["pending_created"] == [], second
+    assert [p["name"] for p in second["pending_extended"]] == [name]
+    assert service._snippets.count(name, user_id="u") == 6
+    assert len(service.pending_profiles(user_id="u")) == 1
+
+
+def test_learn_new_false_is_unchanged(service, db, tmp_path):
+    """Collect-only behaviour: a registered profile grows, nothing is learned."""
+    VoiceprintDB(db).save("Gergely Papp", _unit(7), user_id="u",
+                          total_speech_sec=30)
+    known = [(float(i * 20), float(i * 20 + 18)) for i in range(3)]
+    generic = [(100.0 + i * 20, 118.0 + i * 20) for i in range(3)]
+    out = service.auto_collect_from_diarization(
+        audio_path=str(tmp_path / "meeting.wav"),
+        segments=_segs("Gergely Papp", known)
+        + _segs("Speaker 5", generic),
+        user_id="u", source_id="meeting.wav",
+    )
+    assert out["pending_created"] == []
+    assert out["pending_extended"] == []
+    assert out["learn_skipped"] == []
+    assert {c["speaker_name"] for c in out["collected"]} == {"Gergely Papp"}
+    assert len(out["collected"]) == 3
+    assert "Speaker 5" not in {
+        s["name"] for s in service.list_speakers(user_id="u")}

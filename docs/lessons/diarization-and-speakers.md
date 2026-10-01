@@ -446,3 +446,187 @@ Three rules this shape depends on:
 - **`merge_pending_into` re-checks `is_pending_profile`.** Without it, a named
   profile could be passed as the source and a colleague's audio moved into
   someone else's profile.
+
+## 40. ONE boundary engine decides every cut
+
+Until now the pipeline placed a boundary in **three different ways** and the
+turn timeline in a **fourth**, and they did not agree with each other:
+
+| Site | Rule it used |
+|---|---|
+| `pipeline._refine_turn_boundaries_exact` (step 13) | VAD+embedding → **quietest single 20 ms frame** → gap midpoint |
+| `asr_router._refine_boundaries_with_vad` (turn timeline) | VAD+embedding → **longest energy dip run** → quietest frame → midpoint |
+| `speaker/audio.refine_speaker_boundaries` (step 7) | sub-window embedding → **midpoint between two sub-window centres** |
+| `asr_router._gap_boundary` (residual gaps) | longest energy dip run, thresholded on the gap **peak** |
+
+The second and fourth disagree by construction: one looks for the *quietest
+frame*, the other for the *longest dip*. On the same gap they returned different
+cuts, so which one ran decided the answer.
+
+There is also no **signal-based snapping** anywhere: no zero-crossing, no
+pitch-contour discontinuity, no spectral-change detection, no forced alignment.
+The only signals used to place a cut were frame-RMS minima, Silero section
+edges, window-grid midpoints and arithmetic midpoints.
+
+`asr_mcp/speaker/boundary.py` now owns the single chain:
+
+```
+vad_embedding  ->  spectral_change  ->  energy_dip  ->  quietest_frame  ->  midpoint
+```
+
+`cut_between(start, end, refs, audio, cfg) -> (cut, method)` returns the cut
+**and the method that produced it**, and `refine_gap(left, right, …)` applies it
+to both spans so they share one cut (lesson 17). The three former callers are
+thin wrappers. The engine is numpy-only at import time — the embedding is
+injected through `refs` — so it is unit-testable without the ML stack, and
+`tests/test_boundary_engine.py` contains **frozen verbatim copies of the old
+arithmetic** so "did this change the numbers?" is answerable by a test rather
+than by a run.
+
+Two rules the design depends on:
+
+- **The two flags are not the same question.** `boundary_refine.acoustic: false`
+  disables methods 1 and 2 (the deliberately *worse* arm used for the A/B);
+  `spectral_novelty: false` alone reproduces the pre-P1 chain exactly and is the
+  **regression lock**. "Reproduce today's numbers" and "disable acoustics" cannot
+  both be one flag, because today's behaviour already used method 1.
+- **A refused cut keeps the nominal boundary.** `refine_gap` will not move a cut
+  that would leave either side below `min_side_sec`, or that moves less than
+  `min_shift_sec`. The old step-7 code *deleted* the short segment instead;
+  `split_at_energy_dips` dropped pieces below `min_split_piece` outright. Real
+  audio is no longer discarded anywhere in the boundary path.
+
+### What the measurement says (and what it does not)
+
+`/tmp/opencode/ab/ab_measure.py` scores every internal turn boundary against the
+**raw Silero VAD sections** — independent evidence of where speech actually
+starts and stops. A boundary's *distance to the nearest VAD edge* is the metric;
+lower is better. No ASR is involved, so this isolates the boundary decision.
+
+Distance in seconds to the nearest VAD edge — **lower is better**.
+
+| clip | `acoustic: false` (energy only) p50 / p90 / max | `acoustic: true` p50 / p90 / max |
+|---|---|---|
+| `0-four-speakers-zh` 56.9 s | 1.397 / 3.970 / 6.738 | **0.000 / 0.550 / 0.550** |
+| `1-two-speakers-en` 16.0 s | 0.864 / 1.530 / 1.696 | **0.391 / 0.678 / 0.750** |
+| `2-two-speakers-en` 34.0 s | 0.304 / 0.504 / 0.576 | **0.106 / 0.227 / 0.398** |
+| `3-two-speakers-en` 54.8 s | 0.806 / 1.488 / 1.616 | **0.550 / 0.634 / 0.690** |
+| **ZO249** 3439 s (471 boundaries) | 0.448 / 1.168 / 3.792 | **0.000 / 0.350 / 1.984** |
+
+`acoustic: true` is better on **all five files**, on every percentile, by a wide
+margin — and the improvement is largest exactly where the material is hardest
+(four-speaker Chinese, and the 57-minute podcast). The `on` and `legacy` arms are
+**byte-identical on all five files**; see the note on `spectral_change` below.
+
+**The acoustic path is what makes boundaries land on real speech edges, and by a
+large margin.** With `acoustic: false` (energy-only) the median boundary sits
+0.4–1.4 s away from the nearest VAD edge; with it on, the median is 0.00–0.55 s
+and on the podcast exactly 0.000 s — the `first_right_start` rule puts the cut on
+a real speech onset.
+
+**`spectral_change` contributed nothing measurable.** It is the *only* difference
+between the `on` and `legacy` arms, and the two are byte-identical on all four
+ground-truth fixtures. Its two thresholds (`spectral_min_ratio` 1.5,
+`spectral_min_abs` 0.15) are **UNCALIBRATED** reasoned defaults, the only
+evidence for the method is a synthetic pure-tone test, and the honest statement
+is: a new capability, present and tested, that did not fire on this material. It
+is kept because it is cheap and gated, not because it is proven.
+
+Two methodological notes, because both were got wrong first:
+
+- A boundary sitting **at** a VAD section start is the *best* placement, not a
+  cut-through. The first version of the scorer tested `t < section.end` and so
+  counted the ideal `first_right_start` cut as bad — which is how a 0.000 s
+  median appeared next to a 65 % "inside speech" rate. Inside now means
+  *strictly* inside, with a 50 ms edge tolerance.
+- `inside_pct` alone is **confounded**: a boundary dumped in the middle of a
+  long pause scores 0 % and is also wrong. Distance is the primary metric.
+  (`acoustic: false` scores 0 % inside on three of four fixtures while placing
+  boundaries up to 6.7 s from any speech edge — the clearest possible
+  demonstration that the secondary metric cannot carry the conclusion.)
+
+### One caveat about what the arms isolate
+
+`boundary_refine.acoustic: false` does **not** only disable the router's
+refinement. It also makes the pipeline's own step 7 (`refine_speaker_boundaries`,
+which is embedding-only) a no-op and downgrades step 13 to the energy chain, so
+the arms produce **different segment sets** — 616 turns with acoustics off
+versus 472 with them on for ZO249, and 7 speakers versus 4. The distance metric
+is still comparable per boundary, but this is not a clean isolation of the
+router's decision, and the differing turn counts should not be read as "acoustic
+refinement produces fewer turns".
+
+## 41. Learn a voiceprint from the boundaries the TRANSCRIPT uses
+
+The learning path cut its snippets from the **diarization segments** (set A)
+while the transcript is attributed against the **turns** (set B) — two
+independently computed boundary sets, produced by a second full-file Silero pass
+and different merge gaps. Worse, two of the three placers in set A are
+*midpoints* (`pipeline.py` final overlap resolution, `speaker/audio.py` step 7),
+so **mid-word cuts were the normal case, not the exception.**
+
+That closes a bad loop: a learned embedding is used as a *reference for cutting
+future boundaries* (`pipeline._get_speaker_ref`, `asr_router._speaker_refs`
+prefer `known_speakers[name]["embedding"]`). A mid-word snippet becomes a
+mis-shaped reference, which then cuts the next run's boundaries worse.
+
+Now:
+
+- `Diarizer.run` returns its raw VAD sections, so `_prepare_turns` reuses that
+  pass instead of running Silero a second time over the same audio.
+- **The learner runs after `_prepare_turns` and is handed the turns**
+  (`learn_spans = turns or list(segments)`), so snippets and transcript share
+  one boundary set. Ordering is the fix; there is no second code path.
+- Each snippet is **trimmed to the VAD sections inside it**, so a boundary
+  cannot cut a phoneme. Trimming is **inward-only**: turns abut by design, so
+  padding outward would pull in the neighbour's speech and duplicate it. Edges
+  that land inside a speech section are left alone; only leading/trailing
+  silence is removed.
+- One `AudioSegmentSource` per request decodes the file **once**. The old
+  `load_audio_segment` decoded the *entire* file per segment — 89 whole-file
+  decodes for one ZO249 cluster, synchronously in the event loop.
+- The learner runs in an executor (`auto_collect_from_diarization_async`).
+
+### Learning now fails closed, and extends by embedding
+
+`_split_cluster_by_cohesion` used to return the cluster **whole** on every
+failure path — no session, `<2` segments, sklearn missing, clustering threw,
+`<2` groups. A blend closer than the threshold was therefore undetectable, and
+"the check failed" silently became "this is one person". It now returns
+`(parts, status)` with status `ok` / `opted_out` / `unverified:<why>` and
+**refuses to learn** when the split cannot be verified. `learning.fail_closed:
+false` restores the old behaviour.
+
+That matters because the failure is real and was measured. On ZO249 a cluster
+that the pipeline called `Speaker 6` was learned as one pending profile of 89
+snippets / 606 s — and it contained **two people**: the guest in the first half
+and the host in the second. Ranking the individual spans against all 35
+registered profiles gave *Alexander Radyukin* at 0.53–0.59 for the guest's spans
+and *Gergely Papp* at 0.39–0.53 for the host's, with a within-group spread of
+0.175–0.291 and a between-group spread of 0.368–0.448. Naming that profile would
+have asserted one name for two people **and corrupted the turn boundaries of
+every later run**, because both refinement engines consume the profile. Note
+also that `pitch_std` is 40–59 Hz for *every* cluster on this material, so pitch
+cannot serve as a purity signal.
+
+`_find_pending_to_extend` now extends a pending profile by **embedding distance**,
+with the old source-filename-stem name match demoted to a fallback. The old key
+meant the same colleague in a *second* recording minted a *second* unnamed
+profile, and the second "Save name" was then **refused** as a duplicate. Also
+fixed: `Speaker_1` is a substring of `Speaker_10` (now token-exact), the `" #2"`
+collision loop only checked the DB (now snippet directories too), the learn path
+had **no** duration cap while `_auto_refine` is duration-weighted (now capped at
+`max_refine_weight_ratio × median`, and per-snippet / per-profile ceilings), and
+a per-profile `purity` statistic is stored (`voiceprints.purity`, additive
+migration) and surfaced on the pending card.
+
+**Every one of these distance thresholds is the same uncalibrated 0.32**, taken
+from the single ZO249 measurement above. Each gate is set to **refuse** rather
+than assert, so a wrong constant loses a profile instead of inventing one — but
+0.32 has been validated on one file and should be swept properly (lesson 33:
+cache the embeddings and sweep offline) before it is trusted as calibrated.
+
+A deliberate consequence of using turns: a cluster whose segments all fall within
+`turn_merge_gap_sec` arrives as a single span, so it is reported
+`unverified:too_few_segments` and nothing is learned. Previously it would have
+been learned from many short segments.

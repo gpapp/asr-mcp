@@ -93,7 +93,6 @@ function packFlush() {
 
 const DETECTOR_DEFAULTS = {
     frame_ms: 32.0,
-    noise_floor_ratio: 3.0,
     noise_floor_min: 0.0005,
     noise_floor_max: 0.05,
     start_threshold_ratio: 2.5,
@@ -101,7 +100,6 @@ const DETECTOR_DEFAULTS = {
     start_threshold_min: 0.0012,
     end_threshold_min: 0.0006,
     start_confirm_frames: 2,
-    end_confirm_frames: 3,
     hangover_ms: 320,
     pre_roll_ms: 160,
     post_roll_ms: 200,
@@ -343,12 +341,20 @@ class TurnDetector {
  * poll() releases the held turn once merge_gap_sec has elapsed, which is what
  * bounds the added latency -- without it the last sentence of a session (or the
  * only sentence of a short one) is never sent.
+ *
+ * The merged payload is `head + tail` -- the pause is not concatenated in -- so
+ * the merged turn declares the span it carries and keeps the real end of the
+ * audio separately, for the next merge decision. Declaring the tail's real end
+ * claimed up to merge_gap_sec of audio the server never received.
  */
 class TurnCoalescer {
     constructor(cfg, clock) {
         this.cfg = Object.assign({}, DETECTOR_DEFAULTS, cfg || {});
         this.clock = clock || (() => performance.now() / 1000);
         this.pending = null;
+        // Real end of the pending turn's audio; equal to pending.endSample
+        // until a merge shortens the declared span.
+        this.audioEnd = null;
         this.due = null;
         this.merged = 0;
         this.released = 0;
@@ -359,31 +365,49 @@ class TurnCoalescer {
             + this.cfg.merge_gap_sec;
     }
 
+    _hold(turn) {
+        this.pending = turn;
+        this.audioEnd = turn.endSample;
+    }
+
     /** Offer a completed turn; return the turns that are ready to send. */
     submit(turn, now) {
         if (!turn) return [];
         const pending = this.pending;
         if (!pending) {
-            this.pending = turn;
+            this._hold(turn);
             this._defer(now);
             return [];
         }
-        const gap = turn.startSample - pending.endSample;
+        const pendingEnd = this.audioEnd === null ? pending.endSample : this.audioEnd;
+        const gap = turn.startSample - pendingEnd;
         const span = (turn.endSample - pending.startSample) / SAMPLE_RATE;
         if (gap >= 0 && gap <= this.cfg.merge_gap_sec * SAMPLE_RATE
                 && span <= this.cfg.max_merge_sec) {
-            const total = pending.pcm.length + turn.pcm.length;
+            const headLen = pending.pcm.length;
+            const tailLen = turn.pcm.length;
+            const start = pending.startSample;
+            // Digital silence so the tail's audio lands where it actually
+            // occurred. The pad is measured from the head's own length, not from
+            // the turn boundary: a payload is only a slice of its turn's span
+            // (the detector trims hangover frames), so head+tail would place the
+            // tail up to merge_gap_sec early. With the pad the declared span ends
+            // at the tail's true end.
+            const pad = Math.max(0, turn.startSample - start - headLen);
+            const total = headLen + pad + tailLen;
             const pcm = new Int16Array(total);
             pcm.set(pending.pcm, 0);
-            pcm.set(turn.pcm, pending.pcm.length);
-            this.pending = new Turn(pending.startSample, turn.endSample, pcm, 'merged',
+            pcm.set(turn.pcm, headLen + pad);
+            const declaredEnd = start + pcm.length;
+            this.pending = new Turn(start, declaredEnd, pcm, 'merged',
                 Math.max(pending.peakRms, turn.peakRms));
+            this.audioEnd = turn.endSample;
             this.merged += 1;
             this._defer(now);
             return [];
         }
         this.released += 1;
-        this.pending = turn;
+        this._hold(turn);
         this._defer(now);
         return [pending];
     }
@@ -395,6 +419,7 @@ class TurnCoalescer {
         if (t < this.due) return [];
         const pending = this.pending;
         this.pending = null;
+        this.audioEnd = null;
         this.due = null;
         this.released += 1;
         return [pending];
@@ -405,6 +430,7 @@ class TurnCoalescer {
         if (!this.pending) return [];
         const pending = this.pending;
         this.pending = null;
+        this.audioEnd = null;
         this.due = null;
         this.released += 1;
         return [pending];
@@ -762,7 +788,7 @@ class Session {
         } else if (kind === 'dropped') {
             this.gaps.push({
                 start: msg.start, end: msg.end,
-                channel: msg.channel, reason: msg.reason,
+                channel: msg.channel, reason: msg.reason, detail: msg.detail,
             });
             this.dropCount += 1;
             this.opts.onDropped(msg);
@@ -936,8 +962,13 @@ class Session {
         }
 
         // 2. Flush detectors (trailing speech) then coalescers (held turns), so
-        //    the last sentence is not lost. The coalesced PCM is recorded too,
-        //    which keeps the WAV the same length as the audio that was sent.
+        //    the last sentence is not lost. Neither is appended to the
+        //    recording: every block the detector saw was already pushed to
+        //    chunks in _onPcm, so writing a turn's PCM again made the WAV up to
+        //    one turn too long with the tail duplicated -- which over-reported
+        //    audio_duration_sec / micSeconds() and gave the shutdown
+        //    re-attribution a repeated region to diarize into extra segments
+        //    (and spurious pending profiles).
         for (const id of [CHANNEL_MIC, CHANNEL_SPEAKER]) {
             const ch = this.channel(id);
             const tail = ch.detector.flush();
@@ -946,7 +977,6 @@ class Session {
             // the last sentence of every session was silently never sent.
             if (tail) ch.coalescer.submit(tail, 0);
             for (const ready of ch.coalescer.flush()) {
-                ch.chunks.push(ready.pcm);
                 this._sendTurn(id, ready);
             }
         }
@@ -1214,8 +1244,20 @@ class UI {
             language,
             token,
             onTranscript: (m) => this._appendTranscript(m),
-            onDropped: (m) => this._note(
-                `Decoder fell behind: dropped turn ${m.start}-${m.end}s`, 'warn'),
+            onDropped: (m) => {
+                if (m.reason === 'timeline_drift') {
+                    // Not a dropped turn: the server could not believe the
+                    // timestamps this channel declared. Every word is still
+                    // here, but the labels come from a shifted timeline.
+                    const which = m.channel === CHANNEL_MIC ? 'Microphone' : 'Speaker';
+                    this._note(
+                        `${which} timestamps look wrong (${m.detail || m.reason}); `
+                        + 'speaker labels on that channel may be off.', 'warn');
+                    return;
+                }
+                this._note(
+                    `Decoder fell behind: dropped turn ${m.start}-${m.end}s`, 'warn');
+            },
             onSkip: () => { /* counted; summarised at the end, not per turn */ },
             onError: (m) => this._note(m, 'warn'),
             onStats: (s) => { this.lastStats = s; },

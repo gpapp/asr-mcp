@@ -70,12 +70,13 @@ After completing any code changes:
 ### Transcription Chunking (Long Audio)
 
 **Turn preparation** (`asr_router.py::_prepare_turns`) — every second of the timeline is covered by exactly one turn. Turns feed the timeline/display and post-hoc speaker attribution; they are NOT decode units:
-1. Merge same-speaker diarized segments into turns (gap ≤1.5s)
+1. Merge same-speaker diarized segments into turns (gap ≤ `uncertainty.turn_merge_gap_sec`, never merging a `speaker is None` span)
 2. Split turns >120s (`MAX_TURN_SEC`) at their largest internal diarized-segment gap
-3. **Exact boundary refinement** (`_refine_boundaries_with_vad`): raw uncollapsed VAD over the full file; each VAD section spanning a gap is embedded and attributed to the better-matching adjacent speaker (known DB voiceprint, else ≤30s of that speaker's own turn audio); `_best_split` picks the ownership cut (margin-weighted); both turns move to one shared cut at the exact start of the first section owned by the incoming speaker (or gap end if the gap is entirely the left speaker's)
-4. **Fallback chain for any remaining gap**: energy-dip cut (`_gap_boundary`, quietest pause centre) → midpoint
+3. **Exact boundary refinement** (`_refine_boundaries_with_vad`, a thin caller over `speaker/boundary.py::refine_gap`): the raw uncollapsed VAD sections the **diarizer already computed** (`raw_vad_sections`, threaded through so Silero runs once per file, not twice); each VAD section spanning a gap is embedded and attributed to the better-matching adjacent speaker (known DB voiceprint, else ≤30s of that speaker's own turn audio); `best_split` picks the ownership cut (margin-weighted); both turns move to one shared cut at the exact start of the first section owned by the incoming speaker (or gap end if the gap is entirely the left speaker's)
+4. **Fallback chain for any remaining gap** (`_close_residual_gaps`): spectral change → energy-dip cut (longest dip run) → quietest frame → midpoint. Steps 3 and 4 are the *same* engine (`boundary.cut_between`); the router's own VAD pass is only a fallback for `/attribution`, where no diarizer ran
 5. Edges extended to 0.0 / audio_duration
 6. **Transcription** (`asr_router.py::_transcribe_file`): ONE whole-file `transcribe_audio_sync()` call; the backend decodes in its own windows (Qwen `_transcribe_chunked`, Cohere `_transcribe_windowed`), then `speaker/attribution.py::attribute_items` maps each returned item onto the turns and groups consecutive same-speaker items into `TranscribeResult` runs — audio is never cut at speaker boundaries
+7. **Voiceprint learning** (`_auto_collect`) runs AFTER step 1–5 and is passed the **turns**, not the raw segments, so every learned snippet carries the same boundaries the transcript was attributed on; each is trimmed inward to whole VAD sections (lesson 41)
 
 **Decode windowing** (`transcribers/cohere.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
 - Plans ≤30s windows (`_plan_window_bounds`), each cut snapped to the minimum frame-energy point inside a ±100-frame band (never mid-word); tails <300 frames merge into the previous window
@@ -181,6 +182,7 @@ asr-mcp/
 │   │   ├── profiling.py       # Pitch/energy/MFCC profiling, relabel by pitch
 │   │   ├── uncertainty.py     # Uncertain-speaker policy (dependency-free, lesson 30)
 │   │   ├── attribution.py     # Post-hoc span→turn attribution (pure, lesson 30)
+│   │   ├── boundary.py        # THE boundary engine — cut_between (pure, lesson 40)
 │   │   └── service.py         # SpeakerService (SQLite-backed CRUD)
 │   ├── voiceprint/
 │   │   ├── service.py         # VoiceprintService (snippet CRUD, auto-collect, refine, merge)
@@ -192,7 +194,7 @@ asr-mcp/
 │   │   └── manager.py         # SessionManager (SQLite-backed) — initialized, no consumer (see History)
 │   ├── streaming/
 │   │   ├── turn_detector.py   # Adaptive energy turn detector + turn coalescer (lesson 31)
-│   │   ├── speech_gate.py    # Silero speech gate before ASR (fail-open)
+│   │   ├── speech_gate.py    # Silero speech gate + turn-edge trim before ASR (fail-open, lesson 42)
 │   │   ├── protocol.py       # Turn-frame wire format (LVT1)
 │   │   ├── attribution.py    # Channel-aware live speaker attribution
 │   │   └── handler.py         # WebSocket dual-channel real-time transcription
@@ -229,7 +231,8 @@ asr-mcp/
 ├── AGENTS.md
 ├── docs/
 │   ├── uncertain-speakers.md   # User-facing policy reference (JSON shape, reasons, gates)
-│   └── lessons/                # Per-subsystem evidence behind each numbered rule
+│   ├── lessons/                # Per-subsystem evidence behind each numbered rule
+│   └── plans/                  # Improvement plans (boundary + voice quality)
 ├── README.md
 ```
 
@@ -377,6 +380,8 @@ anything the rule covers.
 | 32 | `num_speakers` selects a DIFFERENT clustering path (hard k, no greedy merge) | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 33 | Verify diarization on a SHORT clip too — 52-min files hide over-clustering | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 39 | A learned-but-unnamed speaker is a PENDING profile: excluded from every match until the user names it (or merges it into someone they already have), and the client must say so out loud | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 40 | ONE boundary engine (`speaker/boundary.py::cut_between`) decides every cut; a cluster is not a person, so naming is withheld when the largest cluster owns the speech | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 41 | Learn a voiceprint from the boundaries the TRANSCRIPT uses (trimmed to whole VAD sections) — a mid-word snippet becomes a reference for cutting the next run's boundaries | [diarization](docs/lessons/diarization-and-speakers.md) |
 
 ### ASR decoding internals (Cohere ONNX)
 | # | Rule | Detail |
@@ -422,6 +427,7 @@ anything the rule covers.
 | 35 | `Turn.audio` is float32 on the server, int16 bytes on the client — normalise with `samples_as_float32`; live match gates are calibrated, not guessed | [live design](docs/lessons/live-client-design.md) |
 | 36 | A second live channel requires LVT1 turn frames — the legacy raw-PCM path drops channel 1; browsers have no WASAPI loopback, so channel 1 is `getDisplayMedia` tab/system audio | [live design](docs/lessons/live-client-design.md) |
 | 37 | Level the input ONCE in the capture chain (both clients, shared constants); `desired = TARGET/rms` — dividing by the already-gained level settles at a geometric mean that looks like convergence | [live design](docs/lessons/live-client-design.md) |
+| 42 | A live boundary is the client's CLAIM and the server's DECISION: Silero trims the edges, a timeline guard refuses a `start_sample` that goes backwards, and a merged turn carries its gap as silence so the declared span equals the audio sent | [live design](docs/lessons/live-client-design.md) |
 
 ### Reference documents
 - [docs/uncertain-speakers.md](docs/uncertain-speakers.md) — user-facing description of the
@@ -432,6 +438,9 @@ anything the rule covers.
 - [docs/lessons/live-client-design.md](docs/lessons/live-client-design.md) — why the
   live client's final text comes from the live ASR cache rather than a re-transcription,
   the two rejected alternatives, and the trigger for revisiting the decision.
+- [docs/plans/boundary-and-voice-quality-plan.md](docs/plans/boundary-and-voice-quality-plan.md)
+  — the P0–P4 boundary/learning plan, its findings, the **measured** A/B behind
+  lesson 40, and the honest list of what is still uncalibrated.
 
 ## Historical notes (no longer true — kept so they are not re-introduced)
 

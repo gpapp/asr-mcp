@@ -113,3 +113,41 @@ was visible as `UNKNOWN: Thank you` in the transcript.
 - A rejected turn is reported to the client as `{"type": "empty", "skipped":
   ...}` so the sidecar can distinguish "discarded as noise" from "transcribed to
   nothing". Otherwise the two are indistinguishable in the output.
+
+### The server moves the boundary, the client declares it
+
+The live detector places a boundary by energy crossing plus a fixed
+pre/post-roll (160 ms early, 160 ms late, 32 ms grid). Three consequences, all
+fixed in `plan` P3 — the full argument is in
+[live-client-design.md](live-client-design.md) lesson 42:
+
+- **`trim_turn_edges`** (`speech_gate.py`) trims each turn's leading/trailing
+  frames by Silero frame probability before the gate and before decoding. The
+  VAD session is already resident for the gate, so this costs no extra model and
+  no measurable latency. It bounds the move with `edge_max_trim_sec` 0.40 and
+  `edge_max_trim_ratio` 0.30, **never shortens the timeline** (`start_sample`
+  advances by exactly the trimmed samples; `audio_end_sample` is carried
+  through), and fails open on every unavailable path. `stats` gains
+  `edge_trimmed_turns` / `edge_trimmed_sec`.
+- **`protocol.TimelineGuard`** keeps a per-channel high-water mark and refuses a
+  `start_sample` that regresses or leads implausibly. Previously the client's
+  number was used verbatim, so one dropped worklet block silently shifted every
+  later boundary on that channel. `timeline_overlap_tolerance_sec` 0.05,
+  `timeline_max_lead_sec` 10.0, `timeline_max_lead_ratio` 0.05 (the lead
+  allowance grows with connection elapsed time, because a 0.05 % resample-rate
+  error is seconds over an hour).
+- **A merged turn carries its gap as silence.** The coalescer previously
+  concatenated `head + tail` with no padding while declaring a span that
+  *included* the gap, so the decoder read a discontinuous turn and every
+  attribution span was up to `merge_gap_sec` longer than its audio. The
+  declared span now equals the audio sent, and `Turn.audio_end_sample` keeps
+  the true end for the *next* merge decision and for `covered_sec` — the two
+  spans mean different things and must not be conflated.
+- The speech probe is now **always installed** and reports
+  `speech_probe_unavailable` per turn instead of being decided once at connect.
+  With lazy model loading, deciding at connect meant a session that started
+  before the VAD was resident ran its whole duration ungated.
+
+`tests/test_live_boundary_faults.py` (22 tests) covers the four areas, and
+`tests/test_turn_coalescing.py` had two tests that **pinned the bug** (they
+asserted the un-padded span) — those were rewritten to the fixed contract.

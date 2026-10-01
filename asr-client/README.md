@@ -141,6 +141,13 @@ That message matters: the learned snippets are saved, but the person still reads
 name in the web UI. A learned profile is never auto-named, because a cluster has
 no identity to claim.
 
+If nothing is reported, that may be deliberate: a cluster is only learned when the
+server can verify it is **one** voice. When it cannot — too little speech, the
+model unavailable, or the segments not separating cleanly — nothing is saved,
+because a profile blending two people would then be used to decide whose words
+are whose in every later transcription. Speak more, or add a named colleague so
+there is something to match against.
+
 ## Live mode (`transcribe.bat live`)
 
 Real-time transcription of a meeting. Requires `PyAudioWPatch`, `numpy`, `soxr`
@@ -213,3 +220,30 @@ turn as far as it knows. Two filters keep that out of the transcript:
 If the mic level column stays flat, capture is broken. If both levels look right
 but nothing arrives, raise `streaming.min_speech_prob` only after checking the
 `Filtered:` count — that number is the direct measure of what the gate rejected.
+
+#### Turn boundaries are the client's claim, the server's decision
+
+The energy detector is a good *segmenter* but its edges are a fixed padding
+away from the real speech: it starts up to `pre_roll_ms` (160 ms) early and ends
+`post_roll_ms` (200 ms) late, on a 32 ms grid. That is small per turn but it is
+what turns a speaker change into `UNKNOWN (boundary_crossing)` in the final
+transcript, and it is measured against the diarization turns at shutdown. So the
+server corrects it:
+
+- **Edges are trimmed with Silero** (`streaming.edge_trim_enabled`), removing
+  padded frames from the start and end of each turn up to
+  `edge_max_trim_sec` / `edge_max_trim_ratio`. The turn still occupies its true
+  interval on the channel — the timeline is never shortened — only the audio
+  inside it changes. Each transcript line reports `edge_trimmed_sec` when it
+  applied.
+- **A merged turn carries its pause as silence**, so the span the server decodes
+  is exactly as long as the audio it holds. The tail's words keep their real
+  position instead of jumping forward.
+- **A timeline guard checks `start_sample`** for monotonicity and plausibility. A
+  dropped capture block or a late `getDisplayMedia` would otherwise silently
+  shift every later boundary on that channel. It is reported, not silently
+  fixed, and the shutdown summary lists `timeline_faults` and
+  `drifted_channels`.
+
+If a turn's text appears to start before it was spoken, or the summary reports a
+drifted channel, that is this guard — not a transcription error.

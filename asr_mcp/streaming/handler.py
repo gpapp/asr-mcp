@@ -42,7 +42,11 @@ from asr_mcp.streaming import protocol as proto
 from asr_mcp.streaming.attribution import (
     CHANNEL_MIC, attribute_live_turn, unattributed as _unknown_attribution,
 )
-from asr_mcp.streaming.speech_gate import probe_speech, turn_has_speech
+from asr_mcp.streaming.speech_gate import (
+    probe_speech,
+    trim_turn_edges,
+    turn_has_speech,
+)
 from asr_mcp.streaming.turn_detector import (
     Turn, TurnCoalescer, TurnDetector, config as detector_config,
     samples_as_float32,
@@ -99,7 +103,13 @@ def _err(exc: Exception, limit: int = 300) -> str:
 
 
 def _turn_from_frame(header: dict, pcm: bytes) -> Turn:
-    """Build a Turn from a client-cut turn frame (no detector involved)."""
+    """Build a Turn from a client-cut turn frame (no detector involved).
+
+    ``header["start_sample"]`` is the client's own claim about its recording
+    timeline. It is validated by :class:`~asr_mcp.streaming.protocol.TimelineGuard`
+    before it gets here (and clamped when it regressed), so this copy is of an
+    already-checked value -- see :func:`_check_timeline`.
+    """
     import numpy as np
 
     start_sample = int(header["start_sample"])
@@ -192,7 +202,7 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
 
         session = state.vad_session
         if session is None:
-            return 0.0, 0.0
+            return None
         audio = turn.audio
         if isinstance(audio, (bytes, bytearray, memoryview)):
             audio = np.frombuffer(audio, dtype=np.int16)
@@ -201,16 +211,28 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
             threshold=float(cfg.get("vad_frame_threshold", 0.5)),
         )
 
-    speech_probe = _speech_probe if state.vad_session is not None else None
-    if speech_probe is None:
-        logger.info("No VAD session loaded: live turns are transcribed "
-                    "unfiltered (set streaming.min_speech_prob to enable)")
+    # Always installed.  Deciding once, at connect, silently disabled the gate
+    # for every turn of a session that connected before the VAD was resident --
+    # and the model is lazy-loaded, so that is the common case, not the rare one.
+    # The probe resolves the session per call and reports "unavailable" instead.
+    speech_probe = _speech_probe
+    if state.vad_session is None:
+        logger.info("No VAD session loaded yet: live turns are transcribed "
+                    "unfiltered until one is resident (streaming.min_speech_prob)")
     # Only the legacy raw-PCM path endpointing happens here; turn frames
     # arrive already cut (and already coalesced) from the client, so they must
     # NOT go through this -- a second coalescer would re-merge the client's
     # turns and the two would never agree on a boundary.
     coalescer = TurnCoalescer()
     loop = asyncio.get_running_loop()
+    connected_at = loop.time()
+    # The client's declared start_sample is a claim about its own recording.
+    # One dropped capture block or a late-starting getDisplayMedia stream
+    # shifts every later boundary on that channel silently, so the claim is
+    # checked against what has already been seen and reported when it cannot be
+    # true. A bad frame is flagged, never fatal.
+    timeline = proto.TimelineGuard(cfg)
+    notified_channels = set()
     queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
     stats = {
         "packets": 0,
@@ -222,15 +244,22 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
         "queued_turns": 0,
         "dropped_turns": 0,
         "non_speech_turns": 0,
+        "edge_trimmed_turns": 0,
+        "edge_trimmed_sec": 0.0,
+        "timeline_faults": 0,
+        "drifted_channels": [],
     }
     # Highest audio sample seen, whichever path produced it.  Reported to the
     # client so it knows how much of its recording the server actually covered.
+    # A coalesced turn declares a span shorter than the audio it was cut from,
+    # so its audio_end_sample is the position that matters here.
     stream_end_sample = {"value": 0}
 
     def _note_end(turn: Turn) -> None:
-        stream_end_sample["value"] = max(
-            stream_end_sample["value"], int(turn.end_sample)
-        )
+        true_end = getattr(turn, "audio_end_sample", None)
+        end = int(true_end if true_end is not None else turn.end_sample)
+        stream_end_sample["value"] = max(stream_end_sample["value"], end)
+        timeline.note_end(end)
 
     def _submit(turn: Turn, channel: int) -> None:
         stats["queued_turns"] += 1
@@ -282,11 +311,70 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
         except Exception:
             logger.debug("Could not notify client of dropped turn")
 
+    def _check_timeline(header: dict, channel: int) -> dict:
+        """Validate a client-declared span; return the header to build from.
+
+        The first fault on a channel is pushed to the client immediately, in the
+        existing ``dropped`` vocabulary, so the saved sidecar records that the
+        channel's clock was untrustworthy; repeats only move the counters (a
+        client stuck in a loop must not be able to flood the socket).
+        """
+        start, fault = timeline.observe(
+            channel, header["start_sample"], header["n_samples"],
+            elapsed_sec=loop.time() - connected_at,
+        )
+        if fault is None:
+            return header
+        stats["timeline_faults"] = timeline.faults
+        stats["drifted_channels"] = timeline.drifted_channels()
+        logger.warning(
+            "Client timeline fault on channel %s: %s (declared %.2fs, "
+            "expected >= %.2fs, %d so far)",
+            fault["channel"], fault["reason"], fault["declared_start_sec"],
+            fault["expected_start_sec"], timeline.faults,
+        )
+        if fault["channel"] not in notified_channels:
+            notified_channels.add(fault["channel"])
+            loop.create_task(_notify_drift(fault))
+        if start == header["start_sample"]:
+            return header
+        return {**header, "start_sample": int(start)}
+
+    async def _notify_drift(fault: dict) -> None:
+        try:
+            await websocket.send_json({
+                "type": "dropped",
+                "channel": int(fault["channel"]),
+                "start": fault["declared_start_sec"],
+                "end": fault["declared_start_sec"],
+                "reason": "timeline_drift",
+                "detail": f"{fault['reason']}: {fault['note']}",
+            })
+        except Exception:
+            logger.debug("Could not notify client of a timeline fault")
+
     def _transcribe_turn(turn: Turn, channel: int) -> dict:
         state.touch()
-        # Speech gate FIRST. The endpointing detector cuts on energy, so a
-        # sniff or a chair creak arrives here as a perfectly good 0.5s turn and
-        # Whisper answers it with its standard hallucination ("Thank you.").
+        # Edge refinement FIRST, and before the gate, so the gate scores the
+        # audio that will actually be decoded rather than the pre-roll padding
+        # the detector attached.  The client's boundary is an energy crossing
+        # plus a fixed pre/post-roll, so it is early at the onset and late at
+        # the offset by up to ~0.2 s; those padded frames widen the item span
+        # that the shutdown re-attribution matches against the diarization
+        # turns, which is how a 0.2 s boundary error becomes an
+        # UNKNOWN (boundary_crossing) on the final transcript.  The VAD session
+        # is resident for the gate one line below, so this costs no extra model.
+        turn, trimmed_sec = trim_turn_edges(turn, vad_session=state.vad_session,
+                                           cfg=detector_config())
+        if trimmed_sec > 0:
+            stats["edge_trimmed_turns"] += 1
+            stats["edge_trimmed_sec"] = round(
+                stats["edge_trimmed_sec"] + trimmed_sec, 3)
+            logger.debug("Trimmed %.0f ms off turn %.2f-%.2fs",
+                         trimmed_sec * 1000.0, turn.start_sec, turn.end_sec)
+        # Speech gate. The endpointing detector cuts on energy, so a sniff or a
+        # chair creak arrives here as a perfectly good 0.5s turn and Whisper
+        # answers it with its standard hallucination ("Thank you.").
         # Silero already knows the difference and costs microseconds here.
         ok, score, reason = turn_has_speech(turn, probe=speech_probe,
                                             cfg=detector_config())
@@ -332,6 +420,8 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
             attribution=attribution,
         )
         msg["channel"] = int(channel)
+        if trimmed_sec > 0:
+            msg["edge_trimmed_sec"] = round(trimmed_sec, 3)
         return msg
 
     async def _asr_worker() -> None:
@@ -409,6 +499,7 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
                     stats["mic_packets"] += 1
                 else:
                     stats["speaker_packets"] += 1
+                header = _check_timeline(header, channel)
                 try:
                     turn = _turn_from_frame(header, pcm)
                 except Exception as e:
@@ -491,6 +582,7 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
             "covered_sec": round(
                 stream_end_sample["value"] / proto.SAMPLE_RATE, 2
             ),
+            "timeline": timeline.stats(),
         })
     except Exception:
         pass

@@ -1883,7 +1883,7 @@
             const opt = n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`;
             primary.innerHTML = named.map(opt).join('');
             secondary.innerHTML = all.map(opt).join('');
-            if (names.length > 1) secondary.selectedIndex = 1;
+            if (all.length > 1) secondary.selectedIndex = 1;
             dialog.classList.remove('hidden');
         }
 
@@ -1897,11 +1897,15 @@
             if (primary === secondary) { toast('Select different speakers', true); return; }
             if (!confirm('Merge "' + secondary + '" into "' + primary + '"? This will move all snippets and refine the primary voiceprint.')) return;
             closeMergeDialog();
-            await apiFetch('/speakers/merge', {
+            // The merge route answers 200 with an `error` field when it refuses
+            // (merging a profile into itself, an unknown name), so a refused
+            // merge used to be reported as a success here.
+            const res = await apiFetch('/speakers/merge', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ primary, secondary }),
             });
+            if (res && res.error) { toast('Merge refused: ' + res.error, true); return; }
             toast(secondary + ' merged into ' + primary);
             refresh();
         }

@@ -38,7 +38,6 @@ SAMPLE_RATE = 16000
 
 _DEFAULTS = {
     "frame_ms": 32.0,
-    "noise_floor_ratio": 3.0,
     "noise_floor_min": 0.0005,
     "noise_floor_max": 0.05,
     "start_threshold_ratio": 2.5,
@@ -46,7 +45,6 @@ _DEFAULTS = {
     "start_threshold_min": 0.0012,
     "end_threshold_min": 0.0006,
     "start_confirm_frames": 2,
-    "end_confirm_frames": 3,
     "hangover_ms": 320,
     "pre_roll_ms": 160,
     "post_roll_ms": 200,
@@ -104,6 +102,13 @@ class Turn:
     reason: str = "hangover"
     peak_rms: float = 0.0
     mean_rms: float = 0.0
+    #: Where the audio really ends on the channel timeline, when that is not
+    #: ``end_sample``.  A coalesced turn declares the span it *carries*
+    #: (:class:`TurnCoalescer`), which is shorter than the audio it was cut
+    #: from because the inter-turn pause is not concatenated in; this keeps the
+    #: true position so ``covered_sec`` still reports how much of the recording
+    #: the server actually saw.
+    audio_end_sample: Optional[int] = None
 
     @property
     def duration_sec(self) -> float:
@@ -388,7 +393,8 @@ class TurnDetector:
         }
 
 
-def _rebuild_turn(turn, start_sample: int, end_sample: int, audio, peak_rms: float):
+def _rebuild_turn(turn, start_sample: int, end_sample: int, audio, peak_rms: float,
+                  audio_end_sample: Optional[int] = None):
     """Build a merged turn of the same class as ``turn``.
 
     The server's :class:`Turn` carries a float32 numpy array in ``audio`` while
@@ -396,11 +402,16 @@ def _rebuild_turn(turn, start_sample: int, end_sample: int, audio, peak_rms: flo
     are otherwise identical, so try the server shape first and fall back.  A
     single implementation therefore serves both endpoints and the two can never
     disagree about what was merged.
+
+    ``end_sample`` is the span the merged payload *declares* (see
+    :func:`payload_samples`) while ``audio_end_sample`` is where the audio
+    really sits on the channel timeline.
     """
     try:
         return type(turn)(
             start_sample=start_sample, end_sample=end_sample,
             audio=audio, reason="merged", peak_rms=peak_rms,
+            audio_end_sample=audio_end_sample,
         )
     except TypeError:
         return type(turn)(
@@ -420,6 +431,43 @@ def _turn_payload(turn):
     if payload is None:
         return b""
     return payload
+
+
+def _silence_like(payload, n_samples: int):
+    """``n_samples`` of digital silence in the same representation as ``payload``.
+
+    Used to keep a merged turn's audio on its true timeline: the payload is a
+    slice of a turn's span, so a merge that just did ``head + tail`` would land
+    the tail earlier than it occurred.
+    """
+    if n_samples <= 0:
+        return None
+    if isinstance(payload, np.ndarray):
+        return np.zeros(int(n_samples), dtype=np.float32)
+    return b"\x00" * (int(n_samples) * 2)
+
+
+def payload_samples(payload) -> int:
+    """How many samples a turn payload carries.
+
+    The declared span of a turn must equal this: a span longer than the audio
+    makes the decoder read audio that is not there and pushes every downstream
+    attribution (span, ``covered_sec``, the shutdown re-attribution against the
+    recording) past the end of what was actually sent.
+    """
+    if payload is None:
+        return 0
+    if isinstance(payload, np.ndarray):
+        return int(payload.size)
+    return int(len(payload)) // 2
+
+
+# Public alias.  Edge refinement lives in ``speech_gate`` (it needs Silero, which
+# this module must not import) and rebuilds a turn with a different span, so the
+# two representations of "the same turn, different bounds" cannot drift apart.
+rebuild_turn = _rebuild_turn
+turn_payload = _turn_payload
+silence_like = _silence_like
 
 
 class TurnCoalescer:
@@ -444,6 +492,25 @@ class TurnCoalescer:
     pauses shorter than that.  A real conversational pause is longer, so it
     still submits at once and the live feel is unchanged -- and the ASR queue
     is the bottleneck anyway (~3 s per turn on this hardware), not this delay.
+
+    The merged payload is ``head + silence + tail``: the silence puts the tail's
+    audio back at the offset where it actually occurred.  The pad is measured
+    from the head's own length rather than from the turn boundary, because a
+    payload is only a *slice* of its turn's span (the detector trims hangover
+    frames), so ``head + tail`` would place the tail up to ``merge_gap_sec``
+    early.  Two spans are therefore kept distinct, and they mean different
+    things:
+
+    * ``end_sample`` -- the end of the audio actually carried, which is what the
+      decoder reads.  Declaring the tail's real end while carrying only
+      ``head + tail`` made the decoder read audio that is not in the payload and
+      shifted every downstream consumer of the span (item timestamps,
+      attribution, the shutdown re-attribution against the recording).
+    * ``audio_end_sample`` -- where the audio really ended *on the recording*,
+      used for the next merge decision (whose gap is a timeline measurement) and
+      for the handler's ``covered_sec``.  Measuring the next gap against the
+      trimmed audio end instead would inflate it by the trim and silently stop
+      merges.
     """
 
     def __init__(self, cfg: Optional[dict] = None, sample_rate: int = SAMPLE_RATE,
@@ -453,6 +520,9 @@ class TurnCoalescer:
         self.sample_rate = sample_rate
         self._clock = clock or time.monotonic
         self._pending = None
+        # Real end of the pending turn's audio on the channel timeline; equal
+        # to _pending.end_sample until the first merge shortens the span.
+        self._audio_end = None
         self._due = None
         self._merged = 0
         self._released = 0
@@ -465,43 +535,67 @@ class TurnCoalescer:
         self._due = (now if now is not None else self._clock()) + float(
             self.cfg["merge_gap_sec"])
 
+    def _hold(self, turn) -> None:
+        self._pending = turn
+        self._audio_end = int(turn.end_sample)
+
     def submit(self, turn, now=None) -> List[Turn]:
         """Offer a completed turn; return the turns that are ready to send."""
         if turn is None:
             return []
         pending = self._pending
         if pending is None:
-            self._pending = turn
+            self._hold(turn)
             self._defer(now)
             return []
 
-        gap = int(turn.start_sample) - int(pending.end_sample)
+        pending_end = self._audio_end
+        if pending_end is None:
+            pending_end = int(pending.end_sample)
+        gap = int(turn.start_sample) - pending_end
         span = (int(turn.end_sample) - int(pending.start_sample)) / self.sample_rate
 
         if (0 <= gap <= float(self.cfg["merge_gap_sec"]) * self.sample_rate
                 and span <= float(self.cfg["max_merge_sec"])):
             head = _turn_payload(pending)
             tail = _turn_payload(turn)
+            start = int(pending.start_sample)
+            # Digital silence between the two payloads so the tail sits at its
+            # true offset.  This is not just the inter-turn gap: a payload is a
+            # *slice* of its turn's span (the detector trims hangover frames), so
+            # the pad is measured from the head's own length, not from
+            # pending.end_sample.  With it, the merged turn's declared end equals
+            # the tail's true audio end and nothing downstream is shifted.
+            pad_n = int(turn.start_sample) - start - payload_samples(head)
+            pad = _silence_like(head, pad_n)
             if isinstance(head, np.ndarray) or isinstance(tail, np.ndarray):
                 audio = np.concatenate([
                     head if isinstance(head, np.ndarray) else np.frombuffer(
                         head, dtype=np.int16).astype(np.float32) / 32768.0,
+                    pad if pad is not None else np.zeros(0, dtype=np.float32),
                     tail if isinstance(tail, np.ndarray) else np.frombuffer(
                         tail, dtype=np.int16).astype(np.float32) / 32768.0,
                 ])
             else:
-                audio = head + tail
+                audio = head + (pad or b"") + tail
+            declared_end = start + payload_samples(audio)
             self._pending = _rebuild_turn(
-                pending, int(pending.start_sample), int(turn.end_sample), audio,
+                pending, start, declared_end, audio,
                 max(float(getattr(pending, "peak_rms", 0.0) or 0.0),
                     float(getattr(turn, "peak_rms", 0.0) or 0.0)),
+                audio_end_sample=int(turn.end_sample),
             )
+            # The merge decision and covered_sec stay on the RECORDING's timeline
+            # (turn.end_sample), not on the trimmed audio end -- measuring the
+            # next gap against the trim would inflate it by the hangover and stop
+            # merges that used to happen.
+            self._audio_end = int(turn.end_sample)
             self._merged += 1
             self._defer(now)
             return []
 
         self._released += 1
-        self._pending = turn
+        self._hold(turn)
         self._defer(now)
         return [pending]
 
@@ -518,12 +612,14 @@ class TurnCoalescer:
         if (now if now is not None else self._clock()) < self._due:
             return []
         pending, self._pending, self._due = self._pending, None, None
+        self._audio_end = None
         self._released += 1
         return [pending]
 
     def flush(self) -> List[Turn]:
         """Release the held turn (end of stream / shutdown)."""
         pending, self._pending = self._pending, None
+        self._audio_end = None
         self._due = None
         if pending is None:
             return []

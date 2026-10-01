@@ -103,13 +103,59 @@ def convert_to_wav(input_path: str, output_dir: Optional[Path] = None) -> Path:
     return ensure_wav(p, output_dir)
 
 
+def slice_audio(waveform: torch.Tensor, start_sec: float, end_sec: float,
+                sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
+    """In-memory slice of an ALREADY-LOADED waveform.
+
+    Split out from :func:`load_audio_segment` so a caller that needs many
+    segments of one file can decode the file once (see
+    :class:`AudioSegmentSource`).  Semantics are identical to the old
+    inline arithmetic: the slice is clamped to the waveform and an end before
+    the start yields an empty tensor rather than an exception.
+    """
+    total = int(waveform.shape[-1])
+    start_sample = max(0, int(start_sec * sample_rate))
+    end_sample = min(total, int(end_sec * sample_rate))
+    if end_sample < start_sample:
+        end_sample = start_sample
+    return waveform[..., start_sample:end_sample]
+
+
+class AudioSegmentSource:
+    """One decode per source file; every segment after that is a memory slice.
+
+    ``load_audio_segment`` decoded the **entire** file on every call, so a
+    cluster with 89 snippets cost 89 whole-file decodes (docs/plans/
+    boundary-and-voice-quality-plan.md, F4).  A single request builds one of
+    these and reuses it, which turns that into one decode plus 89 slices.
+
+    ``loads`` counts the actual decodes so a test can assert it is 1.
+    """
+
+    def __init__(self, wav_path: str, target_sr: int = SAMPLE_RATE):
+        self.path = wav_path
+        self.target_sr = int(target_sr)
+        self.loads = 0
+        self._waveform = None
+        self._sr = self.target_sr
+
+    @property
+    def loaded(self) -> bool:
+        return self._waveform is not None
+
+    def waveform(self) -> tuple[torch.Tensor, int]:
+        if self._waveform is None:
+            self.loads += 1
+            self._waveform, self._sr = load_audio(self.path, self.target_sr)
+        return self._waveform, self._sr
+
+    def segment(self, start_sec: float, end_sec: float) -> tuple[torch.Tensor, int]:
+        waveform, sr = self.waveform()
+        return slice_audio(waveform, start_sec, end_sec, sr), sr
+
+
 def load_audio_segment(wav_path: str, start_sec: float, end_sec: float):
-    waveform, sr = load_audio(wav_path)
-    start_sample = int(start_sec * SAMPLE_RATE)
-    end_sample = int(end_sec * SAMPLE_RATE)
-    start_sample = max(0, start_sample)
-    end_sample = min(waveform.shape[-1], end_sample)
-    return waveform[..., start_sample:end_sample], SAMPLE_RATE
+    return AudioSegmentSource(wav_path).segment(start_sec, end_sec)
 
 
 def extract_speaker_audio(

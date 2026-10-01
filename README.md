@@ -212,8 +212,20 @@ A speaker who has no voiceprint yet is learned automatically — but as a
   it also moves their snippets into a normal voiceprint.
 - Confirming refuses a name already in use, so it cannot overwrite a real
   colleague's profile.
-- Re-running the same recording **extends** the existing pending profile
-  instead of creating a second one.
+- Re-running the same recording — **or a different one** — extends the existing
+  pending profile instead of creating a second one: the match is by
+  **embedding distance** to the other pending profiles, with the filename as a
+  fallback. Before a profile is extended, the new audio is compared against the
+  profile's own embedding and refused if it spreads wider than
+  `learning.max_profile_intra_dist`.
+- A profile records a **purity** figure (largest distance *within* the group,
+  smallest *between* groups) that the Voiceprints tab shows. When a cluster
+  cannot be verified as one voice — no embedding session, too few snippets, a
+  clustering failure, or groups that sit closer than `learning.min_inter_dist` —
+  **nothing is learned** (`learning.fail_closed`), because a blend learned as one
+  profile would then be used as a reference for cutting later boundaries.
+- Snippets are cut from the **same turns the transcript is attributed on** and
+  trimmed to whole VAD sections, so a boundary can never land mid-word.
 
 #### "Is this someone I already added?"
 
@@ -243,6 +255,42 @@ Step numbers match the `# Step N` comments in
 11. **Minority suppression** — short speakers suppressed, matched voiceprints protected
 12. **Second pass** — re-identify unknown speakers (gated by `second_pass.min_identity_confidence`)
 13. **Exact boundary refinement** — from the raw VAD sections
+
+### Boundary accuracy
+
+Every speaker transition is cut by **one** engine,
+`asr_mcp/speaker/boundary.py::cut_between`, shared by the pipeline, the turn
+timeline and the client-side detector. It tries, in order: VAD-section ownership
+decided by voiceprint embedding → spectral change → energy dip → quietest frame
+→ gap midpoint. Whichever method wins, the two spans either side move to the
+*same* cut, so no second of the timeline is ever unclaimed or double-claimed.
+
+The acoustic step is not decoration. Measured against the raw VAD sections as
+ground truth (distance from the cut to the nearest speech edge, lower is
+better), on 4 ground-truth clips and a 57-minute podcast:
+
+| material | energy only | acoustic |
+|---|---|---|
+| 0-four-speakers-zh (56.9s) | 1.397 / 3.970 / 6.738 s | **0.000 / 0.550 / 0.550 s** |
+| 1-two-speakers-en (16.0s) | 0.864 / 1.530 / 1.696 s | **0.391 / 0.678 / 0.750 s** |
+| 2-two-speakers-en (34.0s) | 0.304 / 0.504 / 0.576 s | **0.106 / 0.227 / 0.398 s** |
+| 3-two-speakers-en (54.8s) | 0.806 / 1.488 / 1.616 s | **0.550 / 0.634 / 0.690 s** |
+| ZO249 podcast (57min, 471 cuts) | 0.448 / 1.168 / 3.792 s | **0.000 / 0.350 / 1.984 s** |
+
+(p50 / p90 / worst.) `boundary_refine.acoustic: false` gives the energy-only
+column and is the A/B switch. **`spectral_change` never fired on any of that
+real material** — it is implemented and unit-tested on a synthetic signal only,
+and its two thresholds remain uncalibrated, so it is currently inert. Roll back
+the engine wholesale with `boundary_refine.enabled: false` (every cut at the gap
+midpoint). Full method notes and the caveats: **docs/lessons/diarization-and-speakers.md**
+(lesson 40) and **[docs/plans/boundary-and-voice-quality-plan.md](docs/plans/boundary-and-voice-quality-plan.md)**.
+
+**Live boundaries** are the client's claim and the server's decision: Silero
+trims each turn's leading and trailing frames, a timeline guard rejects a
+`start_sample` that goes backwards or runs implausibly far ahead, and a merged
+turn carries its pause as silence so the declared span equals the audio actually
+sent. All three are reported back to the client. See
+**docs/lessons/live-client-design.md** (lesson 42).
 
 ## Project Structure
 
@@ -327,6 +375,7 @@ asr-mcp/
 ├── AGENTS.md
 ├── docs/
 │   ├── uncertain-speakers.md   # Uncertainty policy reference
-│   └── lessons/                # Evidence behind each AGENTS.md rule
+│   ├── lessons/                # Evidence behind each AGENTS.md rule
+│   └── plans/                  # Improvement plans (boundary + voice quality)
 └── README.md
 ```

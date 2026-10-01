@@ -38,6 +38,12 @@ class VoiceprintModel(Base):
     # until the user gives it a name, so learning someone can never produce a
     # confident misattribution (uncertainty policy, lesson 30).
     pending = Column(Boolean, default=False, nullable=False, index=True)
+    # A JSON blob describing how tightly the profile's own snippets agree with
+    # each other and with the profiles they were separated from
+    # ({"intra_max": .., "inter_min": .., "purity_ratio": .., "groups": ..}).
+    # Retained so a learned profile can be SHOWN to be a blend candidate rather
+    # than silently asserted as one person.
+    purity = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -103,5 +109,7 @@ def init_db(db_path: str) -> sessionmaker:
         if "pending" not in vp_cols:
             conn.execute(text(
                 "ALTER TABLE voiceprints ADD COLUMN pending BOOLEAN NOT NULL DEFAULT 0"))
+        if "purity" not in vp_cols:
+            conn.execute(text("ALTER TABLE voiceprints ADD COLUMN purity TEXT"))
         conn.commit()
     return sessionmaker(bind=engine)

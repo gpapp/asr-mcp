@@ -234,6 +234,8 @@ def match_known_speakers_full(
     known_speakers: dict[str, dict],
     cfg: dict = None,
     renumber: bool = False,
+    allow_renaming: bool = True,
+    renaming_blocked_reason: Optional[str] = None,
 ) -> Tuple[list[dict], dict]:
     """Match cluster centroids against known speaker voiceprints.
 
@@ -245,11 +247,27 @@ def match_known_speakers_full(
     5. Replaces matched speaker labels in segments, populates alternatives, updates profiles.
     6. Merges multiple clusters that matched to the same known speaker (updating both segments and profiles).
     7. Merges clusters with near-identical distance profiles (<0.05 max diff).
+
+    ``allow_renaming=False`` returns the segments untouched.  It is set by the
+    caller when the cluster balance shows the clusterer collapsed several
+    voices into one cluster (see ``uncertainty.naming_blocked_reason``): the
+    ``Speaker N`` labels are kept — the separation is real evidence — but no
+    cluster may be given a name, because a match against one profile cannot
+    certify a cluster that mixes speakers.
     """
     from asr_mcp.speaker.matcher import match_clusters
     from asr_mcp.diarization.segment_ops import merge_profiles
 
     if not known_speakers:
+        return merged_segments, profiles
+
+    if not allow_renaming:
+        logger.warning(
+            "Known-speaker matching withheld (%s): keeping %d generic speaker "
+            "label(s) instead of naming them",
+            renaming_blocked_reason or "naming disabled by caller",
+            len({s.get("speaker") for s in merged_segments if s.get("speaker")}),
+        )
         return merged_segments, profiles
 
     cfg = cfg or {}
@@ -428,6 +446,8 @@ def collapse_unknown_speakers_second_pass(
     profiles: dict,
     state=None,
     cfg: dict = None,
+    allow_renaming: bool = True,
+    blocked_reason: Optional[str] = None,
 ) -> Tuple[list[dict], dict]:
     """Second-pass re-identification and consolidation of unknown speakers.
 
@@ -437,6 +457,21 @@ def collapse_unknown_speakers_second_pass(
     4. Matches remaining unknown 'Speaker N' clusters against known targets with larger fit margin.
     5. Cross-matches and merges duplicate unknown speakers.
     6. Fuses adjacent same-speaker segments.
+
+    `allow_renaming=False` (with `blocked_reason` for the log) skips step 4
+    ONLY.  Steps 5 and 6 still run, because folding two clusters of the SAME
+    person together and fusing adjacent segments are safe without a name.
+
+    This gate exists because step 4's own confidence gate is not sufficient on
+    its own.  Measured on ZO249 (`?num_speakers=2`, a 2-person podcast with
+    short clips from several other speakers inserted): the cluster holding 84.8%
+    of all windows matched Gergely Papp at combined 0.197 / conf 0.61, which
+    CLEARS `min_identity_confidence` — yet that cluster is a blend of the host
+    and the inserted clips, so a confident name on it is a confident wrong
+    answer.  A tight match to one voiceprint says nothing about whether a
+    cluster is PURE.  `uncertainty.naming_blocked_reason` decides that, in
+    `pipeline.Diarizer.run`, and the decision is threaded into BOTH naming
+    steps so it cannot be bypassed by falling through to the second pass.
     """
     from asr_mcp.speaker.embedding import extract_embedding
     from asr_mcp.speaker.matcher import find_best_match, is_clear_winner
@@ -461,6 +496,14 @@ def collapse_unknown_speakers_second_pass(
     # distance (1 - combined / 0.5), so the shipped 0.5 gate is equivalent to
     # combined <= 0.25.  Keep this default in sync with thresholds.json.
     min_identity_conf = float(sec_cfg.get("min_identity_confidence", 0.5))
+
+    if not allow_renaming:
+        logger.warning(
+            "Second pass: known-voiceprint renaming WITHHELD (%s) — keeping the "
+            "generic speaker label(s). The duplicate merge and segment fusion below "
+            "still run; they do not assert an identity.",
+            blocked_reason or "naming blocked",
+        )
 
     all_speakers = set(seg.get("speaker") for seg in segments if seg.get("speaker"))
     unknown_speakers = [
@@ -534,7 +577,7 @@ def collapse_unknown_speakers_second_pass(
     # menu a runner-up is noise, not a better answer.
     resolved_unknowns: set[str] = set()
     claimed_by: dict[str, str] = {}  # known name -> cluster that won it
-    if reference_targets:
+    if reference_targets and allow_renaming:
         # Strongest match claims a name first, so the better-fitting cluster
         # wins and the weaker one is the one that has to look elsewhere.
         candidates: list[tuple[float, str, dict]] = []

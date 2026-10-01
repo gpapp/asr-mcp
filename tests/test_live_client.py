@@ -261,6 +261,45 @@ def test_dropped_turn_is_recorded_as_a_gap(tmp_path, monkeypatch, live, capsys):
     assert "dropped" in capsys.readouterr().err
 
 
+def test_a_timeline_drift_is_reported_as_a_bad_clock_not_a_dropped_turn(
+        tmp_path, monkeypatch, live, capsys):
+    """The server contradicting this client's timestamps must be visible.
+
+    Nothing was lost -- every word came back -- but the labels on that channel
+    were resolved against a timeline the server does not believe, so the user
+    has to be told rather than handed a confidently wrong transcript.
+    """
+    s = _session(tmp_path, monkeypatch, live)
+    s.on_message({
+        "type": "dropped", "start": 12.5, "end": 12.5, "channel": 0,
+        "reason": "timeline_drift",
+        "detail": "start_sample_regression: turn starts before the previous one",
+    })
+    assert s.drop_count == 1
+    assert s.gaps[0]["reason"] == "timeline_drift"
+    assert s.gaps[0]["detail"].startswith("start_sample_regression")
+    err = capsys.readouterr().err
+    assert "timestamps" in err, err
+    assert "dropped turn" not in err, (
+        "a clock fault is not a queue overflow; the message must say so"
+    )
+
+
+def test_the_sidecar_keeps_the_timeline_faults(tmp_path, monkeypatch, live):
+    """The .asr.json is the record of what went wrong with a session."""
+    s = _session(tmp_path, monkeypatch, live)
+    s.on_message({
+        "type": "stats", "covered_sec": 30.0, "timeline_faults": 1,
+        "drifted_channels": [0],
+        "timeline": {"faults": 1, "by_reason": {"start_sample_regression": 1},
+                     "channels": [0], "detail": []},
+    })
+    path = s.write_sidecar({})
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["server_stats"]["drifted_channels"] == [0]
+    assert data["server_stats"]["timeline"]["by_reason"]["start_sample_regression"] == 1
+
+
 def test_sidecar_records_gaps_and_source(tmp_path, monkeypatch, live):
     s = _session(tmp_path, monkeypatch, live)
     s.on_message({"type": "transcript", "start": 0.0, "end": 1.0,

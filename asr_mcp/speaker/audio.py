@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torchaudio
 
+from asr_mcp.speaker.boundary import BoundaryStats, refine_gap
+
 logger = logging.getLogger("asr_mcp.speaker.audio")
 
 FBANK_N_FILTERS = 80
@@ -82,12 +84,26 @@ def refine_speaker_boundaries(
     sub_stride_sec: float = 0.2,
     min_segment_dur: float = 0.3,
 ) -> list[dict]:
-    """Refine speaker boundaries after initial clustering.
+    """Refine speaker boundaries after initial clustering (pipeline step 7).
 
     At each transition point between two different speakers, re-examines the audio
-    in a ±search_sec window around the boundary using fine sub-windows.
-    All sub-windows across all transitions are collected and embedded in a
-    batched ONNX call with caching.
+    in a ±search_sec window around the boundary using fine sub-windows.  All
+    sub-windows across all transitions are collected and embedded in a batched
+    ONNX call with caching.
+
+    The cut itself is decided by the one boundary engine
+    (``speaker/boundary.py::cut_between``) with the overlapping sub-windows
+    standing in for VAD sections and ``section_cut_rule="window_midpoint"`` — a
+    sub-window's *start* sits before the audio it labels, so the start of the
+    first right-owned window would cut systematically too early.  This used to be
+    a third, slightly different copy of the same arithmetic.
+
+    Two behaviour changes vs. the pre-P1 code, both required by lesson 17:
+
+    * a refinement that would leave either side shorter than *min_segment_dur* is
+      **not applied** — previously the offending segments were then **deleted**
+      from the returned list, which silently dropped audio from the timeline;
+    * no segment is ever dropped. The count in equals the count out.
     """
     if not segments or len(segments) < 2:
         return segments
@@ -210,45 +226,61 @@ def refine_speaker_boundaries(
     norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
     embs = raw_embs / np.maximum(norms, 1e-12)
 
-    # Cosine distance to centroids
-    dists = 1.0 - (embs @ centroid_matrix.T)  # [N, S]
-    nearest = [spk_labels[int(np.argmin(d))] for d in dists]
-
     # ------------------------------------------------------------------ #
-    # Pass 3: group results back per transition, then update boundaries
+    # Pass 3: hand every transition to the one boundary engine
     # ------------------------------------------------------------------ #
-    candidates_per_transition: dict[int, list] = {
+    stats = BoundaryStats()
+    windows_per_transition: dict[int, list[dict]] = {
         t: [] for t in range(len(transition_meta))
     }
+    vectors_per_transition: dict[int, dict[tuple, Optional[np.ndarray]]] = {
+        t: {} for t in range(len(transition_meta))
+    }
+    half = sub_samples / 2 / sample_rate
     for k, (t_idx, center_t) in enumerate(slot_map):
-        candidates_per_transition[t_idx].append((center_t, nearest[k]))
+        key = (center_t - half, center_t + half)
+        windows_per_transition[t_idx].append({"start": key[0], "end": key[1]})
+        vectors_per_transition[t_idx][key] = np.asarray(embs[k], dtype=np.float32)
 
     for t_idx, (seg_i, nominal_boundary, search_start, search_end,
                 left_spk, right_spk) in enumerate(transition_meta):
-        candidates = candidates_per_transition[t_idx]
-        if not candidates:
+        sections = windows_per_transition[t_idx]
+        if not sections:
             continue
 
-        last_left_t = search_start
-        first_right_t = search_end
+        lookup = vectors_per_transition[t_idx]
 
-        for center_t, spk in candidates:
-            if spk == left_spk:
-                last_left_t = center_t
-        for center_t, spk in candidates:
-            if spk == right_spk and center_t > last_left_t:
-                first_right_t = center_t
-                break
-
-        new_boundary = round((last_left_t + first_right_t) / 2.0, 4)
+        def _embed(selected, _lookup=lookup):
+            out = []
+            for sec in selected:
+                key = (float(sec["start"]), float(sec["end"]))
+                vec = _lookup.get(key)
+                out.append(None if vec is None else np.asarray(vec, dtype=np.float32))
+            return out
 
         left = refined[seg_i]
         right = refined[seg_i + 1]
-        if (abs(new_boundary - nominal_boundary) > 0.05 and
-                new_boundary - left["start"] >= min_segment_dur and
-                right["end"] - new_boundary >= min_segment_dur):
-            refined[seg_i] = dict(left, end=new_boundary)
-            refined[seg_i + 1] = dict(right, start=new_boundary)
+        refine_gap(
+            left, right,
+            audio=None,  # step 7 is embedding-only; the engine's energy chain is
+                         # unused here and never consulted on this path today.
+            refs={
+                "sections": sections,
+                "embed_sections": _embed,
+                "left": centroid_matrix[spk_labels.index(left_spk)],
+                "right": centroid_matrix[spk_labels.index(right_spk)],
+                "sample_rate": sample_rate,
+                "min_side_sec": min_segment_dur,
+                "min_shift_sec": 0.05,
+                "stats": stats,
+            },
+            cfg={
+                "lookaround_sec": search_sec,
+                "section_cut_rule": "window_midpoint",
+            },
+        )
 
-    refined = [s for s in refined if s["end"] - s["start"] >= min_segment_dur]
+    logger.info(stats.summary())
+    # Deliberately NO filtering: a span that ends up shorter than min_segment_dur
+    # is kept. Dropping it would delete audio from the timeline (lesson 17).
     return refined

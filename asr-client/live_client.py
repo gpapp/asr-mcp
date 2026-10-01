@@ -117,7 +117,6 @@ def pack_flush() -> bytes:
 # offline turn boundaries agree.
 DETECTOR_DEFAULTS = {
     "frame_ms": 32.0,
-    "noise_floor_ratio": 3.0,
     "noise_floor_min": 0.0005,
     "noise_floor_max": 0.05,
     "start_threshold_ratio": 2.5,
@@ -125,7 +124,6 @@ DETECTOR_DEFAULTS = {
     "start_threshold_min": 0.0012,
     "end_threshold_min": 0.0006,
     "start_confirm_frames": 2,
-    "end_confirm_frames": 3,
     "hangover_ms": 320,
     "pre_roll_ms": 160,
     "post_roll_ms": 200,
@@ -375,6 +373,11 @@ class TurnCoalescer:
     by nothing at all) is still sent promptly -- the added latency is bounded
     by ``merge_gap_sec``, and the server's ASR queue (~3 s per turn here) is
     the real bottleneck anyway.
+
+    The merged payload is ``head + tail`` -- the pause is not concatenated in --
+    so the merged turn declares the span it carries and keeps the real end of
+    the audio separately (for the next merge decision).  See
+    ``asr_mcp/streaming/turn_detector.py`` for the server-side mirror.
     """
 
     def __init__(self, cfg=None, sample_rate=SAMPLE_RATE, clock=None):
@@ -383,6 +386,9 @@ class TurnCoalescer:
         self.sample_rate = sample_rate
         self._clock = clock or time.monotonic
         self._pending = None
+        # Real end of the pending turn's audio; equal to _pending.end_sample
+        # until a merge shortens the declared span (see submit).
+        self._audio_end = None
         self._due = None
         self.merged = 0
         self.released = 0
@@ -396,31 +402,53 @@ class TurnCoalescer:
         self._due = (now if now is not None else self._clock()) + float(
             self.cfg["merge_gap_sec"])
 
+    def _hold(self, turn):
+        self._pending = turn
+        self._audio_end = int(turn.end_sample)
+
     def submit(self, turn, now=None):
         """Offer a completed turn; return the turns that are ready to send."""
         if turn is None:
             return []
         pending = self._pending
         if pending is None:
-            self._pending = turn
+            self._hold(turn)
             self._defer(now)
             return []
 
-        gap = turn.start_sample - pending.end_sample
+        pending_end = self._audio_end
+        if pending_end is None:
+            pending_end = int(pending.end_sample)
+        gap = turn.start_sample - pending_end
         span = (turn.end_sample - pending.start_sample) / self.sample_rate
         if (0 <= gap <= float(self.cfg["merge_gap_sec"]) * self.sample_rate
                 and span <= float(self.cfg["max_merge_sec"])):
+            head, tail = pending.pcm, turn.pcm
+            start = int(pending.start_sample)
+            # Digital silence so the tail's audio lands where it actually
+            # occurred. The pad is measured from the head's own length, not from
+            # the turn boundary: a payload is only a slice of its turn's span
+            # (the detector trims hangover frames), so head+tail would place the
+            # tail up to merge_gap_sec early. With the pad the declared span ends
+            # at the tail's true end.
+            pad_n = int(turn.start_sample) - start - len(head) // 2
+            pcm = head + (b"\x00" * (pad_n * 2) if pad_n > 0 else b"") + tail
+            declared_end = start + len(pcm) // 2
             self._pending = Turn(
-                pending.start_sample, turn.end_sample,
-                pending.pcm + turn.pcm, reason="merged",
+                start, declared_end, pcm, reason="merged",
                 peak_rms=max(pending.peak_rms, turn.peak_rms),
             )
+            # The merge decision and covered_sec stay on the RECORDING's timeline
+            # (turn.end_sample), not on the trimmed audio end -- measuring the
+            # next gap against the trim would inflate it by the hangover and stop
+            # merges that used to happen.
+            self._audio_end = int(turn.end_sample)
             self.merged += 1
             self._defer(now)
             return []
 
         self.released += 1
-        self._pending = turn
+        self._hold(turn)
         self._defer(now)
         return [pending]
 
@@ -431,12 +459,14 @@ class TurnCoalescer:
         if (now if now is not None else self._clock()) < self._due:
             return []
         pending, self._pending, self._due = self._pending, None, None
+        self._audio_end = None
         self.released += 1
         return [pending]
 
     def flush(self):
         """Release the held turn (end of stream / shutdown)."""
         pending, self._pending = self._pending, None
+        self._audio_end = None
         self._due = None
         if pending is None:
             return []
@@ -1215,16 +1245,27 @@ class LiveSession:
                     })
                     self.skip_count += 1
         elif kind == "dropped":
+            reason = msg.get("reason")
             with self._lock:
                 self.gaps.append({
                     "start": msg.get("start"), "end": msg.get("end"),
                     "channel": msg.get("channel"),
-                    "reason": msg.get("reason"),
+                    "reason": reason, "detail": msg.get("detail"),
                 })
                 self.drop_count += 1
-            print(f"  !! {msg.get('reason')}: dropped turn "
-                  f"{msg.get('start')}-{msg.get('end')}s (decoder fell behind)",
-                  file=sys.stderr, flush=True)
+            if reason == "timeline_drift":
+                # Not a dropped turn: the server could not believe the
+                # timestamps this channel declared. The words are all still
+                # here, but the speaker labels on this channel come from a
+                # shifted timeline and must not be trusted.
+                which = "microphone" if msg.get("channel") == CHANNEL_MIC else "speaker"
+                print(f"  !! {which} timestamps look wrong "
+                      f"({msg.get('detail')}); speaker labels on that channel "
+                      f"may be off.", file=sys.stderr, flush=True)
+            else:
+                print(f"  !! {reason}: dropped turn "
+                      f"{msg.get('start')}-{msg.get('end')}s (decoder fell behind)",
+                      file=sys.stderr, flush=True)
         elif kind == "stats":
             self.server_stats = msg
             self.covered_sec = float(msg.get("covered_sec") or 0.0)
@@ -1386,6 +1427,44 @@ def _fmt_hms(sec):
     hours, rem = divmod(sec, 3600)
     minutes, seconds = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+# ── Shutdown ───────────────────────────────────────────────────────────────
+
+def flush_at_shutdown(channels, coalescers):
+    """Close every open turn at end of stream; return the turns still to send.
+
+    ``channels`` is a sequence of ``(detector, recorder, resampler, channel)``
+    tuples; a missing detector or recorder (no speaker channel) is skipped.
+
+    The recorder is NOT extended with the flushed audio. Every block the
+    detector saw was already written as it arrived (``rec.write(pcm)`` in the
+    capture loop), so writing the tail turn's PCM again appended the last turn
+    a second time: the .wav came out up to one turn too long with the tail
+    duplicated. That over-reported ``audio_duration_sec`` / ``micSeconds()``
+    and handed the shutdown re-attribution a repeated region, which diarizes
+    into extra segments -- and therefore into spurious pending profiles.
+
+    The resampler's own trailing samples *are* new audio (soxr needs a final
+    chunk to drain its filter), so they are still written.
+
+    The turns are returned rather than sent so the caller keeps the send-error
+    handling, and so this is testable without an audio device.
+    """
+    ready_turns = []
+    for det, rec, res, channel in channels:
+        if det is None or rec is None:
+            continue
+        # Detector first, then the coalescer: the open turn must be *submitted*
+        # so it can merge with the held one (and be released in order) rather
+        # than left in no turn list at all, which silently lost the last
+        # sentence of every session.
+        tail = det.flush()
+        if tail is not None:
+            ready_turns.extend((channel, t) for t in coalescers[channel].submit(tail))
+        rec.write(res.flush())
+        ready_turns.extend((channel, t) for t in coalescers[channel].flush())
+    return ready_turns
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────
@@ -1578,29 +1657,22 @@ def run_live(args):
         except Exception:
             pass
 
-        # Flush both detectors so trailing speech is not lost, and pad both
-        # recordings so they stay the same length as the sent audio.
-        for det, rec, res, channel in (
-            (mic_det, mic_rec, mic_res, CHANNEL_MIC),
-            (spk_det, spk_rec, spk_res, CHANNEL_SPEAKER),
+        # Flush both detectors so trailing speech is not lost, and release
+        # whatever each coalescer is still holding.
+        for channel, ready in flush_at_shutdown(
+            (
+                (mic_det, mic_rec, mic_res, CHANNEL_MIC),
+                (spk_det, spk_rec, spk_res, CHANNEL_SPEAKER),
+            ),
+            coalescers,
         ):
-            if det is None or rec is None:
-                continue
-            tail = det.flush()
-            if tail is not None:
-                rec.write(tail.pcm)
-            rec.write(res.flush())
-            # Release whatever the coalescer is still holding, so the last
-            # sentence of the session is not lost.
-            for ready in coalescers[channel].flush():
-                rec.write(ready.pcm)
-                session.sequence += 1
-                if transport is not None and not send_error:
-                    try:
-                        transport.send_turn(channel, ready, session.sequence)
-                        session.turns_sent += 1
-                    except Exception:
-                        pass
+            session.sequence += 1
+            if transport is not None and not send_error:
+                try:
+                    transport.send_turn(channel, ready, session.sequence)
+                    session.turns_sent += 1
+                except Exception:
+                    pass
 
         if transport is not None:
             transport.send_flush()

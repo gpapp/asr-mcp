@@ -61,6 +61,16 @@ class VoiceprintDB:
         return json.dumps(mfcc).encode("utf-8")
 
     @staticmethod
+    def _deserialize_purity(data) -> dict:
+        if not data:
+            return {}
+        try:
+            text_ = data.decode("utf-8") if isinstance(data, bytes) else data
+            out = json.loads(text_)
+        except (ValueError, UnicodeDecodeError, TypeError):
+            return {}
+        return out if isinstance(out, dict) else {}
+
     def _deserialize_mfcc(data: bytes) -> dict:
         return json.loads(data.decode("utf-8")) if data else {}
 
@@ -68,7 +78,8 @@ class VoiceprintDB:
              pitch_hz: float = 0.0, pitch_std: float = 0.0, energy_rms: float = 0.0,
              spectral_centroid: float = 0.0, spectral_rolloff: float = 0.0,
              total_speech_sec: float = 0.0, sample_count: int = 0,
-             mfcc: Optional[dict] = None, pending: Optional[bool] = None):
+             mfcc: Optional[dict] = None, pending: Optional[bool] = None,
+             purity: Optional[dict] = None):
         """Insert or update a voiceprint row.
 
         ``pending=None`` means PRESERVE the current flag. That is the safe
@@ -76,6 +87,10 @@ class VoiceprintDB:
         refine, merge) and a naive rebuild must never silently promote an
         auto-learned profile into a matchable identity. Promotion is an explicit
         user action via ``set_pending``/``confirm_pending``.
+
+        ``purity=None`` means PRESERVE, for the same reason: ``_auto_refine``
+        recomputes a profile it did not learn and must not erase the cohesion
+        measurement recorded when the profile was learned.
         """
         with self._db.get_session() as session:
             existing = session.query(VoiceprintModel).filter_by(
@@ -83,12 +98,16 @@ class VoiceprintDB:
             ).first()
             emb_bytes = self._serialize_embedding(embedding)
             mfcc_bytes = self._serialize_mfcc(mfcc) if mfcc else None
+            purity_bytes = (json.dumps(purity).encode("utf-8")
+                            if purity is not None else None)
             now = datetime.datetime.utcnow()
             if existing:
                 existing.embedding = emb_bytes
                 existing.mfcc = mfcc_bytes
                 if pending is not None:
                     existing.pending = bool(pending)
+                if purity_bytes is not None:
+                    existing.purity = purity_bytes
                 existing.pitch_hz = pitch_hz
                 existing.pitch_std = pitch_std
                 existing.energy_rms = energy_rms
@@ -111,6 +130,7 @@ class VoiceprintDB:
                     total_speech_sec=total_speech_sec,
                     sample_count=sample_count,
                     pending=bool(pending) if pending is not None else False,
+                    purity=purity_bytes,
                     created_at=now,
                     updated_at=now,
                 )
@@ -208,6 +228,7 @@ class VoiceprintDB:
             "spectral_rolloff": vp.spectral_rolloff or 0.0,
             "total_speech_sec": vp.total_speech_sec or 0.0,
             "sample_count": vp.sample_count or 0,
+            "purity": self._deserialize_purity(vp.purity),
             "embedding": self._deserialize_embedding(vp.embedding),
             "mfcc": self._deserialize_mfcc(vp.mfcc) if vp.mfcc else {},
         }

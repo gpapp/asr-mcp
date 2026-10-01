@@ -20,9 +20,11 @@ from asr_mcp.diarization.segment_ops import (
     eliminate_ghost_speakers,
 )
 from asr_mcp.speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
+from asr_mcp.speaker.boundary import BoundaryStats, refine_gap
 from asr_mcp.speaker.embedding import extract_embedding, _run_with_cpu_fallback
 from asr_mcp.speaker.vad import split_at_energy_dips, run_vad_chunked, run_vad_onnx, merge_vad_sections
 from asr_mcp.speaker.profiling import profile_speakers, relabel_by_pitch
+from asr_mcp.speaker.uncertainty import naming_blocked_reason, setting
 
 logger = logging.getLogger("asr_mcp.diarization.pipeline")
 
@@ -86,6 +88,12 @@ class Diarizer:
             await progress_callback({"stage": "Splitting audio at silence boundaries", "progress": 0.15})
 
         # Step 2: Energy-dip splitting (split at genuine pauses >1s)
+        # ``abs_floor_ratio`` stays at its default 0.0, i.e. the historical
+        # median-relative threshold. The absolute-floor variant (0.35 = the same
+        # "fraction of the loudest moment" rule anchored to the peak) is
+        # available but uncalibrated on real recordings, so it is NOT enabled
+        # without the P0 measurement. The split no longer discards pieces shorter
+        # than ``min_split_piece``; they are attached to their neighbour.
         speech_ts = split_at_energy_dips(
             speech_ts, waveform_np, sample_rate,
             min_segment_dur=3.0, dip_ratio=0.35, min_dip_dur=0.5,
@@ -172,11 +180,25 @@ class Diarizer:
                 profiles[final_name]["embedding"] = centroid_emb_map[init_name]
 
         # Step 9: Known speaker matching (BEFORE ghost elimination so alternatives are populated)
+        #
+        # The naming is withheld when the cluster balance shows the clusterer
+        # collapsed several voices into one cluster.  A match against one
+        # voiceprint cannot certify a cluster that mixes speakers, and on
+        # real material the WRONG cluster can score the better match, so no
+        # confidence threshold catches it (AGENTS.md lesson 40).
+        # The decision is threaded into BOTH naming steps: gating only step 9
+        # just moves the false name to step 12, which is exactly what happened
+        # on ZO249 before this was fixed.
+        naming_blocked = naming_blocked_reason(
+            np.bincount(np.asarray(long_labels, dtype=int))
+        ) if known_speakers else None
         if known_speakers:
             non_ov, profiles = match_known_speakers_full(
                 non_ov, all_segments_meta, embeddable_indices,
                 raw_embeddings, cluster_centroids, profiles, known_speakers, cfg,
                 renumber=True,
+                allow_renaming=naming_blocked is None,
+                renaming_blocked_reason=naming_blocked,
             )
 
         # Step 10: Ghost elimination (uses seg["alternatives"] if populated by matching)
@@ -197,6 +219,8 @@ class Diarizer:
                 profiles=profiles,
                 state=self._state,
                 cfg=cfg,
+                allow_renaming=naming_blocked is None,
+                blocked_reason=naming_blocked,
             )
         except Exception as e:
             logger.warning("Second pass unknown collapse failed: %s", e)
@@ -238,6 +262,12 @@ class Diarizer:
             ),
             "total_time_sec": round(total_time, 2),
             "audio_duration_sec": round(audio_duration, 2),
+            # The ONE uncollapsed Silero pass over this file. ``asr_router`` used to
+            # run the same model over the same audio again (no shared result) to
+            # refine the turn boundaries; it now consumes this. Callers that
+            # persist this dict must pop the key first — it is hundreds of
+            # sections, not transcript content.
+            "raw_vad_sections": self._raw_vad_sections,
         }
 
     def _load_audio(self, audio_path: str) -> tuple:
@@ -421,13 +451,16 @@ class Diarizer:
                 "Cluster balance: %d windows -> %d clusters (largest %.1f%%): %s",
                 total, sizes.size, 100.0 * sizes.max() / total, shares,
             )
-            if sizes.size > 1 and sizes.max() / total > 0.75:
+            if naming_blocked_reason(sizes):
                 logger.warning(
                     "Cluster balance: the largest cluster holds %.1f%% of all "
-                    "speaker windows — a multi-voice recording is being "
-                    "collapsed into one identity. Check the ECAPA embedding "
-                    "quality / diarization.merge_threshold%s",
+                    "speaker windows (limit %.0f%%) — a multi-voice recording is "
+                    "being collapsed into one cluster, so known-voiceprint "
+                    "naming is WITHHELD for this run and the generic speaker "
+                    "labels are kept. Check the ECAPA embedding quality / "
+                    "diarization.merge_threshold%s",
                     100.0 * sizes.max() / total,
+                    100.0 * float(setting("max_share_for_naming", 0.75)),
                     (
                         ", or omit num_speakers (the default threshold + "
                         "greedy-merge path splits this material far better than "
@@ -575,6 +608,14 @@ class Diarizer:
         profiles: dict,
         known_speakers: dict,
     ) -> list:
+        """Step 13 — hand every different-speaker transition to ``boundary.py``.
+
+        The ownership arithmetic, the fallback chain and the clamping used to live
+        here as a third copy of code that also existed in ``asr_router`` and
+        ``speaker/audio.py`` (and the three disagreed).  This is now a thin caller:
+        it only supplies the raw VAD sections, the two speaker references and a
+        *batched* section embedder, then records what the engine decided.
+        """
         if len(segments) < 2 or not self._raw_vad_sections:
             return segments
 
@@ -583,9 +624,6 @@ class Diarizer:
         if emb_session is None:
             return refined
 
-        margin = 0.5
-        min_sec_dur = 0.1
-        audio_dur = len(waveform_np) / sample_rate
         raw = sorted(self._raw_vad_sections, key=lambda s: s["start"])
 
         ref_cache: dict[str, Optional[np.ndarray]] = {}
@@ -603,162 +641,143 @@ class Diarizer:
             right = refined[i + 1]
             if left.get("speaker") == right.get("speaker"):
                 continue
-
-            gap_start = float(left["end"])
-            gap_end = float(right["start"])
-
-            region_start = max(0.0, gap_start - margin)
-            region_end = min(audio_dur, gap_end + margin)
-
-            secs = [
-                s for s in raw
-                if s["end"] > region_start and s["start"] < region_end
-                and (s["end"] - s["start"]) >= min_sec_dur
-            ]
-            transitions.append((i, gap_start, gap_end, secs))
+            transitions.append((i, float(left["end"]), float(right["start"])))
 
         if not transitions:
             return refined
 
-        sec_key_to_emb: dict[tuple, Optional[np.ndarray]] = {}
-        all_secs_to_embed: list[dict] = []
-        seen_keys: set[tuple] = set()
-        for _, _, _, secs in transitions:
-            for s in secs:
-                key = (s["start"], s["end"])
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    all_secs_to_embed.append(s)
+        # Embed the candidate sections once, batched, with the fbank MD5 cache —
+        # the engine calls ``embed_sections`` once per boundary and this lookup
+        # keeps it to one ONNX batch per boundary instead of one per section.
+        # Only sections the engine would actually consider are embedded: the
+        # whole raw-VAD list of a long recording is much larger.
+        br_cfg = (cfg.get("boundary_refine") or {}) if isinstance(cfg, dict) else {}
+        lookaround = float(br_cfg.get("lookaround_sec", 0.5))
+        min_section = float(br_cfg.get("min_section_sec", 0.3))
+        candidates = []
+        seen_keys: set = set()
+        for _, gap_start, gap_end in transitions:
+            for sec in raw:
+                if (sec["end"] > gap_start - lookaround
+                        and sec["start"] < gap_end + lookaround
+                        and (sec["end"] - sec["start"]) >= min_section):
+                    key = (sec["start"], sec["end"])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        candidates.append(sec)
+        sec_key_to_emb = self._embed_boundary_sections(
+            candidates, waveform_np, sample_rate,
+        )
 
-        if all_secs_to_embed:
-            fbanks, valid_keys = [], []
-            for s in all_secs_to_embed:
-                a = int(s["start"] * sample_rate)
-                b = int(s["end"] * sample_rate)
-                b = min(b, len(waveform_np))
-                chunk = waveform_np[a:b]
-                if len(chunk) < int(min_sec_dur * sample_rate):
-                    sec_key_to_emb[(s["start"], s["end"])] = None
-                    continue
-                t = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)
-                fb = extract_fbank(t, sample_rate)  # [1, T, 80]
-                fb = fb - fb.mean(dim=2, keepdim=True)  # CMN
-                fbanks.append(fb)
-                valid_keys.append((s["start"], s["end"]))
+        def _embed(selected):
+            out = []
+            for sec in selected:
+                vec = sec_key_to_emb.get((sec["start"], sec["end"]))
+                out.append(None if vec is None else np.asarray(vec, dtype=np.float64))
+            return out
 
-            if fbanks:
-                hashes = [hashlib.md5(fb.numpy().tobytes()).hexdigest() for fb in fbanks]
-                cached_embs: dict[int, np.ndarray] = {}
-                misses: list[int] = []
-                for idx, h in enumerate(hashes):
-                    hit = getattr(self._state, "embedding_cache", None)
-                    c_hit = hit.get(h) if hit else None
-                    if c_hit is not None:
-                        cached_embs[idx] = c_hit
-                    else:
-                        misses.append(idx)
-
-                if misses:
-                    miss_fbs = [fbanks[idx] for idx in misses]
-                    max_len = max(fb.shape[1] for fb in miss_fbs)
-                    padded = []
-                    for fb in miss_fbs:
-                        if fb.shape[1] < max_len:
-                            padded.append(torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1])))
-                        else:
-                            padded.append(fb)
-                    batch = torch.stack(padded, dim=0).squeeze(1).numpy().astype(np.float32)  # [N_miss, max_len, 80]
-                    input_name = emb_session.get_inputs()[0].name
-                    output_names = [o.name for o in emb_session.get_outputs()]
-                    try:
-                        computed_outs = []
-                        batch_size = 16
-                        for b_start in range(0, len(batch), batch_size):
-                            b_inp = batch[b_start:b_start + batch_size]
-                            out_chunk = _run_with_cpu_fallback(emb_session, {input_name: b_inp}, output_names)[0]
-                            if out_chunk.ndim == 3:
-                                out_chunk = out_chunk.mean(axis=1)
-                            computed_outs.append(out_chunk)
-                        out = np.concatenate(computed_outs, axis=0) if computed_outs else None
-                    except Exception as e:
-                        logger.warning("Boundary batch embed failed, skipping: %s", e)
-                        out = None
-                    if out is not None:
-                        for li, idx in enumerate(misses):
-                            e_vec = out[li].astype(np.float64)
-                            nrm = np.linalg.norm(e_vec)
-                            if nrm > 1e-8:
-                                e_vec = e_vec / nrm
-                            if getattr(self._state, "embedding_cache", None):
-                                self._state.embedding_cache.put(hashes[idx], e_vec)
-                            cached_embs[idx] = e_vec
-
-                for idx, key in enumerate(valid_keys):
-                    sec_key_to_emb[key] = cached_embs.get(idx)
-
-        n_refined = 0
-        for i, gap_start, gap_end, secs in transitions:
+        stats = BoundaryStats()
+        for i, gap_start, gap_end in transitions:
             left = refined[i]
             right = refined[i + 1]
-
-            left_ref = _ref(left["speaker"])
-            right_ref = _ref(right["speaker"])
-
-            owners_int: list[int] = []
-            weights: list[float] = []
-            valid_secs: list[dict] = []
-
-            if left_ref is not None and right_ref is not None:
-                for s in secs:
-                    emb = sec_key_to_emb.get((s["start"], s["end"]))
-                    if emb is None:
-                        continue
-                    sa = float(np.dot(emb, left_ref))
-                    sb = float(np.dot(emb, right_ref))
-                    owners_int.append(0 if sa >= sb else 1)
-                    weights.append(abs(sa - sb) + 1e-3)
-                    valid_secs.append(s)
-
-            if valid_secs:
-                n = len(owners_int)
-                best_k, best_cost = 0, float("inf")
-                for k in range(n + 1):
-                    cost = 0.0
-                    for j in range(k):
-                        if owners_int[j] == 1:
-                            cost += weights[j]
-                    for j in range(k, n):
-                        if owners_int[j] == 0:
-                            cost += weights[j]
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_k = k
-
-                if best_k < n:
-                    cut = float(valid_secs[best_k]["start"])
-                else:
-                    cut = gap_end
-
-                cut = max(float(left["start"]) + 0.001, min(cut, float(right["end"]) - 0.001))
-                if gap_end > gap_start:
-                    cut = max(gap_start, min(cut, gap_end))
-            else:
-                if gap_end > gap_start:
-                    cut = self._gap_energy_cut(waveform_np, gap_start, gap_end, sample_rate)
-                else:
-                    search_s = max(0.0, gap_start - margin)
-                    search_e = min(audio_dur, gap_end + margin)
-                    mid = self._gap_energy_cut(waveform_np, search_s, search_e, sample_rate)
-                    cut = max(float(left["start"]) + 0.001,
-                              min(mid, float(right["end"]) - 0.001))
-
-            left["end"] = round(cut, 4)
-            right["start"] = round(cut, 4)
-            n_refined += 1
+            # ``refine_gap`` sets ``left["end"] = right["start"] = cut`` (lesson 17),
+            # has already clamped the cut into the gap and rounded it to 4
+            # decimals, and records the method into ``stats``.
+            refine_gap(
+                left, right,
+                waveform_np,
+                {
+                    "sections": raw,
+                    "embed_sections": _embed,
+                    "left": _ref(left.get("speaker")),
+                    "right": _ref(right.get("speaker")),
+                    "left_start": float(left["start"]),
+                    "right_end": float(right["end"]),
+                    "sample_rate": sample_rate,
+                    "stats": stats,
+                },
+            )
 
         logger.info("exact_boundary_refinement_done: %d/%d transitions refined",
-                    n_refined, len(transitions))
+                    len(transitions), len(transitions))
+        logger.info(stats.summary())
         return refined
+
+    def _embed_boundary_sections(
+        self, sections: list, waveform_np: np.ndarray, sample_rate: int,
+    ) -> dict:
+        """Batch-embed raw VAD sections (CMN + MD5 cache), keyed by ``(start, end)``."""
+        min_dur = 0.1
+        sec_key_to_emb: dict[tuple, Optional[np.ndarray]] = {}
+        fbanks, valid_keys = [], []
+        for s in sections:
+            a = int(s["start"] * sample_rate)
+            b = min(int(s["end"] * sample_rate), len(waveform_np))
+            chunk = waveform_np[a:b]
+            if len(chunk) < int(min_dur * sample_rate):
+                sec_key_to_emb[(s["start"], s["end"])] = None
+                continue
+            t = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)
+            fb = extract_fbank(t, sample_rate)  # [1, T, 80]
+            fb = fb - fb.mean(dim=2, keepdim=True)  # CMN
+            fbanks.append(fb)
+            valid_keys.append((s["start"], s["end"]))
+
+        if not fbanks:
+            return sec_key_to_emb
+
+        emb_session = self._state.embedding_session
+        hashes = [hashlib.md5(fb.numpy().tobytes()).hexdigest() for fb in fbanks]
+        cached_embs: dict[int, np.ndarray] = {}
+        misses: list[int] = []
+        for idx, h in enumerate(hashes):
+            hit = getattr(self._state, "embedding_cache", None)
+            c_hit = hit.get(h) if hit else None
+            if c_hit is not None:
+                cached_embs[idx] = c_hit
+            else:
+                misses.append(idx)
+
+        if misses:
+            miss_fbs = [fbanks[idx] for idx in misses]
+            max_len = max(fb.shape[1] for fb in miss_fbs)
+            padded = []
+            for fb in miss_fbs:
+                if fb.shape[1] < max_len:
+                    padded.append(torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1])))
+                else:
+                    padded.append(fb)
+            batch = torch.stack(padded, dim=0).squeeze(1).numpy().astype(np.float32)
+            input_name = emb_session.get_inputs()[0].name
+            output_names = [o.name for o in emb_session.get_outputs()]
+            try:
+                computed_outs = []
+                batch_size = 16
+                for b_start in range(0, len(batch), batch_size):
+                    b_inp = batch[b_start:b_start + batch_size]
+                    out_chunk = _run_with_cpu_fallback(
+                        emb_session, {input_name: b_inp}, output_names
+                    )[0]
+                    if out_chunk.ndim == 3:
+                        out_chunk = out_chunk.mean(axis=1)
+                    computed_outs.append(out_chunk)
+                out = np.concatenate(computed_outs, axis=0) if computed_outs else None
+            except Exception as e:
+                logger.warning("Boundary batch embed failed, skipping: %s", e)
+                out = None
+            if out is not None:
+                for li, idx in enumerate(misses):
+                    e_vec = out[li].astype(np.float64)
+                    nrm = np.linalg.norm(e_vec)
+                    if nrm > 1e-8:
+                        e_vec = e_vec / nrm
+                    if getattr(self._state, "embedding_cache", None):
+                        self._state.embedding_cache.put(hashes[idx], e_vec)
+                    cached_embs[idx] = e_vec
+
+        for idx, key in enumerate(valid_keys):
+            sec_key_to_emb[key] = cached_embs.get(idx)
+        return sec_key_to_emb
 
     @staticmethod
     def _gap_energy_cut(
@@ -768,17 +787,15 @@ class Diarizer:
         sample_rate: int,
         frame_ms: float = 20.0,
     ) -> float:
-        s = int(gap_start * sample_rate)
-        e = int(gap_end * sample_rate)
-        chunk = waveform_np[s:e].astype(np.float32)
-        frame_len = int(frame_ms / 1000 * sample_rate)
-        if len(chunk) < frame_len * 2:
+        """Deprecated shim — the energy chain now lives in ``speaker/boundary.py``.
+
+        Kept so any out-of-tree caller keeps working; the arithmetic is the one
+        boundary engine method ``quietest_frame`` (midpoint when the window is too
+        short to frame).
+        """
+        from asr_mcp.speaker.boundary import quietest_frame_cut
+
+        cut = quietest_frame_cut(waveform_np, gap_start, gap_end, sample_rate, frame_ms)
+        if cut is None:
             return (gap_start + gap_end) / 2.0
-        energies = []
-        for i in range(0, len(chunk) - frame_len, frame_len):
-            frame = chunk[i:i + frame_len]
-            energies.append(np.sqrt(np.mean(frame ** 2)))
-        if not energies:
-            return (gap_start + gap_end) / 2.0
-        min_idx = int(np.argmin(energies))
-        return gap_start + (min_idx + 0.5) * frame_len / sample_rate
+        return cut

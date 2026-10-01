@@ -10,6 +10,7 @@ The client mirrors the same class, so the parity tests matter: a turn cut live
 must be submitted the same way it would be re-diarized offline.
 """
 
+import numpy as np
 import pytest
 
 from asr_mcp.streaming.turn_detector import Turn, TurnCoalescer, SAMPLE_RATE
@@ -67,19 +68,90 @@ def test_short_pause_merges(clock):
     c.submit(_t(0, 2.0))
     assert c.submit(_t(2.4, 1.0)) == []          # 0.4s gap
     assert c._merged == 1
+    # The merged turn keeps the *timeline*: 0.4s of digital silence stands in for
+    # the pause, so the span is the whole 3.4s window and the tail's audio sits
+    # where it occurred rather than 0.4s early.
     assert c.pending_sec == pytest.approx(3.4)
 
 
-def test_merged_audio_is_concatenated(clock):
+def test_merged_audio_is_padded_so_the_tail_lands_on_its_true_offset(clock):
     c = TurnCoalescer(_cfg(), clock=clock)
     c.submit(_t(0, 1.0, amp=0.1))
     c.submit(_t(1.2, 1.0, amp=0.9))
     merged = c._pending
-    assert len(merged.audio) == pytest.approx(2.0 * SAMPLE_RATE, abs=2)
+    head = 1.0 * SAMPLE_RATE
+    # 1.0s head + 0.2s silence + 1.0s tail
+    assert len(merged.audio) == pytest.approx(2.2 * SAMPLE_RATE, abs=2)
     assert merged.peak_rms == pytest.approx(0.9)
     assert merged.reason == "merged"
     assert merged.start_sample == 0
     assert merged.end_sample == pytest.approx(2.2 * SAMPLE_RATE, abs=2)
+    # end_sample and audio_end_sample now coincide: the pad removed the gap
+    # between the declared span and where the audio really ended.
+    assert merged.audio_end_sample == merged.end_sample
+    # The pad really is silence, and the tail still starts at its own amplitude.
+    gap = merged.audio[int(head):int(1.2 * SAMPLE_RATE)]
+    assert np.max(np.abs(gap)) == 0.0
+    assert float(np.max(np.abs(merged.audio[int(1.2 * SAMPLE_RATE):]))) == pytest.approx(0.9, abs=1e-3)
+
+
+def test_declared_span_equals_the_samples_actually_sent(clock):
+    """The defect this file guards: the declared span ran ahead of the audio.
+
+    Declaring the tail's real end while carrying only ``head + tail`` claimed up
+    to ``merge_gap_sec`` of audio the decoder never received -- and every
+    downstream consumer of the span (attribution, ``covered_sec``, the shutdown
+    re-attribution against the recording) inherited the error.  The fix pads the
+    payload, so span == samples sent *and* the audio is on its true timeline.
+    """
+    c = TurnCoalescer(_cfg(), clock=clock)
+    c.submit(_t(0.0, 1.0))
+    c.submit(_t(1.4, 0.8))                      # 0.4s gap inside merge_gap_sec
+    merged = c.flush()[0]
+    assert merged.end_sample - merged.start_sample == len(merged.audio)
+
+
+def test_three_merges_keep_every_gap_inside_the_span(clock):
+    """Repeated merges must not drop or re-open the gaps they just closed."""
+    c = TurnCoalescer(_cfg(), clock=clock)
+    c.submit(_t(0.0, 0.5))
+    c.submit(_t(0.7, 0.5))
+    c.submit(_t(1.4, 0.5))
+    merged = c._pending
+    assert c._merged == 2
+    # 0.5 + 0.2 + 0.5 + 0.2 + 0.5 -- both gaps are inside the payload now.
+    assert len(merged.audio) == pytest.approx(1.9 * SAMPLE_RATE, abs=2)
+    assert merged.end_sample - merged.start_sample == len(merged.audio)
+    # The gap of the LAST merge (1.9 -> 2.2, i.e. 0.3s) is still what the next
+    # turn is measured against, so it still merges -- the coalescer must not lose
+    # the thread after a merge.
+    c.submit(_t(2.2, 0.5))
+    assert c._merged == 3, c.stats()
+    assert c._pending.end_sample - c._pending.start_sample == len(c._pending.audio)
+    assert c._pending.end_sample == pytest.approx(2.7 * SAMPLE_RATE, abs=2)
+
+
+def test_client_coalescer_declares_the_same_span(live):
+    """The client's mirror must declare the span the server expects."""
+    def t(start_sec, dur_sec, amp=0.5):
+        return live.Turn(
+            start_sample=int(start_sec * live.SAMPLE_RATE),
+            end_sample=int((start_sec + dur_sec) * live.SAMPLE_RATE),
+            pcm=b"\x01\x02" * int(dur_sec * live.SAMPLE_RATE),
+            reason="hangover", peak_rms=amp,
+        )
+
+    server = TurnCoalescer(_cfg(), clock=_Clock())
+    client = live.TurnCoalescer(_cfg(), clock=_Clock())
+    server.submit(_t(0.0, 1.0))
+    server.submit(_t(1.4, 0.8))
+    client.submit(t(0.0, 1.0))
+    client.submit(t(1.4, 0.8))
+    s_turn, c_turn = server.flush()[0], client.flush()[0]
+    assert (s_turn.start_sample, s_turn.end_sample) == \
+        (c_turn.start_sample, c_turn.end_sample)
+    assert s_turn.end_sample - s_turn.start_sample == len(s_turn.audio)
+    assert c_turn.end_sample - c_turn.start_sample == len(c_turn.pcm) // 2
 
 
 def test_long_pause_releases_the_previous_turn(clock):

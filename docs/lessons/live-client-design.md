@@ -352,3 +352,90 @@ resampling arithmetic, device selection and session bookkeeping are covered by
 tests (including the real device table from a Windows machine, which is what
 exposed the loopback bug); the actual audio callback and loopback capture are
 not.
+
+## 42. A live boundary is the client's CLAIM and the server's DECISION
+
+The live detector places a boundary by an **energy crossing plus a fixed
+pre/post-roll**: the start is the first frame at/above the start threshold minus
+up to `pre_roll_ms` (160 ms) of pre-roll, the end is 5 frames (160 ms) *after*
+the last frame above the end threshold, both on a 32 ms grid. So a live boundary
+runs up to ~192 ms off a true speech onset, and up to ~0.5 s for quiet speech
+where the adaptive floor is high. Nothing ever refined it. That matters because
+the item's `start`/`end` are what the shutdown re-attribution matches against
+the diarization turns — a 0.2 s disagreement past
+`uncertainty.max_boundary_cross_sec` is what turns a correct transcript into
+`UNKNOWN (boundary_crossing)`.
+
+### Three defects, all found by reading rather than by a test
+
+1. **A merged turn declared a span it did not carry.** The coalescer built
+   `head + tail` — **no gap padding** — while setting
+   `start = pending.start_sample, end = turn.end_sample`. The decoder read a
+   *discontinuous* turn, and every attribution span was up to `merge_gap_sec`
+   (1.0 s) longer than the audio it described. Two fixes were possible: pad with
+   the gap samples, or declare `end` from the samples actually sent. The second
+   was implemented first and then **overridden**, because it silently moves the
+   tail's text earlier than it occurred — the exact error the plan exists to
+   remove. The shipped rule is to pad with silence, which is what a pause sounds
+   like to a decoder anyway:
+   ```
+   pad = turn.start_sample - pending.start_sample - payload_samples(head)
+   audio = head + silence_like(head, pad) + tail
+   ```
+   `pad` is computed against the *raw* next turn, so it also absorbs the
+   trailing-hangover trim, not just the inter-turn gap.
+2. **The server trusted a client-declared `start_sample`.** `unpack_turn`
+   validated length, magic, version and the sample count — nothing else. One
+   dropped worklet block, or a `getDisplayMedia` that started later than the mic,
+   shifted every later boundary on that channel with no signal at all.
+   `protocol.TimelineGuard` now keeps a per-channel high-water mark, flags a
+   regression or an implausible lead, clamps it, and reports
+   `timeline_faults` / `drifted_channels` in `stats` and in the shutdown frame.
+   `unpack_turn` also rejects a turn declaring zero samples.
+3. **The session tail was written to the WAV twice.** `finish()` pushed the
+   flushed turn's PCM into the recording *after* every block had already been
+   written, so the file was up to one turn too long with the last turn
+   duplicated — over-reporting `audio_duration_sec`/`micSeconds()` and handing
+   the learner a duplicate region that can spawn a spurious pending profile.
+   `flush_at_shutdown()` now gives the recorder only the resampler's drain.
+
+### Two spans, two meanings — do not conflate them
+
+`Turn.end_sample` is the end of the **audio carried** (what the decoder reads).
+`Turn.audio_end_sample` is where the audio really **ended on the recording**, and
+it is what the *next* merge decision and the handler's `covered_sec` use. Setting
+`audio_end_sample` to the trimmed end was the first implementation and it was
+wrong: measuring the next gap against trimmed audio inflates it by the hangover
+(2048 samples) and silently stops merges that used to happen. The raw-PCM test
+caught it.
+
+### The server moves the boundary back (step 21)
+
+`streaming/speech_gate.py::trim_turn_edges` now trims each turn's leading and
+trailing frames by **Silero frame probability**. The VAD model is already
+resident for the speech gate, so this is one more scoring pass over frames that
+were already computed: no extra model, no measurable latency, and it removes
+the pre/post-roll padding from *both* the decoded audio and the declared span.
+The **timeline is never shortened** — `start_sample` advances by exactly the
+trimmed samples and `audio_end_sample` is carried through, so the turn still
+occupies its true interval; only its contents and its declared span change.
+`edge_max_trim_sec` 0.40 and `edge_max_trim_ratio` 0.30 bound how much it may
+move, and every unavailable path fails open.
+
+Because shutdown re-attribution re-runs the whole offline pipeline, the same
+`boundary.py` engine then governs the final `.txt`. **One fix, both paths** —
+which is the argument for keeping the client's detector as the claim and the
+server as the decision.
+
+### Two smaller things found on the way
+
+- `handler.py` decided **once at connect** whether to install the speech probe
+  (`if state.vad_session is not None`). With lazy model loading, a session that
+  connects before the VAD is resident — the common case — ran its whole duration
+  with no gate and, once the edge trim existed, no trim either. The probe is now
+  always installed and reports `speech_probe_unavailable` per turn, which fails
+  open with a reason that names itself.
+- `live_attribution.min_match_confidence` = 0.60 still rests on a **single**
+  false-positive measurement. The margin gate is still **unvalidated** (a
+  one-profile menu produces no runner-up, so no false-positive margin was ever
+  measured). Do not read either number as calibrated.

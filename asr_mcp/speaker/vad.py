@@ -1,8 +1,10 @@
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-import torch
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    import torch
 
 logger = logging.getLogger("asr_mcp.speaker.vad")
 
@@ -35,10 +37,28 @@ def split_at_energy_dips(
     dip_ratio: float = 0.35,
     min_dip_dur: float = 0.15,
     min_split_piece: float = 1.0,
+    abs_floor_ratio: float = 0.0,
 ) -> list[dict]:
     """Split long VAD segments at local energy dips.
 
     Operates on float-second timestamps: {"start": float, "end": float}.
+
+    Two properties of this function were wrong and are now fixed:
+
+    1. **Nothing is deleted.**  A piece shorter than *min_split_piece* used to be
+       DROPPED, which silently discarded real speech from the timeline (and with
+       it, any learnable audio).  Such a piece is now attached to its neighbour:
+       the dip boundary is simply not used.
+    2. **The threshold also respects an absolute floor.**  The threshold is
+       ``median(segment energies) * dip_ratio`` — *relative to each segment's own
+       median*, so a uniformly quiet passage (a long pause-heavy stretch, a
+       whispered passage, a distant mic) is NEVER split no matter how deep its
+       internal dips are.  ``abs_floor_ratio`` additionally treats a frame as
+       "at a dip" when it is below ``abs_floor_ratio`` times the peak frame
+       energy of the whole segment, which is the ratio actually being compared
+       for a segment whose median happens to sit near its peak.  Default 0.0
+       keeps the historical behaviour; 0.35 restores the relative-to-peak rule
+       unconditionally.
     """
     if waveform.ndim > 1:
         waveform = waveform.squeeze()
@@ -76,6 +96,13 @@ def split_at_energy_dips(
 
         threshold_energy = median_energy * dip_ratio
         is_dip = np.array(energies) < threshold_energy
+        if abs_floor_ratio and float(np.max(energies)) > 1e-8:
+            # Absolute floor: the same "fraction of the peak" rule, but anchored to
+            # the peak instead of the median, so it fires on uniformly quiet
+            # material too.
+            is_dip = is_dip | (
+                np.array(energies) < float(np.max(energies)) * float(abs_floor_ratio)
+            )
 
         split_times = []  # seconds relative to segment start
         i = 0
@@ -102,8 +129,18 @@ def split_at_energy_dips(
         for k in range(len(boundaries) - 1):
             piece_start = start_sec + boundaries[k]
             piece_end = start_sec + boundaries[k + 1]
-            if (piece_end - piece_start) >= min_split_piece:
-                pieces.append({"start": round(piece_start, 4), "end": round(piece_end, 4)})
+            # A piece shorter than min_split_piece is ATTACHED to its neighbour,
+            # never dropped: the audio stays on the timeline.  Forward pass first.
+            if pieces and (piece_end - piece_start) < min_split_piece:
+                pieces[-1]["end"] = round(piece_end, 4)
+            else:
+                pieces.append({"start": round(piece_start, 4),
+                               "end": round(piece_end, 4)})
+        # A short FIRST piece had no predecessor to attach to, so fold it into the
+        # next one. Without this the head of the segment would be discarded.
+        if len(pieces) > 1 and (pieces[0]["end"] - pieces[0]["start"]) < min_split_piece:
+            pieces[1]["start"] = pieces[0]["start"]
+            pieces.pop(0)
 
         if len(pieces) <= 1:
             results.append({"start": round(start_sec, 4), "end": round(end_sec, 4)})
@@ -115,7 +152,7 @@ def split_at_energy_dips(
 
 
 def run_vad_chunked(
-    waveform_tensor: torch.Tensor,
+    waveform_tensor: "torch.Tensor",
     vad_model=None,
     get_speech_timestamps=None,
     sample_rate: int = 16000,
@@ -157,7 +194,7 @@ def run_vad_chunked(
 
 
 def _run_vad_simple(
-    waveform: torch.Tensor,
+    waveform: "torch.Tensor",
     threshold: float = 0.5,
     min_speech_duration_ms: int = 250,
     sample_rate: int = 16000,
@@ -219,7 +256,7 @@ def _run_vad_simple(
 
 
 def run_vad_onnx(
-    waveform: torch.Tensor,
+    waveform: "torch.Tensor",
     vad_session,
     sample_rate: int = 16000,
     threshold: float = 0.5,
