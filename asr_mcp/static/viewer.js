@@ -101,7 +101,7 @@ function seekPane(pane, caret, audioDur, clientX, layer) {
     const rect = layer.getBoundingClientRect();
     const frac = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
     const t = frac * audioDur;
-    caret.style.display = 'block';
+    caret.classList.add('shown');
     caret.style.left = (frac * 100).toFixed(2) + '%';
     const blocks = pane.querySelectorAll('.tp-block');
     let target = null, prev = null;
@@ -155,13 +155,13 @@ function renderTranscriptViewer(result, container) {
     const bars = document.createElement('div');
     bars.className = 'tv-bars';
     const stack = document.createElement('div');
-    stack.style.position = 'relative';
+    stack.className = 'bars-stack';
     fillSpeakerBars(stack, source, audioDur, allSpeakers);
 
     const layer = document.createElement('div');
-    layer.style.cssText = 'position:absolute;top:0;bottom:0;left:0;right:0;cursor:pointer;';
+    layer.className = 'seek-layer';
     const caret = document.createElement('div');
-    caret.style.cssText = 'display:none;position:absolute;top:0;bottom:0;left:0;width:2px;background:#ff4444;z-index:10;';
+    caret.className = 'seek-caret';
     layer.appendChild(caret);
     stack.appendChild(layer);
     bars.appendChild(stack);
@@ -169,13 +169,13 @@ function renderTranscriptViewer(result, container) {
     viewer.appendChild(bars);
 
     const pane = document.createElement('div');
-    pane.className = 'tv-text';
+    pane.className = 'text-pane pane-tall tv-text';
     if (results.length) {
         renderBlocks(pane, results);
         layer.addEventListener('click', (e) => seekPane(pane, caret, audioDur, e.clientX, layer));
     } else {
         const note = document.createElement('div');
-        note.style.cssText = 'color:#999;font-size:0.85rem;';
+        note.className = 'pane-note';
         note.textContent = 'No transcription text stored for this entry.';
         pane.appendChild(note);
     }

@@ -1126,6 +1126,20 @@ function unpackTurnForTest(buf) {
 
 const $ = (id) => document.getElementById(id);
 
+/**
+ * Show/hide by toggling .hidden.
+ *
+ * Visibility is a class so the stylesheet keeps ownership of every element's
+ * display mode -- the same rule the rest of the SPA follows. live.js defines
+ * its own copy rather than reaching for app.html's `show()`: this file is
+ * loaded and exercised by the node test harness with no page around it.
+ */
+function _show(id, on) {
+    const el = $(id);
+    if (el) el.classList.toggle('hidden', !on);
+    return el;
+}
+
 class UI {
     constructor() {
         this.session = null;
@@ -1151,7 +1165,7 @@ class UI {
         const el = $('liveStatus');
         if (!el) return;
         el.textContent = text;
-        el.className = 'live-status' + (cls ? ' ' + cls : '');
+        el.className = 'pill' + (cls ? ' ' + cls : '');
     }
 
     clear() {
@@ -1188,20 +1202,30 @@ class UI {
         const pane = $('liveText');
         if (!pane) return;
         const d = document.createElement('div');
-        d.className = 'live-note' + (cls ? ' ' + cls : '');
+        d.className = 'note' + (cls ? ' ' + cls : '');
         d.textContent = text;
         pane.appendChild(d);
     }
 
+    /**
+     * Drive the two level meters.
+     *
+     * The fill is the inner <div> of the shared .mini-bar -- a block box on
+     * purpose, because width does not apply to an inline element and the
+     * original <span> fill silently dropped every write.
+     */
     _meter() {
         for (const id of [CHANNEL_MIC, CHANNEL_SPEAKER]) {
             const el = id === CHANNEL_MIC ? $('liveMeterMic') : $('liveMeterSpk');
             if (!el || !this.session) continue;
+            const bar = el.parentElement;
+            const lbl = bar && bar.parentElement
+                ? bar.parentElement.querySelector('.meter-label') : null;
             const ch = this.session.channel(id);
             const running = this.session.nodes.some((n) => n.channelId === id);
             if (!running) {
                 el.style.width = '0%';
-                const lbl = el.parentElement && el.parentElement.querySelector('.live-meter-label');
+                if (bar) bar.classList.remove('hot');
                 if (lbl) lbl.textContent = '';
                 continue;
             }
@@ -1209,7 +1233,7 @@ class UI {
             const db = ch.peak > 0 ? 20 * Math.log10(ch.peak) : -60;
             const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
             el.style.width = `${pct.toFixed(1)}%`;
-            const lbl = el.parentElement && el.parentElement.querySelector('.live-meter-label');
+            if (bar) bar.classList.toggle('hot', db > -1);
             if (lbl) {
                 // Show the boost too, so a quiet input reads as "levelled up"
                 // rather than as a meter that is stuck low.
@@ -1294,7 +1318,7 @@ class UI {
                 // name anyone (see the note appended below).
                 this._note(
                     'Tab/system audio was not shared, so only the microphone is '
-                    + 'transcribed. Other people cannot be named.', 'warn');
+                    + 'transcribed. Other people cannot be named.', 'italic');
             }
         }
 
@@ -1315,7 +1339,7 @@ class UI {
                 // The user can stop sharing from the browser's own bar; treat
                 // that as "the speaker channel ended" rather than an error.
                 spkStream.getVideoTracks()[0].addEventListener('ended', () => {
-                    this._note('Tab/system audio sharing stopped.', 'warn');
+                    this._note('Tab/system audio sharing stopped.', 'italic');
                 });
                 await session.attach(CHANNEL_SPEAKER, spkStream);
             }
@@ -1329,9 +1353,9 @@ class UI {
         $('liveStop').disabled = false;
         // Hide the settings, never the transport controls: they live in their
         // own row, so the Stop button stays reachable for the whole session.
-        $('liveSettings').style.display = 'none';
-        $('liveConnection').style.display = 'none';
-        $('liveOutput').style.display = '';
+        _show('liveSettings', false);
+        _show('liveConnection', false);
+        _show('liveOutput', true);
         this.setStatus('Recording', 'ok');
         this.lastStats = null;
 
@@ -1383,9 +1407,9 @@ class UI {
                 + 'Keeping whatever the server already sent.', 'warn');
         } finally {
             $('liveStart').disabled = false;
-            $('liveSettings').style.display = '';
-            $('liveConnection').style.display = '';
-            $('liveOutput').style.display = 'none';
+            _show('liveSettings', true);
+            _show('liveConnection', true);
+            _show('liveOutput', false);
         }
 
         if (!session.transcriptCount) {

@@ -608,18 +608,22 @@ def test_the_stop_button_survives_the_recording_state():
 
 
 def test_the_level_meter_fill_is_not_an_inline_box():
-    """`width`/`height` do not apply to a non-replaced inline element.
+    """`width` does not apply to a non-replaced inline element.
 
-    The meter fill is a <span>; without display:block the JS width writes are
-    dropped and the bar reads as a dead capture no matter what the mic is
-    doing.
+    The meter fill was a <span>, so every width write below was dropped and the
+    bar read as a dead capture no matter what the mic was doing. The fill is now
+    a <div> inside the shared `.mini-bar` track.
     """
     template = (REPO_ROOT / "asr_mcp" / "templates" / "app.html").read_text(
         encoding="utf-8")
-    rule = next(l for l in template.split("\n") if ".live-meter-fill {" in l)
-    assert "display: block" in rule or "display:block" in rule, (
-        f".live-meter-fill must be a block box to render its width: {rule.strip()}"
-    )
+    m = re.search(r'<div class="mini-bar meter-bar"[^>]*>\s*<div id="liveMeterMic"',
+                  template)
+    assert m, "the mic meter fill is no longer a <div> inside a .mini-bar"
+    rule = next(l for l in template.split("\n")
+                if ".mini-bar > div {" in l and "display: block" in l)
+    assert "display: block" in rule
+    live_js = LIVE_JS.read_text(encoding="utf-8")
+    assert "el.style.width" in live_js, "the meter no longer writes a width"
 
 
 # ── Input levelling must behave, and must behave the same in both clients ──

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>ASR-MCP</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -17,8 +17,18 @@
             --grad: linear-gradient(135deg, #4f6ef7, #7c5cff);
             --ok: #16a34a;
             --bad: #dc2626;
+            --warn: #b45309;
             --radius: 14px;
             --shadow: 0 1px 2px rgba(16,24,40,.05), 0 10px 28px -16px rgba(16,24,40,.25);
+            /* Tinted pairs for status surfaces. Every status pill, badge and
+               note draws from these, so "green" means one colour everywhere. */
+            --ok-soft: #e7f8ee;   --ok-ink: #0f8a47;
+            --bad-soft: #fdeaea;  --bad-ink: #b4232a;
+            --warn-soft: #fdf1d8; --warn-ink: #92400e;
+            --ghost: #f6f8fd;     /* inset panel: status items, code, preview */
+            /* Heights of the three scrollable transcript surfaces. They share
+               one .text-pane; only the height differs. */
+            --pane-h: 40vh;
         }
         html { -webkit-text-size-adjust: 100%; }
         body {
@@ -78,10 +88,76 @@
         .card-title::before { content: ""; width: 4px; height: 16px; border-radius: 2px; background: var(--grad); flex-shrink: 0; }
         .card-body { padding: 1.4rem; }
 
+        /* ── Shared primitives ───────────────────────────────────────────
+           Layout patterns used by more than one pane. The Live tab originally
+           grew its own set (.live-status/.live-meters/.live-text/.live-note/
+           .live-downloads) and the transcript viewer grew another
+           (.tv-text). Everything below exists so a pane composes these
+           instead of restating them. */
+        .hidden { display: none !important; }
+        .prose { font-size: .86rem; color: var(--muted); line-height: 1.6; }
+        .code {
+            background: var(--ghost); padding: .1rem .35rem; border-radius: 5px;
+            border: 1px solid var(--line); font-size: .82rem; word-break: break-all;
+        }
+        .code-block {
+            display: block; padding: .5rem .7rem; background: var(--ghost);
+            border: 1px solid var(--line); border-radius: 9px; font-size: .8rem; word-break: break-all;
+        }
+        .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+        .row-spread { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+        .stack { display: flex; flex-direction: column; gap: .4rem; }
+        .mt-1 { margin-top: 1rem; }
+        .mt-05 { margin-top: .5rem; }
+        .mb-09 { margin-bottom: .9rem; }
+
+        /* Buttons in a row. .toolbar is the same idea with a page gutter. */
+        .btn-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+        .btn-row a.btn { text-decoration: none; }
+
+        /* A live status word, and the note lines a pane appends while it runs. */
+        .pill {
+            display: inline-flex; align-items: center; gap: .4rem; padding: .24rem .75rem;
+            border-radius: 999px; font-size: .78rem; font-weight: 600;
+            color: var(--muted); background: var(--line);
+        }
+        .pill.ok { background: var(--ok-soft); color: var(--ok-ink); }
+        .pill.bad { background: var(--bad-soft); color: var(--bad-ink); }
+        .note { font-size: .78rem; color: var(--muted); padding: .3rem 0; }
+        .note.warn { color: var(--warn-ink); }
+        .note.ok { color: var(--ok-ink); }
+        .note.italic { font-style: italic; }
+
+        /* The one scrollable transcript surface (#transcriptionTextPane during
+           SSE transcription, the viewer's pane in History, the Live pane). The
+           height comes from --pane-h so each use can differ. */
+        .text-pane {
+            position: relative; overflow-y: auto; max-height: var(--pane-h);
+            border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+            background: #fbfcfe; font-size: .86rem; line-height: 1.55;
+            color: var(--ink); white-space: pre-wrap; overscroll-behavior: contain;
+        }
+        .pane-short { --pane-h: 260px; }   /* SSE transcription pane */
+        .pane-tall { --pane-h: 56vh; }     /* History viewer */
+        .pane-live { --pane-h: 46vh; }     /* Live tab */
+
+        /* Level meter: a name, a bar, a readout. Grid areas so the phone
+           layout can reflow the readout above a full-width bar. */
+        .meter-row {
+            display: grid; grid-template-areas: "name bar label";
+            grid-template-columns: 6.5rem 1fr auto; align-items: center; gap: .3rem .6rem;
+        }
+        .meter-name { grid-area: name; font-size: .72rem; color: var(--muted); }
+        .meter-bar { grid-area: bar; }
+        .meter-label {
+            grid-area: label; font-size: .7rem; color: var(--muted); text-align: right;
+            font-variant-numeric: tabular-nums; white-space: nowrap;
+        }
+
         .btn {
-            padding: .6rem 1.25rem; border: none; border-radius: 10px; cursor: pointer;
+            display: inline-block; padding: .6rem 1.25rem; border: none; border-radius: 10px; cursor: pointer;
             font-size: .87rem; font-weight: 600; transition: transform .14s, box-shadow .14s, background .14s, opacity .14s;
-            font-family: inherit;
+            font-family: inherit; text-align: center;
         }
         .btn:hover { transform: translateY(-1px); }
         .btn:active { transform: translateY(0); }
@@ -96,14 +172,22 @@
         .btn-sm { padding: .32rem .65rem; font-size: .77rem; border-radius: 8px; }
 
         .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .9rem; }
-        .status-item { padding: .85rem .95rem; border-radius: 10px; background: #f6f8fd; border: 1px solid var(--line); }
+        .status-item { padding: .85rem .95rem; border-radius: 10px; background: var(--ghost); border: 1px solid var(--line); }
         .status-item .label { font-size: .72rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: .3rem; font-weight: 600; }
         .status-item .value { font-size: 1.05rem; font-weight: 700; }
         .status-item .sub { font-size: .72rem; color: var(--muted); margin-top: .25rem; line-height: 1.35; word-break: break-word; }
         .status-idle { color: var(--muted); font-weight: 600; }
+        /* The only level meter in the UI: a track with a fill. The fill is a
+           <div> on purpose -- width/height do not apply to a non-replaced
+           inline box, and the live tab's meter was a <span> whose width writes
+           were silently dropped, so it read as a dead capture. */
         .mini-bar { height: 5px; background: #e7ebf5; border-radius: 999px; overflow: hidden; margin-top: .5rem; }
-        .mini-bar > div { height: 100%; width: 0%; background: var(--grad); border-radius: 999px; transition: width .35s; }
+        .mini-bar > div { display: block; height: 100%; width: 0%; background: var(--grad); border-radius: 999px; transition: width .35s; }
         .mini-bar.warn > div { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+        /* Level meters in the Live tab: 8px, instant, and green until it clips. */
+        .meter-row .mini-bar { height: 8px; margin-top: 0; }
+        .meter-row .mini-bar > div { background: var(--ok); transition: width .1s linear; }
+        .meter-row .mini-bar.hot > div { background: var(--bad); }
         .status-ok { color: var(--ok); }
         .status-fail { color: var(--bad); }
 
@@ -154,14 +238,14 @@
 
         .tt-area { position: relative; padding-right: 96px; margin-top: 4px; }
         .tt-caret-layer { position: absolute; top: 0; bottom: 0; left: 0; right: 96px; pointer-events: none; }
-        .tt-pointer { display: none; position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #ff4444; transition: left .15s ease; z-index: 10; }
+        .tt-pointer { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #ff4444; transition: left .15s ease; z-index: 10; }
         .tt-pointer-label { position: relative; height: 18px; font-size: .7rem; color: var(--muted); margin-top: .25rem; overflow: hidden; white-space: nowrap; }
         .tt-overlay { position: absolute; top: 0; bottom: 0; left: 0; right: 96px; pointer-events: none; z-index: 5; }
         .tt-overlay-fill { position: absolute; top: 0; bottom: 0; left: 0; right: 0; background: rgba(148, 163, 184, .45); transition: left .35s ease; }
-        .tt-text-pane { position: relative; margin-top: .55rem; max-height: 240px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #fbfcfe; font-size: .86rem; line-height: 1.55; color: var(--ink); white-space: pre-wrap; }
+        .tt-text-pane { margin-top: .55rem; }
         .tt-text-caret { display: inline-block; width: 2px; height: 1.05em; background: #ff4444; vertical-align: text-bottom; margin-left: 1px; animation: ttCaretBlink 1.1s steps(1) infinite; }
         @keyframes ttCaretBlink { 50% { opacity: .15; } }
-        .tt-text-pane .tp-block.tp-active { background: rgba(79, 110, 247, .09); outline: 1px solid rgba(79, 110, 247, .3); border-radius: 8px; }
+        .text-pane .tp-block.tp-active { background: rgba(79, 110, 247, .09); outline: 1px solid rgba(79, 110, 247, .3); border-radius: 8px; }
 
         .results-area { margin-top: 1.2rem; }
         .results-area h3 { font-size: .95rem; margin-bottom: .6rem; }
@@ -184,7 +268,15 @@
         .bar-name { position: absolute; left: calc(100% + 8px); top: 50%; transform: translateY(-50%); font-size: .7rem; color: var(--muted); white-space: nowrap; }
         .tv-viewer { display: flex; gap: 14px; align-items: stretch; margin-top: .5rem; }
         .tv-bars { flex: 0 0 48%; box-sizing: border-box; position: relative; padding-right: 96px; min-width: 0; }
-        .tv-text { flex: 1; position: relative; max-height: 56vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fbfcfe; min-width: 0; }
+        .tv-text { flex: 1; min-width: 0; }
+        .bars-stack { position: relative; }
+        /* Click target + caret for jumping to a time in the History viewer.
+           They were inline style.cssText strings in viewer.js; they are classes
+           so the phone layout can reach them. */
+        .seek-layer { position: absolute; top: 0; bottom: 0; left: 0; right: 0; cursor: pointer; }
+        .seek-caret { display: none; position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #ff4444; z-index: 10; }
+        .seek-caret.shown { display: block; }
+        .pane-note { color: var(--muted); font-size: .85rem; }
         .tp-block { margin-bottom: 14px; }
         .tp-block-uncertain { border-left: 3px solid #8b949e; padding-left: 9px; }
         .tp-block-uncertain .tp-head { color: #6e7781; }
@@ -208,7 +300,7 @@
             pointer-events: none; max-width: 420px;
         }
         .toast.show { opacity: 1; transform: none; }
-        .toast.error { background: #b4232a; }
+        .toast.error { background: var(--bad-ink); }
 
         .toolbar { display: flex; gap: .6rem; margin-bottom: 1.3rem; flex-wrap: wrap; }
         #rescanStatus {
@@ -241,12 +333,19 @@
         .form-inline input[type="text"] { padding: .4rem .6rem; border: 1px solid var(--line); border-radius: 8px; font-size: .85rem; }
         .form-inline input[type="file"] { font-size: .82rem; max-width: 100%; }
         .form-inline .form-label { font-size: .84rem; font-weight: 600; color: var(--muted); }
+        .form-inline .grow { flex: 1; display: flex; flex-direction: column; gap: .2rem; }
+        .form-inline .grow input { width: 100%; }
+        .disclosure { margin-top: .9rem; }
+        .disclosure summary { cursor: pointer; font-size: .8rem; color: var(--muted); font-weight: 600; }
+        .disclosure summary:hover { color: var(--ink); }
+        .disclosure[open] summary { margin-bottom: .6rem; }
 
         .empty { padding: 2.6rem 1.5rem; text-align: center; color: #98a2bd; font-size: .88rem; line-height: 1.6; }
         .empty .icon { font-size: 2.4rem; margin-bottom: .5rem; opacity: .8; }
         .badge { display: inline-block; padding: .16rem .55rem; border-radius: 999px; font-size: .71rem; font-weight: 700; letter-spacing: .02em; }
-        .badge-green { background: #e7f8ee; color: #0f8a47; }
-        .badge-gray { background: #eef1f7; color: #66708a; }
+        .badge-green { background: var(--ok-soft); color: var(--ok-ink); }
+        .badge-red { background: var(--bad-soft); color: var(--bad-ink); }
+        .badge-gray { background: var(--line); color: var(--muted); }
 
         .btn-play {
             background: var(--grad); color: #fff; border: none; border-radius: 50%; width: 28px; height: 28px;
@@ -255,6 +354,13 @@
         }
         .btn-play:hover { transform: scale(1.08); }
         .btn-play.playing { background: linear-gradient(135deg, #ef4444, #dc2626); box-shadow: 0 6px 14px -8px rgba(220,38,38,1); }
+
+        /* Snippet row: play button, name, duration, provenance. */
+        .snippet-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; min-width: 0; }
+        .snippet-head strong { word-break: break-all; }
+        .snippet-dur { color: var(--muted); }
+        .snippet-src { color: #98a2bd; font-size: .8rem; }
+        .input-narrow { width: 64px; }
 
         .merge-dialog { position: fixed; inset: 0; background: rgba(15,18,35,.55); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 999; }
         .merge-dialog.hidden { display: none; }
@@ -295,33 +401,18 @@
         .detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #98a2bd; font-size: .9rem; text-align: center; padding: 2rem; }
         .meta-line { font-size: .8rem; color: var(--muted); margin-bottom: .8rem; }
 
-        /* ── Live tab ─────────────────────────────────────────────── */
-        .live-status { font-size: .82rem; color: var(--muted); font-weight: 600; }
-        .live-status.ok { color: var(--ok); }
-        .live-status.bad { color: var(--bad); }
-        .live-meters { display: flex; flex-direction: column; gap: .4rem; margin-top: .8rem; }
-        .live-meter { display: flex; align-items: center; gap: .6rem; }
-        .live-meter-name { font-size: .72rem; color: var(--muted); width: 6.5rem; flex-shrink: 0; }
-        .live-meter-track { flex: 1; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; display: block; }
-        /* display:block is load-bearing -- the fill is a <span>, and width/height
-           do not apply to a non-replaced inline box, so the meter sat at 0 and
-           looked like a dead capture. */
-        .live-meter-fill { display: block; height: 100%; width: 0%; background: var(--ok); transition: width .1s linear; }
-        .live-meter-label { font-size: .7rem; color: var(--muted); width: 9.5rem; text-align: right; flex-shrink: 0; font-variant-numeric: tabular-nums; }
-        /* Height is set on the element itself, so a scrollable pane needs a
-           definite height rather than growing with its content. */
-        .live-text { max-height: 46vh; overflow-y: auto; padding: 1rem 1.1rem; }
-        .live-note { font-size: .78rem; color: var(--muted); padding: .3rem 0; font-style: italic; }
-        .live-note.warn { color: #b45309; font-style: normal; }
-        .live-note.ok { color: var(--ok); font-style: normal; }
-        .live-downloads { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .6rem; }
-        .live-downloads a.btn { text-decoration: none; }
-
         ::-webkit-scrollbar { width: 10px; height: 10px; }
         ::-webkit-scrollbar-thumb { background: #c8d0e4; border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
         ::-webkit-scrollbar-thumb:hover { background: #aab4d4; border: 2px solid transparent; background-clip: content-box; }
         ::-webkit-scrollbar-track { background: transparent; }
 
+        /* ── Responsive ──────────────────────────────────────────────
+           Two steps, both max-width so the base rules stay the desktop
+           layout. 860px is tablet (panes stack, the timeline goes vertical);
+           560px is phone (single column, touch targets, scrollable tab strip).
+           Add new components to the phone block rather than adding a third
+           breakpoint -- a component that needs a tablet variant belongs in the
+           860px block. */
         @media (max-width: 860px) {
             .topbar { flex-wrap: wrap; gap: .5rem; padding: .6rem .9rem; }
             .tabs { order: 3; width: 100%; }
@@ -330,9 +421,88 @@
             .detail-pane { min-height: 50vh; }
             .tv-viewer { flex-direction: column; }
             .tv-bars { flex: none; padding-right: 84px; }
-            .live-meter-name { width: 4.5rem; }
-            .live-meter-label { width: 6.5rem; }
-            .live-text { max-height: 38vh; }
+            .pane-live { --pane-h: 38vh; }
+        }
+
+        @media (max-width: 560px) {
+            /* Phones: notches and the home indicator live in the padding. */
+            .topbar { padding: calc(.55rem + env(safe-area-inset-top)) .6rem .55rem; }
+            .brand { font-size: .95rem; }
+            .user-info { font-size: .78rem; gap: .6rem; }
+            /* The five tabs do not fit; scroll them sideways instead of
+               wrapping into a three-row header that eats a third of the
+               viewport. */
+            .tabs {
+                order: 3; width: 100%; flex-wrap: nowrap; overflow-x: auto;
+                scrollbar-width: none; -webkit-overflow-scrolling: touch;
+                margin: 0 -.6rem; padding: 0 .6rem .15rem;
+            }
+            .tabs::-webkit-scrollbar { display: none; }
+            .tabs a { flex-shrink: 0; padding: .55rem .85rem; font-size: .84rem; }
+
+            .pane-inner { padding: .9rem .7rem 3rem; }
+            .card { border-radius: 12px; margin-bottom: 1rem; }
+            .card-title { padding: .8rem 1rem; }
+            .card-body { padding: 1rem; }
+            .card-header { padding: .8rem 1rem; }
+            .card-header h3 { font-size: .92rem; }
+            .card-header .meta { gap: .6rem; }
+
+            /* Anything below 16px makes iOS Safari zoom the page on focus,
+               which then never scrolls back. */
+            input, select, textarea { font-size: 16px; }
+            .btn { min-height: 44px; padding: .6rem 1rem; }
+            .btn-sm { min-height: 34px; }
+            .btn-play { width: 34px; height: 34px; }
+            .btn-cancel { min-height: 40px; }
+
+            .options { flex-direction: column; align-items: stretch; gap: .7rem; }
+            .options label { justify-content: space-between; }
+            .options input:not([type="checkbox"]), .options select { width: 100%; }
+            .form-inline { flex-direction: column; align-items: stretch; }
+            .form-inline input[type="text"], .form-inline input[type="file"] { width: 100%; }
+            .row-spread { align-items: stretch; }
+
+            .status-grid { grid-template-columns: 1fr 1fr; }
+            .upload-area { padding: 1.6rem 1rem; }
+
+            /* Speaker bars: the name gutter would eat a third of the width,
+               so the name moves inside the row instead. */
+            .tv-bars { padding-right: 0; }
+            .bar-name {
+                left: .4rem; max-width: 70%; overflow: hidden; text-overflow: ellipsis;
+                background: rgba(255,255,255,.82); padding: 0 .25rem; border-radius: 4px;
+            }
+            /* Same reasoning for the SSE timeline caret gutter. */
+            .tt-area { padding-right: 0; }
+            .tt-caret-layer, .tt-overlay { right: 0; }
+            .tt-pointer-label { height: auto; white-space: normal; }
+
+            /* The readout moves above a full-width bar. */
+            .meter-row { grid-template-areas: "name label" "bar bar"; grid-template-columns: 1fr auto; }
+            .meter-label { text-align: right; }
+
+            .speaker-list li { flex-wrap: wrap; gap: .5rem; }
+            .list-pane { max-height: 46vh; }
+            .detail-head { flex-wrap: wrap; }
+            .detail-body { padding: 1rem; }
+
+            .merge-dialog .dialog-box { width: auto; padding: 1.1rem; max-height: 88vh; overflow-y: auto; }
+            .toast {
+                left: .7rem; right: .7rem; max-width: none;
+                bottom: calc(.7rem + env(safe-area-inset-bottom));
+            }
+            .pane-short, .pane-live { --pane-h: 55vh; }
+            .pane-tall { --pane-h: 60vh; }
+        }
+
+        /* A phone that is also being dragged around does not need the
+           transitions; the pane fade and the live caret are the loud ones. */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: .01ms !important; animation-iteration-count: 1 !important;
+                transition-duration: .01ms !important; scroll-behavior: auto !important;
+            }
         }
     </style>
 </head>
@@ -351,15 +521,15 @@
                             <input type="file" id="audioFile" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus" multiple onchange="fileSelected(this)">
                             <div class="formats">WAV, MP3, MP4, MKV, FLAC, OGG, M4A, WebM, OPUS</div>
                         </div>
-                        <div id="fileName" style="display:none;"></div>
+                        <div id="fileName" hidden></div>
 
-                        <div id="progressArea" class="progress-area" style="display:none;">
+                        <div id="progressArea" class="progress-area" hidden>
                             <div class="prog-block">
                                 <div class="prog-label">Diarization</div>
                                 <div class="pbar"><div id="diarProgressBar">0%</div></div>
                                 <div id="diarProgressStage" class="prog-stage">Preparing...</div>
                             </div>
-                            <div id="transcriptionArea" style="display:none;">
+                            <div id="transcriptionArea" hidden>
                                 <div class="prog-label">Transcription</div>
                                 <div class="tt-area" id="transcriptionBarArea">
                                     <div id="transcriptionSegments"></div>
@@ -367,17 +537,17 @@
                                         <div id="transcriptionOverlayFill" class="tt-overlay-fill"></div>
                                     </div>
                                     <div id="transcriptionCaretLayer" class="tt-caret-layer">
-                                        <div id="transcriptionPointer" class="tt-pointer"></div>
-                                        <div id="transcriptionJumpCaret" class="tt-pointer"></div>
+                                        <div id="transcriptionPointer" class="tt-pointer" hidden></div>
+                                        <div id="transcriptionJumpCaret" class="tt-pointer" hidden></div>
                                     </div>
                                 </div>
                                 <div id="transcriptionPointerLabel" class="tt-pointer-label"></div>
-                                <div id="transcriptionLegend" style="display:none;"></div>
-                                <div id="transcriptionTextPane" class="tt-text-pane" style="display:none;"></div>
+                                <div id="transcriptionLegend" hidden></div>
+                                <div id="transcriptionTextPane" class="text-pane pane-short tt-text-pane" hidden></div>
                                 <div id="transcriptionStage" class="prog-stage">Waiting for diarization...</div>
                             </div>
                             <div class="prog-actions">
-                                <button id="cancelJobBtn" type="button" class="btn-cancel" onclick="cancelActiveJob()" style="display:none;">Cancel</button>
+                                <button id="cancelJobBtn" type="button" class="btn-cancel" onclick="cancelActiveJob()" hidden>Cancel</button>
                             </div>
                         </div>
 
@@ -394,12 +564,12 @@
                                 </select>
                             </label>
                             <label>Speakers:
-                                <input type="number" id="numSpeakers" min="0" max="30" placeholder="auto" style="width:64px">
+                                <input type="number" id="numSpeakers" class="input-narrow" min="0" max="30" placeholder="auto">
                             </label>
                             <button class="btn btn-primary" id="processBtn" onclick="processAudio()" disabled>Process Audio</button>
                         </div>
 
-                        <div class="results-area" id="resultsArea" style="display:none;">
+                        <div class="results-area" id="resultsArea" hidden>
                             <h3>Results</h3>
                             <div id="timelineContainer"></div>
                             <div id="resultsContent"></div>
@@ -414,7 +584,7 @@
                 <div class="card">
                     <div class="card-title">Live Transcription</div>
                     <div class="card-body">
-                        <p class="meta-line" style="margin-bottom: 1rem;">
+                        <p class="prose mb-09">
                             Transcribe a meeting in real time from this browser. The microphone
                             is the local user and is never voiceprint-matched against your own
                             profile; shared tab or system audio is everyone else and is matched
@@ -427,53 +597,49 @@
                             <label>Language:
                                 <select id="liveLang"><option value="auto">Auto-detect</option></select>
                             </label>
-                            <label style="display:flex;align-items:center;gap:.35rem;">
+                            <label>
                                 <input type="checkbox" id="liveSpeaker" checked>
                                 Include tab / system audio
                             </label>
-                            <label style="display:flex;align-items:center;gap:.35rem;">
+                            <label>
                                 <input type="checkbox" id="liveSaveHistory" checked>
                                 Save to history
                             </label>
                         </div>
-                        <details id="liveConnection" style="margin-top:.9rem;">
-                            <summary class="meta-line" style="cursor:pointer;">
-                                Connection details
-                            </summary>
-                            <div class="form-inline" style="margin-top:.6rem;">
-                                <label style="flex:1;">
+                        <details class="disclosure mt-05" id="liveConnection">
+                            <summary>Connection details</summary>
+                            <div class="form-inline">
+                                <label class="form-label grow">
                                     API token (only needed without a session cookie):
-                                    <input type="text" id="liveToken" placeholder="from the Settings tab"
-                                           style="width:100%;margin-top:.2rem;">
+                                    <input type="text" id="liveToken" placeholder="from the Settings tab">
                                 </label>
                             </div>
                         </details>
                         <!-- The transport controls live OUTSIDE liveSettings: the
                              recording state hides the settings, and hiding them
                              must not take the Stop button with them. -->
-                        <div class="options" style="margin-top:.9rem;">
+                        <div class="btn-row mt-05">
                             <button class="btn btn-primary" id="liveStart">Start</button>
                             <button class="btn btn-danger" id="liveStop" disabled>Stop</button>
-                            <span class="live-status" id="liveStatus"></span>
+                            <span class="pill" id="liveStatus"></span>
                         </div>
 
-                        <div class="live-meters" id="liveOutput" style="display:none;">
-                            <div class="live-meter">
-                                <span class="live-meter-name">Microphone</span>
-                                <span class="live-meter-track"><span class="live-meter-fill" id="liveMeterMic"></span></span>
-                                <span class="live-meter-label"></span>
+                        <div class="stack mt-05 hidden" id="liveOutput">
+                            <div class="meter-row">
+                                <span class="meter-name">Microphone</span>
+                                <div class="mini-bar meter-bar"><div id="liveMeterMic"></div></div>
+                                <span class="meter-label"></span>
                             </div>
-                            <div class="live-meter">
-                                <span class="live-meter-name">Tab / system</span>
-                                <span class="live-meter-track"><span class="live-meter-fill" id="liveMeterSpk"></span></span>
-                                <span class="live-meter-label"></span>
+                            <div class="meter-row">
+                                <span class="meter-name">Tab / system</span>
+                                <div class="mini-bar meter-bar"><div id="liveMeterSpk"></div></div>
+                                <span class="meter-label"></span>
                             </div>
                         </div>
 
-                        <div class="live-text" id="liveText"
-                             style="margin-top:1rem;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);"></div>
+                        <div class="text-pane pane-live mt-05" id="liveText"></div>
 
-                        <div class="live-downloads" id="liveDownloads"></div>
+                        <div class="btn-row mt-05" id="liveDownloads"></div>
                     </div>
                 </div>
             </div>
@@ -508,17 +674,17 @@
                             <span id="countBadge"></span>
                         </div>
                         <div class="list-scroll" id="listContainer"></div>
-                        <div id="emptyState" class="empty" style="display:none;">
+                        <div id="emptyState" class="empty" hidden>
                             <div class="icon">&#128196;</div>
                             <p>No transcriptions yet.</p>
-                            <p style="font-size:.8rem;margin-top:.3rem;">Process audio files to see them here.</p>
+                            <p class="note">Process audio files to see them here.</p>
                         </div>
                     </div>
 
                     <div class="detail-pane">
                         <div class="detail-head">
                             <span class="title" id="detailTitle">Transcription</span>
-                            <div class="actions" id="detailActions" style="display:none;">
+                            <div class="actions" id="detailActions" hidden>
                                 <button class="btn btn-success btn-sm" onclick="downloadTranscription(currentId)">Download</button>
                                 <button class="btn btn-danger btn-sm" onclick="deleteTranscription(currentId)">Delete</button>
                             </div>
@@ -545,7 +711,7 @@
                             <div class="status-item"><div class="label">CUDA Device</div><div class="value" id="stCuda">-</div></div>
                             <div class="status-item"><div class="label">Active Job</div><div class="value" id="stJob">-</div><div class="sub" id="stJobSub"></div></div>
                         </div>
-                        <div style="margin-top:1rem;">
+                        <div class="mt-1">
                             <button class="btn btn-ghost btn-sm" onclick="checkStatus()">Refresh status</button>
                         </div>
                     </div>
@@ -554,13 +720,13 @@
                 <div class="card">
                     <div class="card-title">Windows Client Token</div>
                     <div class="card-body">
-                        <p style="font-size:.86rem;color:var(--muted);margin-bottom:.9rem;line-height:1.6;">
-                            API token for the <code style="background:#f2f5fb;padding:.1rem .35rem;border-radius:5px;border:1px solid var(--line);">asr-client</code> drop-target client. One token per user; generating a new one invalidates the previous token. Put it in <code style="background:#f2f5fb;padding:.1rem .35rem;border-radius:5px;border:1px solid var(--line);">asr-client/.env</code> as <code style="background:#f2f5fb;padding:.1rem .35rem;border-radius:5px;border:1px solid var(--line);">TOKEN=...</code>.
+                        <p class="prose mb-09">
+                            API token for the <code class="code">asr-client</code> drop-target client. One token per user; generating a new one invalidates the previous token. Put it in <code class="code">asr-client/.env</code> as <code class="code">TOKEN=...</code>.
                         </p>
-                        <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;">
+                        <div class="row">
                             <button class="btn btn-primary" id="genTokenBtn" onclick="generateClientToken()">Generate token</button>
-                            <code id="tokenValue" style="display:none;padding:.5rem .7rem;background:#f2f5fb;border:1px solid var(--line);border-radius:9px;font-size:.8rem;word-break:break-all;"></code>
-                            <button class="btn btn-ghost btn-sm" id="copyTokenBtn" style="display:none;" onclick="copyClientToken()">Copy</button>
+                            <code id="tokenValue" class="code-block" hidden></code>
+                            <button class="btn btn-ghost btn-sm" id="copyTokenBtn" hidden onclick="copyClientToken()">Copy</button>
                         </div>
                     </div>
                 </div>
@@ -568,8 +734,8 @@
                 <div class="card">
                     <div class="card-title">Session</div>
                     <div class="card-body">
-                        <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
-                            <div style="font-size:.88rem;color:var(--muted);" id="sessionInfo">Loading...</div>
+                        <div class="row-spread">
+                            <div class="prose" id="sessionInfo">Loading...</div>
                             <button class="btn btn-ghost btn-sm" onclick="logout()">Log out</button>
                         </div>
                     </div>
@@ -581,7 +747,7 @@
     <div class="merge-dialog hidden" id="mergeDialog">
         <div class="dialog-box">
             <h3>Merge Speakers</h3>
-            <p style="font-size:.85rem;color:var(--muted);margin-bottom:.9rem;">Snippets from secondary speaker will be moved to primary. Secondary will be removed.</p>
+            <p class="prose mb-09">Snippets from secondary speaker will be moved to primary. Secondary will be removed.</p>
             <label>Primary (keep):</label>
             <select id="mergePrimary"></select>
             <label>Secondary (absorb):</label>
@@ -629,6 +795,20 @@
             t.textContent = msg;
             t.className = 'toast show' + (isError ? ' error' : '');
             setTimeout(() => t.className = 'toast', 4000);
+        }
+
+        /**
+         * Show or hide an element by toggling .hidden.
+         *
+         * Visibility is a class, not an inline `style.display` write: the
+         * stylesheet owns every element's display mode, so the job UI can come
+         * and go without knowing whether a pane is a flex row, a grid cell or a
+         * bare div, and without leaving `style="display:..."` in the template.
+         */
+        function show(elOrId, on) {
+            const el = typeof elOrId === 'string' ? document.getElementById(elOrId) : elOrId;
+            if (el) el.classList.toggle('hidden', !on);
+            return el;
         }
 
         function formatDuration(sec) {
@@ -852,8 +1032,8 @@
                 const d = await r.json();
                 const el = document.getElementById('tokenValue');
                 el.textContent = d.token;
-                el.style.display = 'inline-block';
-                document.getElementById('copyTokenBtn').style.display = 'inline-block';
+                show(el, true);
+                show('copyTokenBtn', true);
                 toast('Token generated — copy it into asr-client/.env');
             } catch (e) {
                 toast('Failed to generate token: ' + e.message, true);
@@ -957,18 +1137,18 @@
             });
             if (bad.length) {
                 el.textContent = 'Skipped unsupported file(s): ' + bad.map(f => f.name).join(', ');
-                el.style.display = 'block';
+                show(el, true);
             } else if (files.length > 0) {
                 if (files.length === 1) {
                     el.textContent = files[0].name;
                 } else {
                     el.textContent = files.length + ' files selected';
                 }
-                el.style.display = 'block';
+                show(el, true);
                 btn.disabled = false;
                 return;
             } else {
-                el.style.display = 'none';
+                show(el, false);
                 btn.disabled = true;
                 return;
             }
@@ -989,56 +1169,56 @@
 
         function enterJobUi(label) {
             jobUiActive = true;
-            document.getElementById('uploadArea').style.display = 'none';
-            document.querySelector('#tab-transcribe .options').style.display = 'none';
+            show('uploadArea', false);
+            show(document.querySelector('#tab-transcribe .options'), false);
             const fn = document.getElementById('fileName');
             fn.textContent = label;
-            fn.style.display = 'block';
+            show(fn, true);
             const btn = document.getElementById('processBtn');
             btn.disabled = true;
             btn.innerHTML = '<span class="spinner"></span>Processing...';
             const resultsArea = document.getElementById('resultsArea');
-            resultsArea.style.display = 'none';
+            show(resultsArea, false);
             document.getElementById('timelineContainer').innerHTML = '';
             const progressArea = document.getElementById('progressArea');
-            progressArea.style.display = 'block';
+            show(progressArea, true);
             const cancelBtn = document.getElementById('cancelJobBtn');
-            cancelBtn.style.display = '';
+            show(cancelBtn, true);
             cancelBtn.disabled = false;
             cancelBtn.textContent = 'Cancel';
             stopStageTicker();
             document.getElementById('diarProgressBar').style.width = '0%';
             document.getElementById('diarProgressBar').textContent = '0%';
             document.getElementById('diarProgressStage').textContent = 'Preparing...';
-            document.getElementById('transcriptionArea').style.display = 'none';
+            show('transcriptionArea', false);
             document.getElementById('transcriptionStage').textContent = 'Waiting for diarization...';
             document.getElementById('transcriptionSegments').innerHTML = '';
-            document.getElementById('transcriptionPointer').style.display = 'none';
+            show('transcriptionPointer', false);
             document.getElementById('transcriptionPointerLabel').textContent = '';
-            document.getElementById('transcriptionLegend').style.display = 'none';
+            show('transcriptionLegend', false);
             document.getElementById('transcriptionLegend').innerHTML = '';
             const tp = document.getElementById('transcriptionTextPane');
-            tp.style.display = 'none';
+            show(tp, false);
             tp.scrollTop = 0;
             tp.innerHTML = '';
-            document.getElementById('transcriptionJumpCaret').style.display = 'none';
+            show('transcriptionJumpCaret', false);
             document.getElementById('transcriptionOverlayFill').style.left = '0%';
         }
 
         function exitJobUi() {
             jobUiActive = false;
             activeSseState = null;
-            document.getElementById('cancelJobBtn').style.display = 'none';
+            show('cancelJobBtn', false);
             stopStageTicker();
-            document.getElementById('uploadArea').style.display = '';
-            document.querySelector('#tab-transcribe .options').style.display = '';
+            show('uploadArea', true);
+            show(document.querySelector('#tab-transcribe .options'), true);
             const btn = document.getElementById('processBtn');
             const files = document.getElementById('audioFile').files;
             btn.innerHTML = 'Process Audio';
             btn.disabled = !files.length;
             const fn = document.getElementById('fileName');
             if (!files.length) {
-                fn.style.display = 'none';
+                show(fn, false);
                 fn.textContent = '';
             }
         }
@@ -1174,16 +1354,16 @@
                     st.allSpeakers = [...new Set(segments.map(speakerKey))].sort();
 
                     if (st.audioDur > 0 && segments.length) {
-                        st.transcriptionArea.style.display = 'block';
+                        show(st.transcriptionArea, true);
                         fillSpeakerBars(st.transcriptionSegments, segments, st.audioDur, st.allSpeakers);
-                        st.transcriptionPointer.style.display = 'block';
+                        show(st.transcriptionPointer, true);
                         st.transcriptionPointer.style.left = '0%';
-                        st.transcriptionLegend.style.display = 'none';
-                        st.transcriptionTextPane.style.display = 'block';
+                        show(st.transcriptionLegend, false);
+                        show(st.transcriptionTextPane, true);
                         st.transcriptionTextPane.innerHTML = '';
                         st.liveItems.length = 0;
                         st.transcriptionOverlayFill.style.left = '0%';
-                        document.getElementById('transcriptionJumpCaret').style.display = 'none';
+                        show('transcriptionJumpCaret', false);
                     }
                 }
             }
@@ -1241,7 +1421,7 @@
 
         function renderLivePane(st) {
             const pane = st.transcriptionTextPane;
-            if (!pane || pane.style.display === 'none') return;
+            if (!pane || pane.classList.contains('hidden')) return;
             const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
             const blocks = groupLiveItems(st.liveItems);
             pane.innerHTML = '';
@@ -1272,7 +1452,7 @@
             const stx = activeSseState;
             if (!stx || !stx.audioDur || !jobUiActive) return;
             const pane = stx.transcriptionTextPane;
-            if (!pane || pane.style.display === 'none') return;
+            if (!pane || pane.classList.contains('hidden')) return;
             const rect = stx.transcriptionSegments.getBoundingClientRect();
             if (!rect.width) return;
             const frac = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
@@ -1287,7 +1467,7 @@
             }
             if (!target) target = prev || blocks[blocks.length - 1];
             const jc = document.getElementById('transcriptionJumpCaret');
-            jc.style.display = 'block';
+            show(jc, true);
             jc.style.left = (frac * 100).toFixed(2) + '%';
             const els = pane.querySelectorAll('.tp-block');
             let el = null;
@@ -1369,10 +1549,10 @@
             dl.href = window._resultUrl;
             dl.download = 'transcription.txt';
             dl.className = 'btn btn-primary';
-            dl.style.display = 'inline-block';
+            show(dl, true);
             dl.textContent = 'Download transcription';
             resultsContent.appendChild(dl);
-            document.getElementById('resultsArea').style.display = 'block';
+            show('resultsArea', true);
         }
 
         async function attachActiveJob(job) {
@@ -1384,7 +1564,7 @@
             activateTab('transcribe');
             enterJobUi('Processing: ' + fname);
             if (job && job.can_cancel === false) {
-                document.getElementById('cancelJobBtn').style.display = 'none';
+                show('cancelJobBtn', false);
             }
             const st = newSseState(mode);
             try {
@@ -1403,7 +1583,7 @@
             if (st.noResult) {
                 exitJobUi();
                 toast('Processing complete');
-                setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+                setTimeout(() => { show('progressArea', false); }, 5000);
                 return;
             }
             if (!st.finalData) {
@@ -1418,7 +1598,7 @@
             showDownloadLink(allResults);
             exitJobUi();
             toast('Processing complete');
-            setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+            setTimeout(() => { show('progressArea', false); }, 5000);
         }
 
         async function processAudio() {
@@ -1488,7 +1668,7 @@
             showDownloadLink(allResults);
             toast('Processing complete');
             exitJobUi();
-            setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 5000);
+            setTimeout(() => { show('progressArea', false); }, 5000);
         }
 
         async function cancelActiveJob() {
@@ -1630,7 +1810,8 @@
                         <div class="meta"><span>learned from recordings, not yet matched against anything</span></div>
                     </div>
                     <p class="note">Name these to make them recognisable. Until you do, their speech is attributed as
-                        <strong>UNKNOWN</strong> (the words are always kept) and they never win a voiceprint match.</p>
+                        <strong>UNKNOWN</strong> (the words are always kept) and they never win a voiceprint match.
+                        If one of them is a person you already added, merge it instead of naming it again.</p>
                     ${pending.map(p => `
                         <div class="row row-spread">
                             <div class="meta">
@@ -1727,11 +1908,11 @@
                     <ul class="speaker-list">
                         ${data.snippets.map(s => `
                             <li>
-                                <div>
+                                <div class="snippet-head">
                                     <button class="btn-play" id="play-${s.id}" onclick="togglePlay(${s.id})" title="Play">&#9654;</button>
-                                    <strong style="margin-left:0.5rem;">${escHtml(basename(s.file_path))}</strong>
-                                    <span style="color:var(--muted);margin-left:0.5rem;">${s.duration_sec.toFixed(1)}s</span>
-                                    ${s.source_audio ? '<span style="color:#98a2bd;margin-left:0.5rem;font-size:0.8rem;">from ' + escHtml(basename(s.source_audio)) + '</span>' : ''}
+                                    <strong>${escHtml(basename(s.file_path))}</strong>
+                                    <span class="snippet-dur">${s.duration_sec.toFixed(1)}s</span>
+                                    ${s.source_audio ? '<span class="snippet-src">from ' + escHtml(basename(s.source_audio)) + '</span>' : ''}
                                 </div>
                                 <div class="actions">
                                     <button class="btn btn-danger btn-sm" onclick="deleteSnippet(${s.id}, '${escHtml(name)}')">Remove</button>
@@ -1975,12 +2156,12 @@
 
             if (!transcripts.length) {
                 container.innerHTML = '';
-                empty.style.display = 'block';
+                show(empty, true);
                 badge.textContent = '';
                 return;
             }
 
-            empty.style.display = 'none';
+            show(empty, false);
             badge.textContent = transcripts.length + ' file(s)';
             container.innerHTML = '';
 
@@ -2018,7 +2199,7 @@
                 } else if (currentId && !transcripts.some(t => t.id === currentId)) {
                     currentId = null;
                     document.getElementById('detailTitle').textContent = 'Transcription';
-                    document.getElementById('detailActions').style.display = 'none';
+                    show('detailActions', false);
                     document.getElementById('detailBody').innerHTML =
                         '<div class="detail-empty">Select a transcription from the list to view it here.</div>';
                 }
@@ -2031,7 +2212,7 @@
             currentId = id;
             renderList();
             document.getElementById('detailTitle').textContent = 'Loading...';
-            document.getElementById('detailActions').style.display = 'none';
+            show('detailActions', false);
             document.getElementById('detailBody').innerHTML =
                 '<div class="detail-empty">Loading...</div>';
             try {
@@ -2040,7 +2221,7 @@
                 const result = item.result || {};
 
                 document.getElementById('detailTitle').textContent = item.audio_filename;
-                document.getElementById('detailActions').style.display = 'flex';
+                show('detailActions', true);
                 const body = document.getElementById('detailBody');
                 body.innerHTML = '';
 
@@ -2067,7 +2248,7 @@
                 }
             } catch (e) {
                 document.getElementById('detailTitle').textContent = 'Transcription';
-                document.getElementById('detailActions').style.display = 'none';
+                show('detailActions', false);
                 document.getElementById('detailBody').innerHTML =
                     '<div class="detail-empty">Failed to load transcription.</div>';
                 toast('Failed to load transcription', true);
@@ -2089,7 +2270,7 @@
                     renderList();
                     if (wasCurrent) {
                         document.getElementById('detailTitle').textContent = 'Transcription';
-                        document.getElementById('detailActions').style.display = 'none';
+                        show('detailActions', false);
                         document.getElementById('detailBody').innerHTML =
                             '<div class="detail-empty">Select a transcription from the list to view it here.</div>';
                     }

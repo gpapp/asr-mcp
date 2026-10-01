@@ -140,6 +140,13 @@ A third live client alongside `asr-client/live_client.py`, for `/live` in the SP
 - **Per-channel turn split** (`Session.turnSplit()`, in the end-of-session note, the sidecar and the `.txt` header) is the one number that explains a bad transcript. `mic 0, speaker 12` means the mic recording has no speech for the re-attribution to diarize, so every item collapses onto one speakerless turn and the whole session comes back UNKNOWN with no reason shown.
 - Live transcript items arrive in **decode-completion order** — sort by `start` before rendering or re-attributing.
 
+### Frontend: one stylesheet, one design system
+- All CSS is inline in `templates/app.html` (`<style>`, comments stripped by the tests before matching). No CSS file, no build step.
+- **A pane composes shared classes; it does not declare its own.** The Live tab shipped with `.live-status` / `.live-meters` / `.live-meter-*` / `.live-text` / `.live-note` / `.live-downloads` — a private second copy of the pill, the level meter and the transcript surface. The primitives are `.pill`, `.note`, `.mini-bar` + `.meter-row`, `.text-pane` + `.pane-short|tall|live`, `.btn` + `.row`/`.row-spread`, `.badge`, `.toast`, `.hidden` + `show(id, on)`. Status colours are `:root` tokens (`--ok-ink --bad-ink --warn-ink --*-soft --pane-h`) and must not be re-hardcoded.
+- **Two max-width breakpoints only: 860px and 560px.** Base rules are the desktop layout, so a `min-width` query is a rule violation. The 560px block is the phone layout (scrollable tab strip, 16px input floor for iOS, 44px tap targets, stacked controls, safe-area insets, `prefers-reduced-motion`); `<meta name="viewport">` carries `viewport-fit=cover` or the safe-area padding is inert.
+- **No inline styles.** Visibility is the `.hidden` class plus `show()`; no `style.display` writes and no `style="..."` in markup.
+- `tests/test_ui_design_system.py` pins all of the above in both directions (no orphan class either way, no private primitive, no inline style, token-only colours, exactly two breakpoints).
+
 ## Project Structure
 
 ```
@@ -211,6 +218,8 @@ asr-mcp/
 │       ├── login.html         # Dark-themed login form
 │       └── app.html           # Unified SPA: Transcribe / Live / Voiceprints / History / Settings tabs
 ├── tests/                    # Pure-python unit tests (pytest, no GPU needed)
+│                            # test_ui_design_system.py = the CSS design system
+│                            # test_live_js_protocol.py = the browser live client
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt output, voiceprints
 │   │                           # .txt = profiles banner + [HH:MM:SS] Speaker (NN%): paragraphs —
@@ -417,7 +426,7 @@ anything the rule covers.
 |---|---|---|
 | 17 | Every second of the timeline is covered by exactly one turn | [turns](docs/lessons/transcription-turns.md) |
 | 18 | Exact turn boundaries come from uncollapsed VAD + voiceprint attribution | [turns](docs/lessons/transcription-turns.md) |
-| 21 | CSS for JS-generated elements must not be scoped under classes JS never adds | [frontend](docs/lessons/frontend-and-client.md) |
+| 21 | CSS for JS-generated elements must not be scoped under classes JS never adds — and a pane must *compose* the shared classes, not declare a private copy | [frontend](docs/lessons/frontend-and-client.md) |
 | 22 | Display the REFINED segments, not raw diarization | [frontend](docs/lessons/frontend-and-client.md) |
 | 23 | Progress UI needs per-window time interpolation | [frontend](docs/lessons/frontend-and-client.md) |
 | 24 | Paragraph breaks at pauses snap to a sentence end within 40 chars | [frontend](docs/lessons/frontend-and-client.md) |
