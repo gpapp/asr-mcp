@@ -215,10 +215,15 @@ def _install_stubs():
             self.rows = [r for r in self.rows if r["id"] != snippet_id]
             return len(self.rows) != before
 
-        def find_duplicate(self, source_audio, start_sec, user_id="default"):
+        def find_duplicate(self, source_audio, start_sec, user_id="default",
+                           speaker_name=None):
             for r in self.rows:
-                if r["source_audio"] == source_audio and r["start_sec"] == start_sec:
-                    return dict(r)
+                if r["source_audio"] != source_audio or r["start_sec"] != start_sec:
+                    continue
+                # ``speaker_name`` scopes it, exactly as the SQL version does.
+                if speaker_name is not None and r["speaker_name"] != speaker_name:
+                    continue
+                return dict(r)
             return None
 
         def rename_speaker(self, old, new, user_id="default"):
@@ -409,10 +414,21 @@ def _one_voice(jitter=0.05):
     The jitter is deterministic in the span's offset, so the within-profile
     spread is reproducible instead of zero -- a profile whose own spans agree
     EXACTLY is not a case worth testing the purity statistic on.
+
+    A LARGE ``jitter`` is a second, and more important, case: a single voice
+    whose spans are spread widely enough that average linkage splits the
+    cluster anyway.  That is the shape the cohesion re-join exists for, and it
+    is the only way to reach it with the shipped thresholds -- see
+    :func:`_fan_spans`.
     """
     def _embed(t):
         return _voice(1.0, 0.0, seed=int(t) + 1, jitter=jitter)
     return _embed
+
+
+def _fan_spans(n, dur=18.0, step=20.0):
+    """``n`` evenly spaced spans -- the corpus a wide-spread voice is judged on."""
+    return [(float(i * step), float(i * step + dur)) for i in range(n)]
 
 
 def _two_voices(split_at=100.0, sep=0.42, jitter=0.02):
@@ -637,6 +653,150 @@ def test_a_different_person_in_a_second_recording_mints_a_second_profile(
 
 
 # --------------------------------------------------------------------------
+# reprocessing a recording REPLACES its take, it does not stack on it
+# --------------------------------------------------------------------------
+
+def test_reprocessing_a_recording_replaces_the_spans_it_cut_before(make_service):
+    """The point of a reprocess is better boundaries. Keeping the old spans
+    would leave the profile fitted to two takes of one room -- the shape of
+    overfitting -- and the newer boundaries would be a minority of the corpus."""
+    s = make_service(_one_voice(jitter=0.03))
+    first_spans = [(0.0, 18.0), (20.0, 38.0), (40.0, 58.0)]
+    first = s.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=_segments("Speaker 5", first_spans),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    name = first["pending_created"][0]["name"]
+    assert s._snippets.count(name, user_id="u") == 3
+
+    # Same recording, same cluster label, same voice, BETTER boundaries: every
+    # span moved. (The label is kept: two labels in one recording are two
+    # speakers by decision -- see ``_find_pending_to_extend``.)
+    second_spans = [(1.0, 18.5), (20.5, 38.5), (40.5, 58.5)]
+    second = s.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=_segments("Speaker 5", second_spans),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+
+    assert second["pending_created"] == [], second
+    assert [p["name"] for p in second["pending_extended"]] == [name]
+    assert s._snippets.count(name, user_id="u") == 3, (
+        "the previous take of the recording must be gone, not kept alongside"
+    )
+    snips = sorted(s.list_snippets(name, user_id="u"), key=lambda x: x["start_sec"])
+    assert [(x["start_sec"], x["end_sec"]) for x in snips] == second_spans
+
+
+def test_reprocessing_keeps_the_clips_from_other_recordings(make_service):
+    """Only the re-run file is replaced. The second recording is the reason the
+    profile generalises at all and must survive untouched."""
+    s = make_service(_one_voice(jitter=0.03))
+    s.auto_collect_from_diarization(
+        audio_path="interview.wav",
+        segments=_segments("Speaker 5", [(0.0, 18.0), (20.0, 38.0), (40.0, 58.0)]),
+        user_id="u", source_id="interview.wav", learn_new=True,
+    )
+    out = s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=_segments("Speaker 5", [(10.0, 28.0), (30.0, 48.0)]),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    # Same voice in a different recording -> the first profile is EXTENDED, so
+    # the name comes from there; either way it is the one profile.
+    name = (out["pending_created"] or out["pending_extended"])[0]["name"]
+    assert s._snippets.count(name, user_id="u") == 5
+
+    s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=_segments("Speaker 5", [(11.0, 28.0), (31.0, 48.0)]),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+
+    snips = s.list_snippets(name, user_id="u")
+    assert s._snippets.count(name, user_id="u") == 5
+    kept = sorted(x["start_sec"] for x in snips
+                  if x["source_audio"] == "interview.wav")
+    assert kept == [0.0, 20.0, 40.0]
+
+
+def test_a_registered_speaker_is_reprocessed_the_same_way(make_service):
+    """The collect path (a REGISTERED speaker) replaces too, not just the
+    learn path -- and its own take of the file is what it drops."""
+    voice = _voice(1.0, 0.0, seed=7, jitter=0.02)
+    s = make_service(_one_voice(jitter=0.02), register={"Ana": voice})
+    s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=_segments("Ana", [(0.0, 18.0), (20.0, 38.0)]),
+        user_id="u", source_id="meeting.wav",
+    )
+    assert s._snippets.count("Ana", user_id="u") == 2
+
+    s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=_segments("Ana", [(1.0, 18.5), (20.5, 38.5), (41.0, 59.0)]),
+        user_id="u", source_id="meeting.wav",
+    )
+
+    snips = sorted(s.list_snippets("Ana", user_id="u"),
+                   key=lambda x: x["start_sec"])
+    assert len(snips) == 3, snips
+    assert [(x["start_sec"], x["end_sec"]) for x in snips] == [
+        (1.0, 18.5), (20.5, 38.5), (41.0, 59.0)]
+
+
+def test_a_speaker_who_is_no_longer_recognised_keeps_the_old_take(make_service):
+    """No fresh snippets means nothing is purged. A recording where the
+    speaker's identity came back UNCERTAIN must not silently strip the audio a
+    previous, confident run contributed -- the run collected nothing, so it has
+    no better take to offer."""
+    s = make_service(_one_voice())
+    out = s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=_segments("Speaker 5", [(0.0, 18.0), (20.0, 38.0), (40.0, 58.0)]),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    name = out["pending_created"][0]["name"]
+
+    # Every span is too short to collect (AUTO_COLLECT_MIN_DURATION = 3.0s).
+    s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=_segments("Speaker 5", [(0.0, 1.0), (2.0, 3.0), (4.0, 5.0)]),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+
+    assert s._snippets.count(name, user_id="u") == 3
+
+
+def test_a_second_speakers_row_is_never_deleted_by_another_speakers_collect(
+        make_service):
+    """``find_duplicate`` deletes what it finds, so an unscoped lookup would let
+        one profile's collection remove ANOTHER profile's audio -- which that
+        profile's embedding, not rebuilt by this run, would keep describing."""
+    register = {"Ana": _voice(1.0, 0.0, seed=3, jitter=0.01),
+                "Bo": _voice(-1.0, 0.0, seed=4, jitter=0.01)}
+    s = make_service(_two_voices(split_at=100.0, sep=0.9), register=register)
+    for label in ("Ana", "Bo"):
+        s.auto_collect_from_diarization(
+            audio_path="meeting.wav",
+            segments=_segments(label, [(0.0, 18.0), (20.0, 38.0)]),
+            user_id="u", source_id="meeting.wav",
+        )
+    assert s._snippets.count("Ana", user_id="u") == 2
+    assert s._snippets.count("Bo", user_id="u") == 2
+
+    # Ana's spans again, from the same recording and the same starts.
+    s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=_segments("Ana", [(0.0, 18.0), (20.0, 38.0)]),
+        user_id="u", source_id="meeting.wav",
+    )
+
+    assert s._snippets.count("Bo", user_id="u") == 2, (
+        "Bo's snippets must not be touched by Ana's collection"
+    )
+
+
+# --------------------------------------------------------------------------
 # steps 14/15 -- caps, purity, fail closed
 # --------------------------------------------------------------------------
 
@@ -843,29 +1003,153 @@ def test_an_unverifiable_cluster_learns_nothing(make_service, monkeypatch,
     assert [m["reason"] for m in out["learn_skipped"]] == [reason]
 
 
-def test_a_split_whose_groups_sit_closer_than_the_bar_is_not_learned(
-        make_service, monkeypatch):
-    """The groups must be FURTHER apart than the threshold that made them.
+def test_a_split_whose_groups_sit_closer_than_the_bar_is_rejoined_not_refused(
+        make_service):
+    """Too close is evidence of ONE voice, not of an unknown one.
 
-    Reachable with clean data only by chaining, so the bar is raised here to a
-    value the two voices cannot clear -- which is exactly the condition the
-    guard exists for: a division produced by the clustering, not by evidence.
+    The groups must be FURTHER apart than the threshold that made them.  When
+    they are not, the split is an artefact of average-linkage noise -- so the
+    groups are merged back into one part instead of being refused.
+
+    Refusing instead was measured to discard exactly the clusters worth having.
+    On 2026-10-07_17-00-32.mp4 fourteen clusters were refused at 0.175-0.281
+    apart, while Speaker 1 and Speaker 9 -- learned from the same run -- had
+    intra-group MEAN distances of 0.179 and 0.170.  The refused "groups" were
+    closer to each other than a learned single speaker is spread internally, so
+    the gate was refusing normal within-speaker variation and calling it two
+    people.
+
+    THE FIXTURE IS A WIDE-SPREAD SINGLE VOICE, and that is not decoration --
+    it is the only shape that reaches this branch with the shipped thresholds.
+    ``min_inter_dist`` and ``max_intra_cluster_dist`` are both 0.32, so for two
+    CLEAN voices the two statistics coincide: average linkage refuses to merge
+    them exactly when the centroids are 0.32+ apart, and the re-join window is
+    empty.  A real cluster is never clean.  Average linkage splits on the MEAN
+    cross-pair distance while the check compares CENTROID to centroid, and the
+    mean runs ahead of the centroids as soon as a voice is spread -- the
+    clusters average linkage tears in half all pull back toward the shared
+    mean.  Measured here: 34 spans at ``jitter=0.68`` split into groups of
+    22/5/4/2/1 whose nearest neighbours sit 0.2310 apart at the centroids,
+    against a 0.297 intra-group mean, so it splits and re-joins under the SAME
+    shipped 0.32.  A two-voice fixture would have hidden that, and would have
+    needed the threshold monkeypatched to test anything.
+    """
+    sklearn = pytest.importorskip("sklearn.cluster")
+    svc = _service()
+    spans = _fan_spans(34)
+    s = make_service(_one_voice(jitter=0.68), duration=700.0)
+
+    # Precondition, so nothing below can pass vacuously.  ``len(parts) == 1``
+    # is ALSO what an unsplit cluster returns, so without this the test would
+    # still be green if the fixture stopped splitting at all -- and then it
+    # would no longer be testing the re-join.  Same shipped numbers and the
+    # same two statistics the service uses.
+    vecs = np.stack([_voice(1.0, 0.0, seed=int(a) + 1, jitter=0.68)
+                     for a, _b in spans])
+    labels = sklearn.AgglomerativeClustering(
+        n_clusters=None, distance_threshold=0.32,
+        metric="cosine", linkage="average",
+    ).fit_predict(vecs)
+    distinct = sorted(set(labels.tolist()))
+    assert len(distinct) > 1, "the corpus must actually be split"
+    cents = []
+    for g in distinct:
+        rows = vecs[labels == g]
+        c = rows.sum(0)
+        cents.append(c / np.linalg.norm(c))
+    worst = max(
+        min(1.0 - float(cents[i] @ cents[j])
+            for j in range(len(cents)) if j != i)
+        for i in range(len(cents))
+    )
+    assert worst < 0.32, "every group's nearest neighbour must be in the merge window"
+
+    parts, status = s._split_cluster_by_cohesion(
+        "Speaker 6", _segments("Speaker 6", spans),
+        svc.AudioSegmentSource("meeting.wav"),
+    )
+    assert status == "ok", status
+    assert len(parts) == 1, parts
+    # Every span is back, in time order, as ONE group -- including the one
+    # dropped as a singleton before the cohesion check (it was dropped only
+    # because a singleton cannot stand alone, which no longer applies).
+    assert [p["start"] for p in parts[0]["segs"]] == \
+        sorted(a for a, _b in spans)
+    # No inter-group statistic survives a one-group result.
+    assert parts[0]["inter_min"] is None
+
+
+def test_the_merge_window_and_the_blend_window_are_disjoint(make_service, svc):
+    """One number decides learn-one-or-learn-two, and it is measured.
+
+    The re-join fires only when every group's nearest neighbour is under
+    ``min_inter_dist``.  A cluster whose groups are FURTHER apart than that --
+    ZO249, the real blend this function exists for, at 0.368 -- does not merge,
+    and is learned as two profiles instead.  The two windows cannot overlap, so
+    undoing the merge cannot smuggle a blend past the split.
+
+    Both sides are asserted with the SHIPPED thresholds, because a merge window
+    that only exists under a monkeypatched one is not a window.  The two
+    fixtures are deliberately unlike: the merge side is ONE voice spread wide
+    enough to be torn apart (see the previous test), the blend side is two
+    clean voices 0.42 apart.  That is why the re-joined group does NOT get its
+    own purity gate -- there is nothing left for a gate to separate.  (It had
+    one: ``max_profile_intra_max``, refused by ``Speaker 9`` -- 20 spans, mean
+    0.255, max 0.463 -- whose maximum is HIGHER than the 0.42 blend's while its
+    mean does not separate them either, so no value of that threshold admitted
+    one and rejected the other.)
+    """
+    pytest.importorskip("sklearn")
+    spans = [(float(i * 20), float(i * 20 + 18)) for i in range(3)] + \
+            [(200.0 + i * 20, 200.0 + i * 20 + 18) for i in range(3)]
+
+    merged = make_service(_one_voice(jitter=0.65), duration=420.0)
+    out = merged.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=_segments("Speaker 6", _fan_spans(20)),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+    )
+    assert [m["reason"] for m in out["learn_skipped"]] == [], out
+    assert len(out["pending_created"]) == 1, out
+
+    split = make_service(_two_voices(split_at=100.0, sep=0.42, jitter=0.02),
+                         duration=300.0)
+    out2 = split.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=_segments("Speaker 6", spans),
+        user_id="u2", source_id="meeting.wav", learn_new=True,
+    )
+    assert len(out2["pending_created"]) == 2, out2
+    assert out2["learn_skipped"] == [], out2
+
+
+def test_a_rejoined_single_voice_cluster_is_learned(make_service):
+    """The re-join must actually recover the profile it was meant to recover.
+
+    One voice whose spans are spread widely enough that the cohesion split tears
+    it apart -- the shape of ``Speaker 9`` on 2026-10-07_17-00-32.mp4, which the
+    old code dropped as ``unverified:groups_too_close`` and the re-join now
+    recovers as a single 20-span group of mean 0.255.  Under the old code this
+    cluster produced nothing at all; it must now be learned as one pending
+    profile, and its span count must include every span, not just the ones that
+    landed in a multi-span group.
     """
     pytest.importorskip("sklearn")
     svc = _service()
-    cfg = dict(svc._learning_cfg())
-    cfg["min_inter_dist"] = 0.9
-    monkeypatch.setattr(svc, "_learning_cfg", lambda: cfg)
-    s = make_service(_two_voices(split_at=100.0, sep=0.42, jitter=0.0))
-    spans = [(float(i * 20), float(i * 20 + 18)) for i in range(3)] + \
-            [(200.0 + i * 20, 200.0 + i * 20 + 18) for i in range(3)]
+    spans = _fan_spans(20)
+    s = make_service(_one_voice(jitter=0.65), duration=420.0)
+    parts, status = s._split_cluster_by_cohesion(
+        "Speaker 6", _segments("Speaker 6", spans),
+        svc.AudioSegmentSource("meeting.wav"),
+    )
+    assert status == "ok", status
+    assert len(parts) == 1
+    assert len(parts[0]["segs"]) == len(spans)
+    assert parts[0]["intra_mean"] < 0.32
     out = s.auto_collect_from_diarization(
         audio_path="meeting.wav", segments=_segments("Speaker 6", spans),
         user_id="u", source_id="meeting.wav", learn_new=True,
     )
-    assert out["pending_created"] == [], out
-    assert [m["reason"] for m in out["learn_skipped"]] == [
-        "unverified:groups_too_close"]
+    assert [m["reason"] for m in out["learn_skipped"]] == [], out
+    assert len(out["pending_created"]) == 1, out
 
 
 def test_a_group_whose_own_spans_disagree_is_not_learned(make_service, svc):
@@ -883,11 +1167,46 @@ def test_a_group_whose_own_spans_disagree_is_not_learned(make_service, svc):
         user_id="u", source_id="meeting.wav",
         source=svc.AudioSegmentSource("meeting.wav"),
         vectors=[_unit(1), _unit(2), _unit(3)],
-        intra_max=0.9, inter_min=0.4, groups=2,
+        intra_max=0.9, intra_mean=0.9, inter_min=0.4, groups=2,
     )
     assert out == {"skipped": "impure_group"}, out
     assert s.pending_profiles(user_id="u") == []
     assert s._snippets.rows == []
+
+
+def test_the_cohesion_gate_reads_the_mean_not_the_max(make_service, svc):
+    """The gate must measure what the split measures.
+
+    The split is average-linkage agglomerative clustering at 0.32, so 0.32
+    bounds the MEAN pairwise distance of a group, not its maximum. A max
+    grows with the number of spans (it is a maximum over n*(n-1)/2 pairs), and
+    an average-linkage threshold bounds nothing about it.
+
+    This is the exact shape of the real failure on 2026-09-04 12-08-59.mp4: a
+    22-span group whose mean was 0.21 -- comfortably inside the bar -- was
+    refused because its max reached 0.379, and the ten one-span fragments
+    around it were all refused as too_few_spans. Zero profiles from a
+    34-minute, four-speaker recording.
+
+    So a group whose mean is inside the bar is learned even when its max is
+    not. Without this, larger clusters are refused precisely because they are
+    the ones worth learning.
+    """
+    s = make_service(_one_voice(jitter=0.05))
+    spans = _segments("Speaker 5", [(float(i * 20), float(i * 20 + 18))
+                                    for i in range(3)])
+    out = s._learn_unknown_speaker(
+        cluster="Speaker 5", segs=spans, audio_path="meeting.wav",
+        user_id="u", source_id="meeting.wav",
+        source=svc.AudioSegmentSource("meeting.wav"),
+        vectors=[_unit(1), _unit(2), _unit(3)],
+        intra_max=0.379, intra_mean=0.21, inter_min=0.4, groups=2,
+    )
+    assert out.get("name"), out
+    assert not out.get("skipped")
+    # Both numbers are kept: the mean is what was gated, the max is evidence.
+    assert out["purity"]["intra_mean"] == pytest.approx(0.21)
+    assert out["purity"]["intra_max"] == pytest.approx(0.379)
 
 
 def test_fail_closed_can_be_rolled_back_to_fail_open(make_service, monkeypatch):
@@ -990,8 +1309,10 @@ def test_run_transcribe_prepares_turns_before_it_learns():
     # A word-boundary match, not a substring: ``raw_vad_sections=...`` contains
     # ``vad_sections=...`` and a plain `in` check cannot tell them apart.
     assert re.search(r"(?<![\w])vad_sections=raw_vad_sections", body)
-    # And the learner is given the very spans the client is shown.
-    assert "for t in turns" in body
+    # And the learner is given the very spans the client is shown: the display
+    # projection reads the same turns, with the raw segments only as the
+    # fallback when refinement produced none.
+    assert "_display_spans(turns or segments)" in body
 
 
 def test_attribution_also_learns_from_the_turns():
@@ -1009,3 +1330,183 @@ def test_the_pending_profile_event_still_carries_the_learned_names():
     src = _router_source()
     assert '"stage": "diarization_complete"' in src
     assert '"pending_profiles": pending_profiles' in src
+
+
+def test_one_span_groups_are_dropped_before_learning(make_service, svc):
+    """A singleton cannot become a profile, so it must not cost an attempt.
+
+    LEARN_MIN_SEGMENTS is 2, so a one-span group is guaranteed to be refused as
+    ``too_few_spans``. Feeding it to the learner anyway spends an embed and
+    buries the one log line that mattered: on 2026-09-04 12-08-59.mp4 ten of
+    Speaker 8's twelve groups were singletons, and the run produced twelve
+    "did NOT learn" lines of which eleven were uninformative.
+
+    The drop happens before the inter-group cohesion check as well. A single
+    span is a poor centroid sample, and including it pushes every comparison
+    toward "these groups are really one voice" -- which suppresses the entire
+    cluster via ``unverified:groups_too_close`` instead of just losing a
+    singleton.
+    """
+    s = make_service(_one_voice())
+    # Three spans of one voice, plus one span of a different voice that lands in
+    # its own group. A splitter at this threshold would otherwise emit all four.
+    main = _segments("Speaker 5", [(float(i * 20), float(i * 20 + 18))
+                                   for i in range(3)])
+    parts, status = s._split_cluster_by_cohesion(
+        "Speaker 5", main,
+        svc.AudioSegmentSource("meeting.wav"),
+    )
+    assert status == "ok"
+    assert len(parts) == 1
+    assert len(parts[0]["segs"]) == 3
+    for part in parts:
+        assert len(part["segs"]) >= 2
+
+
+def test_a_cluster_of_only_singletons_is_not_learned(make_service, svc):
+    """Over-splitting to death must fail closed, not manufacture profiles."""
+    # Every span is a DIFFERENT voice, far apart: the splitter must emit one
+    # group per span, so every group is a singleton.
+    def _distinct(t):
+        return _unit(int(t) + 1)
+    s = make_service(_distinct)
+    segs = _segments("Speaker 5", [(float(i * 60), float(i * 60 + 18))
+                                   for i in range(4)])
+    parts, status = s._split_cluster_by_cohesion(
+        "Speaker 5", segs, svc.AudioSegmentSource("meeting.wav"),
+    )
+    assert parts == []
+    assert status == "unverified:too_few_segments"
+
+
+# --------------------------------------------------------------------------
+# refusals -- which spans were turned away, and why
+# --------------------------------------------------------------------------
+
+def test_a_refused_span_is_reported_with_its_reason_and_runner_up(make_service):
+    """A named speaker the pipeline declined to store is a reviewable fact.
+
+    Without the record, the only evidence was one counter in the log
+    ("skipped 88 segment(s)"), and a near-miss that was a good match with a
+    narrow margin looks identical to a match that was never plausible.
+    """
+    s = make_service(_one_voice())
+    spans = [(0.0, 20.0), (25.0, 45.0), (50.0, 70.0)]
+    segs = _segments("Test Person One", spans)
+    # A match that cleared the naming gate but not the margin gate: the
+    # identity was asserted and then distrusted.
+    for seg in segs:
+        seg.update(speaker_confidence=0.8, speaker_margin=0.005,
+                   speaker_match_dist=0.31,
+                   alternatives=[{"speaker": "Test Person Two",
+                                  "confidence": 0.71},
+                                 {"speaker": "Test Person Three",
+                                  "confidence": 0.44}])
+
+    out = s.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=segs, user_id="u",
+        source_id="meeting.wav", learn_new=True,
+        vad_sections=_sections_for(spans, pad=1.5),
+    )
+
+    diag = out["diagnostics"]
+    assert out["collected"] == []
+    assert diag["refused_total"] == 3
+    assert not diag["refused_truncated"]
+    first = diag["refused"][0]
+    assert first["reason"] == "low_margin"
+    assert first["speaker"] == "Test Person One"
+    assert (first["start"], first["end"]) == (0.0, 20.0)
+    assert first["confidence"] == pytest.approx(0.8)
+    assert first["margin"] == pytest.approx(0.005)
+    assert first["match_dist"] == pytest.approx(0.31)
+    assert [a["speaker"] for a in first["alternatives"]] == [
+        "Test Person Two", "Test Person Three"]
+
+
+def test_a_learned_cluster_is_never_a_refusal(make_service):
+    """A generic label is refused for COLLECTION, not for learning.
+
+    Reporting the learnable spans as refusals would drown the real ones, and
+    would say something untrue: those spans became a profile.
+    """
+    s = make_service(_one_voice())
+    spans = [(0.0, 20.0), (25.0, 45.0), (50.0, 70.0)]
+    out = s.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=_segments("Speaker 5", spans),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+        vad_sections=_sections_for(spans, pad=1.5),
+    )
+    assert out["pending_created"]
+    assert out["diagnostics"]["refused"] == []
+    assert out["diagnostics"]["refused_total"] == 0
+
+
+def test_a_cluster_blocked_from_learning_reports_the_gate_that_stopped_it(
+        make_service):
+    """"generic_label" would be true and useless: learning does not mind it."""
+    s = make_service(_one_voice())
+    spans = [(0.0, 20.0), (25.0, 45.0), (50.0, 70.0)]
+    segs = _segments("Speaker 5", spans)
+    for seg in segs:
+        seg["uncertain"] = True
+
+    out = s.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=segs, user_id="u",
+        source_id="meeting.wav", learn_new=True,
+        vad_sections=_sections_for(spans, pad=1.5),
+    )
+
+    assert out["pending_created"] == []
+    assert out["diagnostics"]["refused_total"] == 3
+    assert {r["reason"] for r in out["diagnostics"]["refused"]} == {
+        "explicitly_uncertain"}
+
+
+def test_refusals_are_bounded_but_the_count_is_not(make_service, svc):
+    """The cap exists so a long recording cannot produce a useless payload.
+
+    It must cap the RECORDS, never the total: "25 of 240" is the fact that
+    makes the omission legible instead of misleading.
+    """
+    s = make_service(_one_voice(), duration=300.0)
+    n = svc.LEARN_DIAG_MAX_REFUSALS + 7
+    spans = [(float(i * 20), float(i * 20 + 18)) for i in range(n)]
+    segs = _segments("Test Person One", spans)
+    for seg in segs:
+        seg.update(speaker_confidence=0.8, speaker_margin=0.0)
+
+    out = s.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=segs, user_id="u",
+        source_id="meeting.wav", learn_new=True,
+        vad_sections=_sections_for(spans, pad=1.5),
+    )
+
+    diag = out["diagnostics"]
+    assert diag["refused_total"] == n
+    assert len(diag["refused"]) == svc.LEARN_DIAG_MAX_REFUSALS
+    assert diag["refused_truncated"] is True
+    # The survivors are the earliest ones, in timeline order.
+    assert [r["start"] for r in diag["refused"]] == sorted(
+        r["start"] for r in diag["refused"])
+
+
+def test_a_span_with_no_evidence_carries_no_evidence_fields(make_service):
+    """Absent numbers stay absent.
+
+    A refusal record padded with 0.0 confidence and 0.0 margin would read as
+    "measured, and terrible" rather than "never measured".
+    """
+    s = make_service(_one_voice())
+    spans = [(0.0, 20.0), (25.0, 45.0)]
+    out = s.auto_collect_from_diarization(
+        audio_path="meeting.wav", segments=_segments("UNKNOWN", spans),
+        user_id="u", source_id="meeting.wav", learn_new=True,
+        vad_sections=_sections_for(spans, pad=1.5),
+    )
+    diag = out["diagnostics"]
+    assert diag["refused_total"] == 2
+    rec = diag["refused"][0]
+    assert rec["reason"] == "unknown_label"
+    for absent in ("confidence", "margin", "match_dist", "alternatives"):
+        assert absent not in rec

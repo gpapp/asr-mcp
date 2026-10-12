@@ -174,6 +174,29 @@ class VoiceprintDB:
             session.commit()
             return True
 
+    def update_speech_total(self, name: str, total_speech_sec: float,
+                            user_id: str = DEFAULT_USER) -> bool:
+        """Correct ``total_speech_sec`` WITHOUT re-deriving the profile.
+
+        Deliberately not ``save()``: that needs an embedding and rewrites pitch,
+        energy and the sample count too, so "fix a stale number" would turn into
+        "replace this speaker's profile", which changes who they match. This
+        writes the one column the snippet durations are the source of truth for,
+        and leaves the embedding exactly as the last refine left it.
+
+        ``updated_at`` moves because the row did change -- but nothing reads it
+        to decide identity.
+        """
+        with self._db.get_session() as session:
+            count = (
+                session.query(VoiceprintModel)
+                .filter_by(user_id=user_id, name=name)
+                .update({"total_speech_sec": float(total_speech_sec),
+                         "updated_at": datetime.datetime.utcnow()})
+            )
+            session.commit()
+            return bool(count)
+
     def delete(self, name: str, user_id: str = DEFAULT_USER) -> bool:
         with self._db.get_session() as session:
             vp = session.query(VoiceprintModel).filter_by(
@@ -205,6 +228,34 @@ class VoiceprintDB:
         with self._db.get_session() as session:
             return session.query(VoiceprintModel).filter_by(user_id=user_id).count()
 
+    def user_ids(self) -> list:
+        """Every user that owns a voiceprint row.
+
+        The startup audit has no request context, so it cannot be told which
+        user to check -- it asks the table instead of assuming ``default`` and
+        silently skipping everyone else's speakers.
+        """
+        with self._db.get_session() as session:
+            rows = session.query(VoiceprintModel.user_id).distinct().all()
+            return sorted({r[0] for r in rows if r[0]})
+
+    def delete_all_for_user(self, user_id: str = DEFAULT_USER) -> int:
+        """Drop every voiceprint row belonging to one user. Count removed.
+
+        Exists for the admin purge, which needs to retire a whole account
+        rather than one speaker at a time: the alternative is a
+        ``list_all``-then-``delete``-per-name loop whose N queries are N
+        chances to leave a half-purged store behind.
+        """
+        with self._db.get_session() as session:
+            count = (
+                session.query(VoiceprintModel)
+                .filter_by(user_id=user_id)
+                .delete()
+            )
+            session.commit()
+            return int(count or 0)
+
     def search(self, embedding: np.ndarray, user_id: str = DEFAULT_USER, top_k: int = 5) -> list[tuple[str, float, dict]]:
         all_vps = self.list_all(user_id=user_id, include_pending=False)
         results = []
@@ -220,7 +271,11 @@ class VoiceprintDB:
             "user_id": vp.user_id,
             "name": vp.name,
             "pending": bool(vp.pending),
-            "created_at": vp.created_at,
+            # Serialized like every other row converter in this module
+            # (snippets, transcripts, api_tokens). The raw datetime leaked out
+            # of the voiceprint dict and made VoiceprintSpeakerInfo.created_at
+            # (a str) fail validation on GET /api/voiceprint/pending.
+            "created_at": vp.created_at.isoformat() if vp.created_at else "",
             "pitch_hz": vp.pitch_hz or 0.0,
             "pitch_std": vp.pitch_std or 0.0,
             "energy_rms": vp.energy_rms or 0.0,
@@ -332,22 +387,113 @@ class SnippetDB:
             )
             return result or 0.0
 
-    def find_duplicate(self, source_audio: str, start_sec: float, user_id: str = DEFAULT_USER) -> Optional[dict]:
+    def find_duplicate(self, source_audio: str, start_sec: float,
+                       user_id: str = DEFAULT_USER,
+                       speaker_name: str = None) -> Optional[dict]:
+        """A snippet already cut from this recording at exactly this start.
+
+        ``speaker_name`` scopes it to one profile, which it must be: the call
+        site collects for ONE speaker and, on a hit, DELETES the row it found.
+        Unscoped, one speaker's collection could remove another profile's audio
+        -- and that profile's embedding is not rebuilt by this run, so it would
+        silently keep describing audio it no longer has.
+        """
         with self._db.get_session() as session:
-            sn = session.query(SnippetModel).filter_by(
+            query = session.query(SnippetModel).filter_by(
                 user_id=user_id, source_audio=source_audio, start_sec=start_sec
-            ).first()
+            )
+            if speaker_name is not None:
+                query = query.filter_by(speaker_name=speaker_name)
+            sn = query.first()
             if not sn:
                 return None
             return self._row_to_dict(sn)
 
     def count(self, speaker_name: str, user_id: str = DEFAULT_USER) -> int:
+        """Snippets for one speaker, or **all** of them when speaker_name is None.
+
+        ``None`` means "every snippet this user owns", which is what the admin
+        purge reports and what a store-wide total needs. Guarded the same way
+        ``find_duplicate`` guards it, because ``filter_by(speaker_name=None)``
+        is not "no filter" -- it is ``WHERE speaker_name IS NULL``, which
+        silently counts nothing.
+        """
         with self._db.get_session() as session:
-            return (
+            query = session.query(SnippetModel).filter_by(user_id=user_id)
+            if speaker_name is not None:
+                query = query.filter_by(speaker_name=speaker_name)
+            return query.count()
+
+    def set_review(self, snippet_id: int, user_id: str = DEFAULT_USER,
+                   flagged: bool = True, score: float = None,
+                   reason: str = None) -> bool:
+        """Mark a snippet for review, or clear the mark.
+
+        ``flagged=True`` stores the score and the reason the outlier pass
+        produced; they are what makes the accusation reviewable rather than a
+        bare boolean. ``flagged=False`` clears all three (keeping a snippet
+        that a previous run accused must not leave the accusation behind).
+        """
+        values = {"review_flag": 1 if flagged else 0,
+                  "review_score": float(score) if flagged and score is not None else None,
+                  "review_reason": (str(reason) if flagged and reason else None)}
+        with self._db.get_session() as session:
+            count = (
                 session.query(SnippetModel)
-                .filter_by(user_id=user_id, speaker_name=speaker_name)
-                .count()
+                .filter_by(id=snippet_id, user_id=user_id)
+                .update(values)
             )
+            session.commit()
+            return bool(count)
+
+    def clear_review(self, speaker_name: str, user_id: str = DEFAULT_USER,
+                     snippet_ids: list = None) -> int:
+        """Clear every review mark of a speaker (optionally only some ids).
+
+        Only rows that ARE marked are touched, so the returned count is the
+        number of accusations actually withdrawn -- not the speaker's snippet
+        count, which would read as "cleared everything" in a report.
+        """
+        with self._db.get_session() as session:
+            query = session.query(SnippetModel).filter_by(
+                user_id=user_id, speaker_name=speaker_name,
+                review_flag=1)
+            if snippet_ids is not None:
+                query = query.filter(SnippetModel.id.in_(list(snippet_ids)))
+            count = query.update(
+                {"review_flag": 0, "review_score": None, "review_reason": None},
+                synchronize_session=False)
+            session.commit()
+            return int(count or 0)
+
+    def list_flagged(self, user_id: str = DEFAULT_USER,
+                     speaker_name: str = None) -> list[dict]:
+        """Every snippet marked for review, worst score first.
+
+        User-scoped: a mark set by one user is never visible to another. The
+        ordering is the advisory ranking the UI shows (largest distance to the
+        speaker's centre first), not a filter -- nothing is removed by this.
+        """
+        with self._db.get_session() as session:
+            query = session.query(SnippetModel).filter_by(
+                user_id=user_id, review_flag=1)
+            if speaker_name:
+                query = query.filter_by(speaker_name=speaker_name)
+            rows = query.all()
+            out = [self._row_to_dict(r) for r in rows]
+        out.sort(key=lambda r: (-(r.get("review_score") or 0.0), r["id"]))
+        return out
+
+    def user_ids(self) -> list:
+        """Every user that owns at least one snippet.
+
+        Mirrors ``VoiceprintDB.user_ids``. The union of the two is the audit's
+        work list, which is what catches a user whose audio exists but whose
+        profiles do not (or the reverse).
+        """
+        with self._db.get_session() as session:
+            rows = session.query(SnippetModel.user_id).distinct().all()
+            return sorted({r[0] for r in rows if r[0]})
 
     def all_speakers(self, user_id: str = DEFAULT_USER) -> dict[str, dict]:
         with self._db.get_session() as session:
@@ -367,6 +513,23 @@ class SnippetDB:
                 for r in rows
             }
 
+    def delete_all_for_user(self, user_id: str = DEFAULT_USER) -> int:
+        """Drop every snippet row belonging to one user. Count removed.
+
+        Rows only -- the FLAC audio is unlinked by the caller, which knows
+        where the per-user voices directory lives. Doing both here would make
+        this a DB method with a filesystem dependency, and the purge is the
+        one place that has to report how many of each it removed.
+        """
+        with self._db.get_session() as session:
+            count = (
+                session.query(SnippetModel)
+                .filter_by(user_id=user_id)
+                .delete()
+            )
+            session.commit()
+            return int(count or 0)
+
     def _row_to_dict(self, sn: SnippetModel) -> dict:
         return {
             "id": sn.id,
@@ -379,6 +542,9 @@ class SnippetDB:
             "end_sec": sn.end_sec,
             "file_mtime": sn.file_mtime,
             "file_size": sn.file_size,
+            "review_flag": bool(sn.review_flag),
+            "review_score": sn.review_score,
+            "review_reason": sn.review_reason,
             "created_at": sn.created_at.isoformat() if sn.created_at else None,
         }
 
@@ -501,6 +667,15 @@ class TokenDB:
                 "created_at": row.created_at.isoformat() if row.created_at else None,
             }
 
+    def delete(self, user_id: str) -> bool:
+        with self._db.get_session() as session:
+            row = session.get(ApiTokenModel, user_id)
+            if not row:
+                return False
+            session.delete(row)
+            session.commit()
+            return True
+
 
 class TranscriptDB:
     def __init__(self, db_manager: DatabaseManager):
@@ -552,6 +727,29 @@ class TranscriptDB:
             session.delete(tm)
             session.commit()
             return True
+
+    def delete_all_for_user(self, user_id: str = DEFAULT_USER) -> int:
+        """Drop every stored transcript belonging to one user. Count removed."""
+        with self._db.get_session() as session:
+            count = (
+                session.query(TranscriptModel)
+                .filter_by(user_id=user_id)
+                .delete()
+            )
+            session.commit()
+            return int(count or 0)
+
+    def user_ids(self) -> list:
+        """Every user that owns at least one stored transcript.
+
+        Needed because a transcript row can outlive its voiceprints: a
+        ``save=false`` live session or a History entry left behind by a deleted
+        key is still that user's data, and the admin table has to be able to
+        see it to offer to keep or remove it.
+        """
+        with self._db.get_session() as session:
+            rows = session.query(TranscriptModel.user_id).distinct().all()
+            return sorted({r[0] for r in rows if r[0]})
 
     def rename_speaker(self, old_name: str, new_name: str,
                        user_id: str = DEFAULT_USER) -> int:

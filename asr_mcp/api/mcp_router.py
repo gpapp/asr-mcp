@@ -4,7 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends
 
-from asr_mcp.api.security import verify_api_key
+from asr_mcp.api.security import get_current_user
 from asr_mcp.config.settings import Settings, get_settings
 
 logger = logging.getLogger("asr_mcp.api.mcp_router")
@@ -104,6 +104,7 @@ async def mcp_call(
     tool_name: Optional[str] = None,
     arguments: dict = {},
     settings: Settings = Depends(get_settings),
+    user: str = Depends(get_current_user),
 ):
     if body:
         tool_name = body.get("tool") or body.get("tool_name") or tool_name
@@ -118,12 +119,14 @@ async def mcp_call(
         state.ensure_backend_ready()
 
     if tool_name == "diarize_audio":
+        from asr_mcp.api.asr_router import _load_known_speakers
         from asr_mcp.diarization.pipeline import Diarizer
         diarizer = Diarizer(state, settings)
         result = await diarizer.run(
             audio_path=arguments.get("wav_path"),
             num_speakers=arguments.get("num_speakers"),
             diarization_threshold=arguments.get("diarization_threshold"),
+            known_speakers=_load_known_speakers(settings, user),
         )
         return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
 
@@ -152,7 +155,8 @@ async def mcp_call(
 
         db = DatabaseManager(settings.db_path)
         service = SpeakerService(settings.data_dir, db)
-        results = service.identify_speaker(embedding, top_k=arguments.get("top_k", 5))
+        results = service.identify_speaker(
+            embedding, top_k=arguments.get("top_k", 5), user_id=user)
         return {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
 
     elif tool_name == "register_voiceprint":
@@ -166,6 +170,7 @@ async def mcp_call(
             wav_path=arguments["wav_path"],
             start_sec=arguments["start_sec"],
             end_sec=arguments["end_sec"],
+            user_id=user,
         )
         return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
 
@@ -175,7 +180,7 @@ async def mcp_call(
 
         db = DatabaseManager(settings.db_path)
         service = SpeakerService(settings.data_dir, db)
-        speakers = service.list_speakers()
+        speakers = service.list_speakers(user_id=user)
         summary = {name: {"speech_sec": info.get("total_speech_sec", 0)} for name, info in speakers.items()}
         return {"content": [{"type": "text", "text": json.dumps(summary, indent=2)}]}
 
@@ -183,13 +188,17 @@ async def mcp_call(
 
 
 @router.get("/resource/{uri:path}")
-async def read_resource(uri: str, settings: Settings = Depends(get_settings)):
+async def read_resource(
+    uri: str,
+    settings: Settings = Depends(get_settings),
+    user: str = Depends(get_current_user),
+):
     if uri == "asr://voiceprints":
         from asr_mcp.db.manager import DatabaseManager
         from asr_mcp.speaker.service import SpeakerService
         db = DatabaseManager(settings.db_path)
         service = SpeakerService(settings.data_dir, db)
-        speakers = service.list_speakers()
+        speakers = service.list_speakers(user_id=user)
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(speakers, indent=2, default=str)}]}
 
     elif uri == "asr://health":

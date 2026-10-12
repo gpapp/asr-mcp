@@ -176,6 +176,21 @@ def load_vad_session(settings: Settings = None) -> ort.InferenceSession:
     )
 
 
+def _requests_cuda(providers) -> bool:
+    """Did this provider list actually ask for the GPU?
+
+    Not ``"CPUExecutionProvider" in providers``: ORT always appends the CPU
+    provider as a fallback, so that test is true on the GPU path too and would
+    silently disable every escalation. The CUDA entry is a
+    ``(name, options)`` tuple, the CPU one a bare string.
+    """
+    for entry in providers or ():
+        name = entry[0] if isinstance(entry, (list, tuple)) and entry else entry
+        if name == "CUDAExecutionProvider":
+            return True
+    return False
+
+
 def load_embedding_session(settings: Settings = None):
     if not settings:
         from asr_mcp.config.settings import get_settings
@@ -184,9 +199,27 @@ def load_embedding_session(settings: Settings = None):
     emb_providers = _get_providers(settings, "embedding")
     so = get_session_options(settings)
     logger.info("Loading embedding session (providers=%s)", emb_providers)
-    return ort.InferenceSession(
-        str(emb_path), sess_options=so, providers=emb_providers
-    )
+    try:
+        return ort.InferenceSession(
+            str(emb_path), sess_options=so, providers=emb_providers
+        )
+    except Exception as e:
+        # Constructing the session can fail for want of memory, and that is not
+        # the same as the model being broken: cuBLAS fails at cublasCreate()
+        # when the card is too full to hold even its own workspace, long before
+        # a weight of ours is placed. Without this the whole reload aborts and
+        # every embedding/diarization endpoint is dead for as long as whatever
+        # else shares the card keeps running. The CPU session is slower and
+        # smaller, which is the correct trade for "the GPU is unavailable".
+        from asr_mcp.core.model_state import is_gpu_oom, log_gpu_memory
+
+        if not is_gpu_oom(e) or not _requests_cuda(emb_providers):
+            raise
+        log_gpu_memory("embedding-session-load-failed")
+        logger.warning("Embedding session GPU init failed (%s); retrying on CPU", e)
+        return ort.InferenceSession(
+            str(emb_path), sess_options=so, providers=["CPUExecutionProvider"]
+        )
 
 
 def reload_embedding_session(settings: Settings, force_cpu: bool = False) -> None:

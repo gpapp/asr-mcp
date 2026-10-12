@@ -11,7 +11,16 @@ from fastapi.responses import JSONResponse, RedirectResponse
 logger = logging.getLogger("asr_mcp.api.auth")
 
 # Public paths that don't require authentication
-PUBLIC_PATHS = {"/login", "/health", "/api/auth/login", "/api/user"}
+# `/api/auth/*` is public because the login page must be able to ask what
+# registration offers, post a signup, and redeem a confirmation link before any
+# session exists. What is NOT public is everything under /api/admin/ and every
+# data-bearing route, which still need a session, a token or a static key.
+PUBLIC_PATHS = {
+    "/login", "/health", "/api/auth/login", "/api/user",
+    "/api/auth/login/session", "/api/auth/logout", "/api/auth/methods",
+    "/api/auth/register", "/api/auth/verify",
+    "/api/auth/google/start", "/api/auth/google/callback",
+}
 
 
 def _get_prefix(request: Request) -> str:

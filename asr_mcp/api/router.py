@@ -1,6 +1,8 @@
 from fastapi import APIRouter
 
+from asr_mcp.api.admin_router import router as admin_router
 from asr_mcp.api.asr_router import router as asr_router
+from asr_mcp.api.auth_router import router as auth_router
 from asr_mcp.api.speaker_router import router as speaker_router
 from asr_mcp.api.mcp_router import router as mcp_router
 from asr_mcp.api.voiceprint_router import router as voiceprint_router
@@ -8,6 +10,8 @@ from asr_mcp.api.transcript_router import router as transcript_router
 from asr_mcp.api.token_router import router as token_router
 
 api_router = APIRouter(prefix="/api")
+api_router.include_router(auth_router)
+api_router.include_router(admin_router)
 api_router.include_router(asr_router)
 api_router.include_router(speaker_router)
 api_router.include_router(mcp_router)

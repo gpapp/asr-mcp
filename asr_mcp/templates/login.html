@@ -16,14 +16,29 @@
         .form-group input:focus { border-color: #8be9fd; }
         .btn { width: 100%; padding: 0.7rem; border: none; border-radius: 6px; background: #50fa7b; color: #1a1a2e; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: background 0.15s; }
         .btn:hover { background: #3ad65e; }
+        .btn-google { background: #4285f4; color: #fff; margin-top: 0.6rem; }
+        .btn-google:hover { background: #357ae8; }
         .error { background: #ff5555; color: white; padding: 0.6rem 1rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 1rem; display: none; }
         .error.show { display: block; }
+        .note { font-size: 0.78rem; color: #6272a4; margin-bottom: 1rem; line-height: 1.4; }
+        .divider { border: none; border-top: 1px solid #44475a; margin: 1.4rem 0; }
+        .toggle { font-size: 0.8rem; color: #8be9fd; margin-top: 1rem; text-align: center; cursor: pointer; }
+        .toggle:hover { text-decoration: underline; }
+        .outcome { padding: 0.6rem 1rem; border-radius: 6px; font-size: 0.85rem; margin-bottom: 1rem; display: none; }
+        .outcome.show { display: block; }
+        .outcome.ok { background: #1b4332; color: #95d5b2; }
+        .outcome.warn { background: #5c3a00; color: #ffd166; }
+        .hidden { display: none !important; }
     </style>
 </head>
 <body>
     <div class="login-box">
         <h1>ASR-MCP</h1>
-        <div class="subtitle">Sign in to continue</div>
+        <div class="subtitle" id="subtitle">Sign in to continue</div>
+
+        <div class="outcome ok" id="verifiedOk">Account confirmed — you can sign in now.</div>
+        <div class="outcome warn" id="verifiedBad">That confirmation link did not work. It may already have been used.</div>
+        <div class="outcome warn" id="googleFailed">Google sign-in did not finish. Nothing was changed.</div>
 
         <div class="error" id="errorMsg"></div>
 
@@ -38,9 +53,90 @@
             </div>
             <button type="submit" class="btn" id="loginBtn">Sign In</button>
         </form>
+
+        <div id="signupCard" class="hidden">
+            <hr class="divider">
+            <div class="note" id="signupIntro">Create an account to keep your own speakers, voiceprints and transcript history.</div>
+
+            <form id="registerForm" class="hidden" onsubmit="return handleRegister(event)">
+                <div class="form-group">
+                    <label for="regUsername">Username</label>
+                    <input type="text" id="regUsername" name="username" autocomplete="username"
+                           minlength="3" maxlength="64" pattern="[A-Za-z0-9._-]+" spellcheck="false" required>
+                </div>
+                <div class="form-group">
+                    <label for="regEmail">Email address</label>
+                    <input type="email" id="regEmail" name="email" autocomplete="email" required>
+                </div>
+                <div class="form-group">
+                    <label for="regPassword">Password</label>
+                    <input type="password" id="regPassword" name="password" autocomplete="new-password"
+                           minlength="10" required>
+                </div>
+                <button type="submit" class="btn" id="registerBtn">Create account</button>
+                <div class="note hidden" id="registerPending"></div>
+            </form>
+            <a href="__PREFIX__/api/auth/google/start" id="googleBtn" class="btn btn-google hidden">Continue with Google</a>
+        </div>
+
+        <div class="toggle hidden" id="toggleSignup" onclick="toggleSignup()">Create an account</div>
     </div>
 
     <script>
+        // Which signup methods could actually work. A card is rendered only for
+        // a method that is BOTH enabled and configured, so a half-configured
+        // deployment shows a working button or no card at all -- never one that
+        // starts a login the server cannot finish.
+        let signupMethods = { email: false, google: false, password_hint: 10 };
+
+        async function loadMethods() {
+            try {
+                const r = await fetch('__PREFIX__/api/auth/methods', { credentials: 'same-origin' });
+                if (!r.ok) return;
+                signupMethods = await r.json();
+            } catch (e) { /* leave the card hidden */ }
+            renderMethods();
+        }
+
+        function renderMethods() {
+            const card = document.getElementById('signupCard');
+            const toggle = document.getElementById('toggleSignup');
+            if (!signupMethods.email && !signupMethods.google) {
+                card.className = 'hidden';
+                toggle.className = 'hidden';
+                return;
+            }
+            card.className = '';
+            toggle.className = '';
+            document.getElementById('registerForm').className = signupMethods.email ? '' : 'hidden';
+            const google = document.getElementById('googleBtn');
+            google.className = signupMethods.google ? 'btn btn-google' : 'hidden';
+            const hint = document.getElementById('signupIntro');
+            if (hint && signupMethods.password_hint) {
+                hint.textContent = 'Create an account to keep your own speakers, voiceprints and transcript history. '
+                    + 'The password needs at least ' + signupMethods.password_hint + ' characters.';
+            }
+        }
+
+        function toggleSignup() {
+            const card = document.getElementById('signupCard');
+            const showing = card.className !== 'hidden';
+            card.className = showing ? 'hidden' : '';
+            document.getElementById('toggleSignup').textContent = showing ? 'Create an account' : 'Cancel';
+        }
+
+        function showOutcome() {
+            const params = new URLSearchParams(window.location.search);
+            if (params.get('verified') === '1') show('verifiedOk', true);
+            if (params.get('verified') === '0') show('verifiedBad', true);
+            if (params.get('google')) show('googleFailed', true);
+        }
+
+        function show(id, on) {
+            const el = document.getElementById(id);
+            if (el) el.className = on ? (el.className.replace('hidden', '') + ' show').trim() : el.className.replace('show', '').trim();
+        }
+
         async function handleLogin(e) {
             e.preventDefault();
             const btn = document.getElementById('loginBtn');
@@ -76,6 +172,55 @@
             }
             return false;
         }
+
+        async function handleRegister(e) {
+            e.preventDefault();
+            const btn = document.getElementById('registerBtn');
+            const errEl = document.getElementById('errorMsg');
+            const pending = document.getElementById('registerPending');
+            errEl.className = 'error';
+            pending.className = 'hidden';
+            btn.disabled = true;
+            btn.textContent = 'Creating...';
+
+            const form = new FormData(document.getElementById('registerForm'));
+            try {
+                const r = await fetch('__PREFIX__/api/auth/register', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: form.get('username'),
+                        email: form.get('email'),
+                        password: form.get('password'),
+                    }),
+                });
+                const data = await r.json();
+                if (r.ok && data.status === 'ok') {
+                    // textContent, never innerHTML: this is the one place an
+                    // address typed by a stranger is written back into the page.
+                    pending.textContent = 'Check your mail to confirm ' + data.email + ' — '
+                        + 'then sign in with the username you chose.';
+                    pending.className = 'note show';
+                    document.getElementById('registerForm').className = 'hidden';
+                    btn.disabled = false;
+                    btn.textContent = 'Create account';
+                } else {
+                    errEl.textContent = data.detail || data.error || 'Could not create that account';
+                    errEl.className = 'error show';
+                }
+            } catch (err) {
+                errEl.textContent = 'Connection error';
+                errEl.className = 'error show';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Create account';
+            }
+            return false;
+        }
+
+        showOutcome();
+        loadMethods();
     </script>
 </body>
 </html>

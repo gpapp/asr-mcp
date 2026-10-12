@@ -166,6 +166,79 @@ def test_setting_reads_config(uncertainty):
     assert uncertainty.setting("no_such_key", "fallback") == "fallback"
 
 
+# --- the naming / learning band -------------------------------------------
+
+
+def _confidence_of_distance(cfg, distance):
+    """The exact conversion speaker/matcher.py applies.
+
+    Reimplemented rather than imported because the band is about the CONTRACT
+    between two modules that both read thresholds.json. If matcher.py ever
+    changes its formula, this helper is the one place that has to change with
+    it, and the assertions below will say which side moved.
+    """
+    conf_max_dist = cfg["normalization"]["confidence_max_distance"]
+    return max(0.0, 1.0 - distance / conf_max_dist)
+
+
+def _cfg():
+    import json
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    return json.loads((root / "asr_mcp" / "config" / "thresholds.json").read_text())
+
+
+def test_naming_accepts_a_wider_band_than_learning_uses(uncertainty):
+    """The two gates are in different units; the gap between them is real.
+
+    Naming compares a DISTANCE (matching.accept_threshold), learning compares a
+    CONFIDENCE (uncertainty.min_speaker_confidence), and matcher.py maps one to
+    the other with confidence_max_distance. Today that leaves a 0.025 band where
+    a span is shown under the speaker's NAME and its audio is refused for
+    learning. The refusal is reported (reason low_confidence, with the measured
+    distance), so it is a visible decision rather than a silent loss -- but it
+    must be visible BY DESIGN, which is what this test is for.
+    """
+    cfg = _cfg()
+    accept = float(cfg["matching"]["accept_threshold"])
+    min_conf = float(cfg["uncertainty"]["min_speaker_confidence"])
+
+    named_edge = _confidence_of_distance(cfg, accept)
+    assert named_edge < min_conf, (
+        "naming and learning now use the same threshold: the band closed, so "
+        "this test and the note in thresholds.json need updating deliberately")
+
+    # Inside the band: named by the matcher, refused by the learning gate.
+    band_distance = (accept + (1.0 - min_conf) * cfg["normalization"]
+                    ["confidence_max_distance"]) / 2
+    in_band = _seg(speaker="Test Person One", start=0.0, end=4.0,
+                   speaker_confidence=_confidence_of_distance(cfg, band_distance),
+                   speaker_margin=0.3)
+    assert in_band["speaker_confidence"] < min_conf
+    assert uncertainty.learning_refusal_reason(in_band) == "low_confidence"
+
+    # Comfortably inside the naming threshold: learned, no refusal at all.
+    solid = _seg(speaker="Test Person One", start=0.0, end=4.0,
+                 speaker_confidence=_confidence_of_distance(cfg, 0.2),
+                 speaker_margin=0.3)
+    assert uncertainty.learning_refusal_reason(solid) is None
+
+
+def test_a_generic_cluster_is_learned_however_weak_its_label(uncertainty):
+    """A nameless cluster has no match confidence at all -- and that is fine.
+
+    Absence of evidence is not evidence of doubt: learning unnamed people is the
+    whole point, and requiring a match confidence for a cluster that was never
+    matched to anybody would refuse every new speaker.
+    """
+    assert uncertainty.learning_refusal_reason(
+        _seg(speaker="Speaker 4", start=0.0, end=4.0)) is None
+    # ...but the same cluster with an explicit low confidence IS refused.
+    assert uncertainty.learning_refusal_reason(
+        _seg(speaker="Speaker 4", start=0.0, end=4.0,
+             speaker_confidence=0.1)) == "low_confidence"
+
+
 # --- apply_identity ------------------------------------------------------
 
 
@@ -236,3 +309,135 @@ def test_the_naming_block_threshold_is_configurable(uncertainty):
 
 def test_zero_sized_clusters_are_ignored(uncertainty):
     assert uncertainty.naming_blocked_reason([10, 0, 0]) is None
+
+
+# --- refusal reasons ------------------------------------------------------
+
+
+def test_the_reason_helpers_agree_with_the_booleans(uncertainty):
+    """One gate, one implementation.
+
+    A caller that explains a refusal and a caller that enforces it must not be
+    able to disagree; that is the only reason the reason-returning functions
+    exist instead of a second, parallel pile of ifs.
+    """
+    cases = [
+        _seg(speaker="Bob", start=0.0, end=4.0, speaker_confidence=0.8,
+             speaker_margin=0.3),
+        _seg(speaker="Bob", start=0.0, end=4.0, speaker_confidence=0.1,
+             speaker_margin=0.5),
+        _seg(speaker="Bob", start=0.0, end=0.2, speaker_confidence=0.9,
+             speaker_margin=0.4),
+        _seg(speaker="Bob", start=0.0, end=4.0, uncertain=True),
+        _seg(speaker="Speaker 2", start=0.0, end=4.0),
+        _seg(speaker="UNKNOWN", start=0.0, end=4.0),
+        _seg(speaker="OVERLAP", start=0.0, end=4.0),
+        _seg(speaker=None, start=0.0, end=4.0),
+        _seg(speaker="Bob", start=0.0, end=4.0, speaker_confidence=0.9,
+             speaker_margin=0.01),
+    ]
+    for seg in cases:
+        reason = uncertainty.auto_collect_refusal_reason(seg)
+        assert (reason is None) == uncertainty.eligible_for_auto_collect(seg), seg
+        learn = uncertainty.learning_refusal_reason(seg)
+        assert (learn is None) == uncertainty.eligible_for_learning(seg), seg
+
+
+def test_each_refusal_is_named(uncertainty):
+    """A refusal that cannot be named cannot be acted on."""
+    def reason(**kw):
+        return uncertainty.auto_collect_refusal_reason(_seg(**kw))
+
+    assert reason(speaker="Bob", end=4.0, speaker_confidence=0.8,
+                  speaker_margin=0.4) is None
+    assert reason(speaker=None) == uncertainty.REASON_UNKNOWN
+    assert reason(speaker="") == uncertainty.REASON_UNKNOWN
+    assert reason(speaker="UNKNOWN") == uncertainty.REASON_UNKNOWN
+    assert reason(speaker="OVERLAP") == uncertainty.REASON_OVERLAP
+    assert reason(speaker="Speaker 2") == uncertainty.REASON_GENERIC
+    assert reason(speaker="Bob", end=4.0, uncertain=True) == \
+        uncertainty.REASON_SUPPRESSED
+    assert reason(speaker="Bob", end=4.0, speaker_confidence=0.1,
+                  speaker_margin=0.5) == uncertainty.REASON_LOW_CONFIDENCE
+    assert reason(speaker="Bob", end=4.0, speaker_confidence=0.9,
+                  speaker_margin=0.01) == uncertainty.REASON_LOW_MARGIN
+    assert reason(speaker="Bob", end=0.2, speaker_confidence=0.9,
+                  speaker_margin=0.4) == uncertainty.REASON_TOO_SHORT
+
+
+def test_a_learning_refusal_never_says_generic(uncertainty):
+    """"generic_label" is the answer to the wrong question for learning.
+
+    A generic cluster is refused for collection by definition, so reporting that
+    as the reason a span failed to be LEARNED would hide the gate that
+    actually stopped it.
+    """
+    generic = _seg(speaker="Speaker 4", start=0.0, end=9.0)
+    assert uncertainty.auto_collect_refusal_reason(generic) == \
+        uncertainty.REASON_GENERIC
+    assert uncertainty.learning_refusal_reason(generic) is None
+    assert uncertainty.learning_refusal_reason(
+        _seg(speaker="Speaker 4", end=9.0, uncertain=True)) == \
+        uncertainty.REASON_SUPPRESSED
+    assert uncertainty.learning_refusal_reason(
+        _seg(speaker="Speaker 4", end=9.0, speaker_confidence=0.05)) == \
+        uncertainty.REASON_LOW_CONFIDENCE
+    assert uncertainty.learning_refusal_reason(
+        _seg(speaker=None)) == uncertainty.REASON_NO_IDENTITY
+
+
+def test_learning_ignores_duration_and_margin(uncertainty):
+    """A short span or a narrow margin is not evidence of a wrong speaker.
+
+    Both gates are about attribution quality, and both stay shut for learning
+    because the alternative is learning from audio the pipeline distrusted.
+    """
+    short = _seg(speaker="Speaker 4", start=0.0, end=0.2)
+    narrow = _seg(speaker="Speaker 4", start=0.0, end=9.0, speaker_margin=0.0)
+    # Named: the duration and margin gates are reached and refuse.
+    assert uncertainty.auto_collect_refusal_reason(
+        _seg(speaker="Bob", start=0.0, end=0.2)) == uncertainty.REASON_TOO_SHORT
+    assert uncertainty.auto_collect_refusal_reason(
+        _seg(speaker="Bob", start=0.0, end=9.0, speaker_margin=0.0)) == \
+        uncertainty.REASON_LOW_MARGIN
+    # Generic: collection is refused on the label before either is consulted,
+    # and learning does not consult them at all.
+    assert uncertainty.auto_collect_refusal_reason(short) == \
+        uncertainty.REASON_GENERIC
+    assert uncertainty.learning_refusal_reason(short) is None
+    assert uncertainty.learning_refusal_reason(narrow) is None
+
+
+def test_a_disabled_policy_lifts_the_suppression_gates(uncertainty):
+    """`enabled: false` is the documented rollback (lesson 30).
+
+    It lifts the gates that *suppress* an identity — the explicit `uncertain`
+    flag, the margin and the duration. The confidence floor is separate and
+    stays: `auto_collect_requires_confidence` is its own switch, and the
+    rollback is not a licence to store audio nobody vouched for.
+    """
+    off = {"enabled": False}
+    assert uncertainty.auto_collect_refusal_reason(
+        _seg(speaker="Bob", end=4.0, uncertain=True), off) is None
+    assert uncertainty.auto_collect_refusal_reason(
+        _seg(speaker="Bob", end=0.2, speaker_confidence=0.9,
+             speaker_margin=0.4), off) is None
+    assert uncertainty.auto_collect_refusal_reason(
+        _seg(speaker="Bob", end=4.0, speaker_confidence=0.01,
+             speaker_margin=0.4), off) == uncertainty.REASON_LOW_CONFIDENCE
+    # ...and a label that carries no speaker at all is still no speaker.
+    assert uncertainty.auto_collect_refusal_reason(
+        _seg(speaker="Speaker 2"), off) == uncertainty.REASON_GENERIC
+
+
+
+def test_a_missing_confidence_is_not_doubt(uncertainty):
+    """A generic cluster label carries no confidence; absence ≠ refusal.
+
+    This is why `learning_refusal_reason` checks an explicit low value only --
+    the alternative would refuse every cluster the diarizer produced.
+    """
+    assert uncertainty.auto_collect_refusal_reason(
+        _seg(speaker="Speaker 9", end=9.0)) == uncertainty.REASON_GENERIC
+    assert uncertainty.learning_refusal_reason(
+        _seg(speaker="Speaker 9", end=9.0)) is None

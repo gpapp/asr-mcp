@@ -20,10 +20,26 @@ python -m asr_mcp.server
 
 After completing any code changes:
 1. Run `python -m py_compile <file.py>` to verify syntax
-2. Run `python -m pytest tests/ -q` — pure-python unit tests (uncertainty policy, attribution, turn detector, streaming handler, segment_ops). The `test_result_merge.py`, `test_clustering_linkage.py` and `test_second_pass_claim.py` modules `importorskip` torch/sklearn and are skipped outside the container; run them with `docker compose exec -T asr-mcp python3 -m pytest tests/ -q` after a rebuild
+2. Run `python -m pytest tests/ -q` — pure-python unit tests (uncertainty policy, attribution, turn detector, streaming handler, segment_ops). The `test_result_merge.py`, `test_clustering_linkage.py` and `test_second_pass_claim.py` modules `importorskip` torch/sklearn and are skipped outside the container; run them with `docker compose exec -T asr-mcp python3 -m pytest tests/ -q` after a rebuild. **Always run test suites through a subagent** (delegate the `docker compose cp` + `pytest` invocation to a `general` subagent), never inline in the main conversation — the suite output is long and running two suites concurrently OOM-kills the container
 3. For threshold work, **cache the per-window embeddings** and sweep offline — see lesson 33
 4. If running in Docker, rebuild: `docker compose up -d --build asr-mcp`
 5. Run `git diff --check` after documentation or code edits
+6. **A test fixture must PIN every `Settings` field the assertion depends on.**
+   `Settings()` reads the environment, so a fixture that only overrides what it
+   is testing inherits `TRANSCRIBE_PREFIX`, `TRANSCRIBE_EXTERNAL_URL`,
+   `TRANSCRIBE_HTPASSWD_PATH`… from the running deployment. This has produced
+   three separate wrong-result runs: an admin table that showed a live
+   `memories` account (pinned `htpasswd_path` in `tests/test_admin_routes.py`),
+   a Google redirect URI that carried `/asr-mcp/asr-mcp` (pinned `prefix` in
+   `tests/test_google_routes.py`), and a confirmation link addressed to
+   `mcp.itworks.hu` (pinned `prefix` and `external_url` in
+   `tests/test_auth_routes.py`). A test that passes locally and fails in the
+   image is a fixture bug, not a flake. The host has no pydantic at all, so
+   these fixtures cannot be exercised outside the container — which is exactly
+   why the ambient leak survives local runs.
+7. **Assert a URL whole, never by substring.** `".../asr-mcp" in body` is
+   satisfied by `.../asr-mcp/asr-mcp/api/auth/verify`, which is how lesson 51's
+   doubled prefix shipped with a passing test.
 
 ## Architecture
 
@@ -33,11 +49,50 @@ After completing any code changes:
 | Nginx | /asr-mcp/ | Proxy mount point (trailing slash!) |
 
 ### Auth Flow
-- Session-based auth via htpasswd file (bcrypt/apr1/sha/plain)
+- Session-based auth via htpasswd file (bcrypt/apr1/sha/plain) — the legacy
+  root, still the first store the login form consults
 - SessionMiddleware cookie → AuthMiddleware innermost → public paths bypass
 - Middleware order: AuthMiddleware (innermost) → SessionMiddleware → CORSMiddleware → logging
 - `TRANSCRIBE_PREFIX` sets URL prefix for redirects behind reverse proxy
-- **API token auth**: `X-API-Key` header with a DB token (or static `TRANSCRIBE_API_KEYS` value). `require_auth` returns 401 JSON for an invalid header (never a login redirect); valid header passes without a session. Tokens: `api_tokens` table, sha256-hashed, one per user (`TokenDB.create` replaces), plaintext returned once by `POST /api/token` (session UI card "Windows Client Token"). `get_current_user` order: session → DB token → static key → default/401.
+- **`get_current_user` order**: session → DB token → static key → 401. A
+  **static** `TRANSCRIBE_API_KEYS` value resolves to a SYNTHETIC id
+  `user_<sha256(key)[:16]>` (`api/security.py::resolve_api_key_user`), never to
+  `default` — that is what keeps a static key's voiceprints out of the default
+  user's library. `_websocket_user` calls the SAME resolver, so one key has one
+  voiceprint scope on both transports. An unresolvable key returns `None`, so a
+  caller refuses rather than falling back to a shared identity.
+- **API token auth**: `X-API-Key` header with a DB token (or static `TRANSCRIBE_API_KEYS` value). `require_auth` returns 401 JSON for an invalid header (never a login redirect); valid header passes without a session. Tokens: `api_tokens` table, sha256-hashed, one per user (`TokenDB.create` replaces), plaintext returned once by `POST /api/token` (session UI card "Windows Client Token").
+- **Open mode refused while registration is on**: when `TRANSCRIBE_API_KEYS` is
+  empty, an unauthenticated caller would otherwise become `default` and share one
+  library with every other anonymous caller. With `TRANSCRIBE_REGISTRATION_ENABLED`
+  on, `get_current_user` answers 401 instead.
+- **Registration** (`TRANSCRIBE_REGISTRATION_ENABLED`, off by default) lives in
+  `asr_mcp/auth/` — `passwords.py` (stdlib scrypt, params travel inside the
+  `scrypt$n$r$p$dklen$salt$hash` string so N can be raised), `mailer.py`, `store.py`
+  (`CredentialStore` on the SQLAlchemy DB) and `api/auth_router.py`. Email sign-up
+  is **throttle-then-flag** (10 attempts / 600 s per client, rightmost
+  `X-Forwarded-For` hop; then the flag, 404 so a disabled route is
+  indistinguishable from an unmounted one), creates an UNVERIFIED row, mails a
+  single-use link (token stored as sha256 only), and **never signs anybody in**.
+  A mail failure DELETES the row (503) — no half-made accounts.
+- **Google sign-in** (`asr_mcp/auth/google_auth.py`, stdlib urllib, no JWT lib):
+  `/api/auth/google/start` mints `secrets.token_urlsafe(24)` into
+  `session["oauth_state"]` and is gated on **configuration, not the registration
+  flag** (turning registration off must not sign out existing users). The callback
+  blanks the state first (consumed either way), compares with `hmac.compare_digest`,
+  exchanges the code and fetches userinfo. A Google sign-up's `user_id` **is the
+  normalised email address** — Google already verified it, so no confirmation mail
+  — and it is refused when `email_verified is not True`, when registration is off,
+  or when the address is already a vault key. Identity is resolved by **subject,
+  never by address**: `email_taken` deliberately does NOT consult
+  `google_identities`, so a username signup for an address a Google vault uses is
+  allowed and safe (the two accounts stay separate).
+- **Admin** (`TRANSCRIBE_ADMIN_USER`, default empty ⇒ **nobody**): `is_admin_user`
+  is a plain equality against the deployment constant; `require_admin` guards
+  `GET /api/admin/users`, the disable/enable routes, `DELETE /api/admin/users/{id}`
+  and `POST /shutdown`. An admin delete **keeps** the user's
+  voiceprints/snippets/transcripts/audio and reports the counts, unless the
+  opt-in `?purge=true` also drops the rows and `rmtree`s `voices/<user_id>/`.
 - **Client no-save**: Windows client calls `/api/asr/transcribe/upload?save=false` → TranscriptDB.save skipped; voiceprint snippet uploads are still persisted. Exception: if the SSE consumer disconnects before `done` (`event_stream` sets `client_disconnected` on GeneratorExit/CancelledError), the transcript IS saved so it appears in the web UI history. Save logic lives in `run_transcribe`'s `_persist_transcript(reason)` (both the main path and the no-segments path call it on disconnect).
 
 ### GPU Backend
@@ -77,6 +132,8 @@ After completing any code changes:
 5. Edges extended to 0.0 / audio_duration
 6. **Transcription** (`asr_router.py::_transcribe_file`): ONE whole-file `transcribe_audio_sync()` call; the backend decodes in its own windows (Qwen `_transcribe_chunked`, Cohere `_transcribe_windowed`), then `speaker/attribution.py::attribute_items` maps each returned item onto the turns and groups consecutive same-speaker items into `TranscribeResult` runs — audio is never cut at speaker boundaries
 7. **Voiceprint learning** (`_auto_collect`) runs AFTER step 1–5 and is passed the **turns**, not the raw segments, so every learned snippet carries the same boundaries the transcript was attributed on; each is trimmed inward to whole VAD sections (lesson 41)
+
+**Diarization-only requests do the same work** (`asr_router.py::_refine_and_learn`, shared by `/diarize` and `/diarize/upload`): steps 1–5 and 7 run, only step 6 (the decode) is skipped. A run that never decodes text must produce the SAME boundary set as one that does — the snippets a diarize-only run learns are cut on the turns the user is shown, trimmed onto the diarizer's own VAD sections, and keyed on the source id so a reprocess replaces that file's earlier take. Both endpoints display the refined turns (`_display_spans`, the same projection `/transcribe/upload` uses) and report `pending_profiles` + `learning`, because a learned-but-unnamed profile is invisible until the user is told. The helper degrades at every step (no audio → no exact-boundary pass; refinement failure → raw segments; learner failure → `{}`) — a voiceprint problem never fails a diarization.
 
 **Decode windowing** (`transcribers/cohere.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
 - Plans ≤30s windows (`_plan_window_bounds`), each cut snapped to the minimum frame-energy point inside a ±100-frame band (never mid-word); tails <300 frames merge into the previous window
@@ -128,6 +185,208 @@ Numbering below matches the `# Step N` comments in
 - Input: mp3, mp4, mkv, flac, ogg, m4a, wav, webm, opus
 - Auto-converts to WAV PCM 16kHz mono via ffmpeg before processing
 - Voiceprint snippets stored as **FLAC** (compressed, lossless)
+- **One file, one contribution**: re-processing a recording must REPLACE that
+  recording's take, not stack a second copy of the same room and channel onto a
+  profile (which is how a profile ends up fitted to one recording). A recording
+  is identified by its **filename hash** (`generate_segment_hash`, md5 of the
+  source stem — the same hash snippet filenames are built from), so a reprocess
+  matches across a different directory, extension, upload name and every moved
+  span or duration. `VoiceprintService._source_snippet_rows` selects the rows,
+  `replace_source_contribution` drops them, `_purge_source_rows` handles the file
+  unlink.
+  - **Upload path**: `add_snippet(replace_source=True)` deletes the same speaker's
+    rows from the same source BEFORE writing the new file (required — the filename
+    is derived from stem+span+duration, so a re-run lands on the same path).
+    Exposed as `?replace_source=false` on `POST /speakers/{name}/upload`.
+  - **Reprocess path** (`auto_collect_from_diarization` + `_learn_unknown_speaker`):
+    collect FIRST, then `replace_source_contribution`, then the single
+    `_auto_refine`. Collecting first is what makes it safe — if every span was
+    rejected, the previous take is still there and nothing is lost. The learn
+    path's same-recording idempotence guard (`have`) covers OTHER recordings only,
+    or it would veto the refresh and the purge would delete the only copy. The
+    learn cap and `AUTO_COLLECT_MAX_TOTAL_SEC` are judged on the POST-replacement
+    total, so a profile sitting at the cap because of this recording can refresh it.
+  - Scope: ONE speaker, one user (a file may feed several profiles, and only a
+    profile this run rebuilt is rewritten); rows with `source_audio IS NULL`
+    (rescan-adopted) never match. Clips from other recordings are always kept.
+  - `SnippetDB.find_duplicate` is speaker-scoped: it DELETES what it finds, so an
+    unscoped lookup would let one profile's collection remove another's audio.
+  - Tests: `tests/test_voiceprint_source_replace.py` (unit) and the "reprocessing a
+    recording replaces the spans it cut before" block in
+    `tests/test_learning_boundaries.py` (through `auto_collect_from_diarization`)
+
+### Voiceprint learning: the cohesion split RE-JOINS, it does not refuse
+`voiceprint/service.py::_split_cluster_by_cohesion` embeds each of a cluster's spans
+separately and re-clusters them at `learning.max_intra_cluster_dist` (average linkage,
+cosine) before learning, because a diarization cluster is not a person. If the groups it
+produces sit closer together than `learning.min_inter_dist`, that split is an **artefact
+and the groups are merged back into ONE part**, which also brings the dropped one-span
+groups back. It used to `return [], "unverified:groups_too_close"` and learn nothing,
+which discarded the largest and richest clusters: on `2026-10-07_17-00-32.mp4` fourteen
+clusters were refused at 0.175–0.281 apart while `Speaker 1` and `Speaker 9`, learned
+from the same run, had intra-group MEANS of 0.179 and 0.170 — the refused "groups" were
+closer together than a learned single speaker is spread internally. "Too close" is
+evidence of one voice.
+
+**There is NO maximum-based purity gate, on any group** — the re-joined one included.
+A maximum over n(n-1)/2 pairs grows with the span count, so it rises with the richness
+of the cluster, which is why gating on it lost every cluster of `2026-09-04 12-08-59.mp4`
+(22 spans, mean 0.21, max 0.379). A re-joined group briefly had one
+(`max_profile_intra_max` 0.40) and real data killed it: `Speaker 9` — a speaker the
+user had ALREADY learned — is 20 spans, mean 0.255, max **0.463** once re-joined, and a
+synthetic two-voice blend is mean 0.252, max **0.42**. Neither statistic separates them,
+so no value of that threshold admitted one and rejected the other; it could only choose
+which real speakers to discard, and it chose the largest. Do not reintroduce it on a
+synthetic fixture — check against a real cluster first.
+
+**The merge window and the blend window are disjoint.** The re-join fires only when every
+group's nearest neighbour is under `min_inter_dist`; ZO249 — the real blend this function
+exists for — had its groups 0.368 apart, so it splits into two profiles and never
+merges. That is why undoing the merge cannot smuggle a blend past the split, and why the
+re-joined group needs no gate of its own.
+
+**Only a SPREAD voice reaches the re-join — never two clean ones.** `min_inter_dist` and
+`max_intra_cluster_dist` are both 0.32, and average linkage splits on the **mean
+cross-pair** distance while the check compares **centroid to centroid**. For two clean
+voices those statistics coincide, so the two clusters land 0.32+ apart exactly when
+linkage stops merging them: the window is empty and the branch is unreachable without
+monkeypatching a threshold. A real cluster is never clean — the mean runs ahead of the
+centroids, because the halves linkage tears apart both pull back toward the shared mean.
+Measured: 34 spans of one voice split 22/5/4/2/1 with neighbours 0.2310 apart at the
+centroids against a 0.297 intra-group mean, and re-join under the same shipped 0.32.
+Write a test fixture as a **wide-spread single voice** (`_one_voice(jitter=0.68)` over
+`_fan_spans(34)`); a two-voice fixture proves nothing here. `test_a_split_whose_groups_sit_closer_tha
+n_the_bar_is_rejoined_not_refused` asserts that precondition (the corpus really is split,
+and really is inside the window) before asserting the re-join, because `len(parts) == 1`
+is also what an *unsplit* cluster returns.
+
+Consequence for threshold work: `min_inter_dist` is now a **merge trigger, not a
+refusal bar** — one number decides learn-one-or-learn-two. Lowering it merges more
+aggressively; raising it above `max_intra_cluster_dist` mostly disables the re-join. A
+split is only ever *refused* for `too_few_segments` / `too_few_embeddings` /
+`no_embedding_session` / `no_sklearn` / `clustering_failed`, all fail-closed
+(`learning.fail_closed`). Tests: `test_a_split_whose_groups_sit_closer_than_the_bar_is_
+rejoined_not_refused`, `test_the_merge_window_and_the_blend_window_are_disjoint`,
+`test_a_rejoined_single_voice_cluster_is_learned`, and the pre-existing
+`test_a_blend_is_learned_as_two_profiles_each_with_its_own_purity` which pins the far
+side of the same boundary (all in `test_learning_boundaries.py`).
+
+### Voiceprint Integrity: audit, automatic rebuild, cleanup
+`voiceprint/audit.py` is read-only and reports 8 findings; `voiceprint/rebuild.py` +
+`cleanup_integrity` are the two halves that act. A finding with **one** correct
+answer is repaired automatically; anything needing a human decision is only
+reported.
+
+**Automatic, on audit failure** (the only automatic repair — `server.py` lifespan):
+1. `run_startup_audit` returns `reports`; `vp_rebuild.enqueue_from_reports(<data_dir>/voiceprint_rebuild_queue.json, reports, logger)` writes the queue.
+2. The TTL monitor's 60 s tick drains it, but only when the queue is non-empty AND `job_state.get_running() is None`. It calls `state.ensure_diarize_ready()` (VAD + ECAPA only — **never** the ASR backend) then `run_pending` in `ms.executor`. This is the documented exception to "no model load at startup".
+3. `VoiceprintService.rebuild_profile_from_scratch(speaker, user_id)` — purge dead snippet rows → drop the derived `voiceprints` row → `_auto_refine` → re-apply `pending` and `purity`.
+
+- **Why dropping the row is safe**: the snippets and their FLAC audio are the source
+  of truth and are NEVER touched by the rebuild; only the *derived* embedding row is
+  discarded and recomputed. It is idempotent and cannot lose material.
+- `pending` and `purity` are read from the old row BEFORE the delete and re-applied
+  after, because `VoiceprintDB.save(pending=None)` PRESERVES the flag but a
+  deleted row destroys it — without the re-apply a learned-but-unnamed profile would
+  silently become matchable (lesson 39).
+- **Purge first, rebuild second.** `_purge_dead_snippet_rows` deletes ROWS ONLY (no
+  unlink — the audio is already gone; a file that resolves must never be unlinked)
+  for rows whose `audit.resolve_snippet_path(...)` is `None`. Measured on the live
+  store: the first boot of this feature re-embedded 219 snippets (~25 min of GPU)
+  for a `missing_snippet_files` finding and fixed nothing, because 73 rows pointed
+  at `.wav` files left over from a wav→flac migration. Purge needs no GPU, so it
+  runs even when the models are absent (then the entry is `skipped` and kept). A
+  row whose file merely fails to LOAD is not dead and is kept.
+- A crash mid-rebuild leaves a speaker profileless — recoverable and self-healing:
+  the next audit reports `snippets_without_profile`, which IS a rebuild target.
+- `TARGET_FINDINGS = ("snippets_without_profile", "profiles_without_snippets",
+  "missing_snippet_files")`. NOT targets: `near_duplicate_profiles`,
+  `name_collisions`, `duplicate_snippet_content`, `orphan_snippet_files`,
+  `stale_speech_totals` — merging is the user's decision.
+- **Convergence**: `MAX_ATTEMPTS = 3` then the entry is dropped with an ERROR naming
+  `POST /api/voiceprint/integrity/cleanup`; a `skipped` result is NOT an attempt.
+  A `done` fingerprint (user + speaker + sorted reasons) stops a fixable-less finding
+  re-queuing on every boot — but keep the marker for handled entries only as long as
+  the reason set is unchanged, or a changed finding is silently suppressed.
+- Manual: `GET /api/voiceprint/integrity` (read-only) and
+  `POST /api/voiceprint/integrity/cleanup` (`IntegrityCleanupRequest{dry_run=True,
+  dead_snippets=True, ...}` → `cleanup_integrity`, which deletes duplicate-content
+  rows and the audit's `missing_snippet_files`, then re-refines each affected
+  speaker ONCE).
+- Tests: `tests/test_voiceprint_rebuild.py` (32), `tests/test_voiceprint_audit.py`,
+  `tests/test_voiceprint_integrity_cleanup.py`. Load `rebuild.py`/`service.py` **by
+  path** — importing `asr_mcp.voiceprint` puts the real package in `sys.modules` and
+  breaks the stubbed loaders in other test modules.
+
+### Voiceprint Consolidation: outlier snippets and manual review
+`voiceprint/service.py::consolidate_speaker` answers "is every snippet of this profile
+actually the same person?". It **flags** the outliers and recomputes the profile from
+the **kept** snippets only; it deletes nothing. Removal is a separate, explicit,
+dry-run-by-default step (`remove_flagged_snippets`), because a flag is an accusation
+the user has to be able to check.
+
+**One embedding pass, shared with refine.** `_embed_snippets(speaker, user_id, ...)`
+loads and embeds every usable snippet once and returns
+`{"rows","vectors","durations","waveforms","missing"}`; `_auto_refine` and the
+consolidation pass BOTH consume it, and `_weighted_embedding(vectors, durations)`
+holds the duration weighting + `max_refine_weight_ratio` cap. Do not reintroduce a
+direct `extract_embedding(` call in either — two implementations would drift, and each
+re-embed of a 219-snippet profile is ~25 min of GPU (the lesson-44 audit figure).
+
+**The detector is a PURE module-level function** `score_outliers(vectors, cfg=None)`
+→ `{distances, kept_indices, flagged_indices, kept_vectors, reasons, rounds}`:
+- Iterative reweighting (`outlier_mad_rounds`, default 2): each round recomputes the
+  centre from the **kept** vectors only. One centre over everything is dragged toward
+  the outliers and hides them.
+- A snippet is accused only when its distance to the centre exceeds BOTH
+  `median + k·MAD·1.4826` (`outlier_mad_k`) AND an absolute floor
+  (`outlier_floor` = **0.35, the naming bar `matching.accept_threshold`**). The
+  statistical half adapts to a tight profile; the floor is what stops a legitimately
+  wide-but-continuous profile from being carved up. It is deliberately NOT the 0.32
+  that `thresholds.json → learning` reuses four times uncalibrated (lesson 43).
+- Guardrails: `n < outlier_min_keep` (3) accuses nobody; `outlier_max_fraction` (0.2)
+  is a **whole-pass** budget enforced worst-first, and floors at 1 (so a 5-snippet
+  profile is not silenced by `floor(0.2*5) == 0`); a capped or spared snippet still
+  gets a reason string, and a snippet that ends up flagged never keeps a
+  "capped"/"min_keep" reason. `outlier_mad_rounds: 0` = report-only (everyone scored,
+  nobody accused).
+- **Why not reuse `_split_cluster_by_cohesion`** (the P2 cohesion split): it flags a
+  whole GROUP, which is right when learning a diarization cluster and wrong for
+  review, and it has hard `unverified:*` exits that would abort a library sweep.
+
+**Marks are durable evidence, not a boolean.** `snippets.review_flag` /
+`review_score` / `review_reason` (additive migration in `db/models.py::init_db`,
+mirroring `file_mtime`/`file_size`) + `SnippetDB.set_review` / `clear_review` /
+`list_flagged` (user-scoped, ranked by descending score). A bare flag would make every
+item an unverifiable accusation. Re-running consolidation **clears** marks it no longer
+makes, and `keep_flagged_snippet` clears one — a kept snippet must not keep a stale
+accusation. Flow: flag → `GET /flagged` (read-only) → per-item keep/remove →
+`POST /flagged/remove` (ONE destructive call, `dry_run=True` by default).
+
+**Removal never calls `delete_snippet`** (it re-refines on every call → N flagged
+snippets = N full re-embeds). `remove_flagged_snippets` collects `doomed` ids first,
+deletes via `_delete_snippet_row`, then does ONE `_auto_refine` per touched speaker (or
+drops the profile row when nothing is left) — the `cleanup_integrity` pattern.
+
+**Hazards designed around**
+- `_auto_refine` returns SILENTLY when `self._emb_session() is None`, and the TTL
+  monitor unloads the embedding session whenever `job_state.get_running() is None`. A
+  sweep that does not register a job can have ECAPA pulled out mid-pass and report
+  success having done nothing. `POST /consolidate/stream` therefore registers a
+  `job_state` job, and `_embed_snippets` re-checks the session **before every embed**,
+  bailing out with empty vectors (→ `status: "skipped"`, not a false `clean`).
+- A zero-norm embedding means "no usable window", not "maximally far away". It is
+  dropped and counted in `missing` → `unusable_snippets`, so a run that silently lost
+  half the corpus cannot read as clean.
+- A single-speaker run is served by the same SSE endpoint and the same result shape
+  (`{speakers, flagged_count, results}`) so the UI has one code path.
+- If EVERY snippet is flagged, nothing is saved — fitting an unapproved set is worse
+  than leaving the old profile.
+
+Tests: `tests/test_voiceprint_consolidation.py` (46) — pure `score_outliers` vectors
+plus service tests on a real temp SQLite DB, with `service.py` loaded **BY PATH** (the
+same reason as above) and each snippet's voice keyed by a **marker written into the
+fake audio**, so a fixture states what a snippet says instead of relying on call order.
 
 ### Browser Live Tab (`static/live.js`)
 A third live client alongside `asr-client/live_client.py`, for `/live` in the SPA. It re-implements the wire protocol and the endpointing in JS, so both are drift-guarded by `tests/test_live_js_protocol.py` (constants vs. `protocol.py`, `DETECTOR_DEFAULTS` vs. `turn_detector.config()`, packed frames vs. `unpack_turn`, node-vs-server detector boundary equality, and `buildTranscript` vs. `transcribe_client.build_transcript`).
@@ -145,7 +404,23 @@ A third live client alongside `asr-client/live_client.py`, for `/live` in the SP
 - **A pane composes shared classes; it does not declare its own.** The Live tab shipped with `.live-status` / `.live-meters` / `.live-meter-*` / `.live-text` / `.live-note` / `.live-downloads` — a private second copy of the pill, the level meter and the transcript surface. The primitives are `.pill`, `.note`, `.mini-bar` + `.meter-row`, `.text-pane` + `.pane-short|tall|live`, `.btn` + `.row`/`.row-spread`, `.badge`, `.toast`, `.hidden` + `show(id, on)`. Status colours are `:root` tokens (`--ok-ink --bad-ink --warn-ink --*-soft --pane-h`) and must not be re-hardcoded.
 - **Two max-width breakpoints only: 860px and 560px.** Base rules are the desktop layout, so a `min-width` query is a rule violation. The 560px block is the phone layout (scrollable tab strip, 16px input floor for iOS, 44px tap targets, stacked controls, safe-area insets, `prefers-reduced-motion`); `<meta name="viewport">` carries `viewport-fit=cover` or the safe-area padding is inert.
 - **No inline styles.** Visibility is the `.hidden` class plus `show()`; no `style.display` writes and no `style="..."` in markup.
+- **A name in an `onclick` is `jsStr(name)`, never `escHtml(name)`.** `escHtml` escapes `& < >` and deliberately leaves quotes alone, and the browser HTML-decodes the attribute *before* the JS is parsed, so `onclick="f('${escHtml(name)}')"` is a `SyntaxError` on an apostrophe and the button silently does nothing. A learned profile takes its name from a source **filename**, so the apostrophe arrives without anybody typing it. `jsStr` is `JSON.stringify` with `"` → `&quot;`; `tests/test_voiceprint_panes.py` fails on any remaining `'${` in an `onclick`.
 - `tests/test_ui_design_system.py` pins all of the above in both directions (no orphan class either way, no private primitive, no inline style, token-only colours, exactly two breakpoints).
+
+### Voiceprints tab: two sub-tabs
+The Voiceprints pane is split by `.pill-tab` buttons into **Known speakers** and **Unnamed** (`showVoiceprintSubtab`, state in `vpSubtab`). They were one list, with the unnamed ones in a card above the known speakers — which made the named list unreadable and asked the user to identify a voice from a row of counts.
+
+- `.pill-tab` is ONE primitive for both strips: the header nav (`_nav.html` anchors) and the in-pane sub-tabs (buttons). The old `.tabs a` rule was replaced, and the test asserts it is gone — an anchor-scoped rule is what a button sub-tab would silently miss.
+- An unnamed profile is a fold (`togglePending` → `loadSnippetBody` → `snippetListHtml`) exactly like a named one: same endpoint, same player, same remove button. Its audio is the only evidence of who the voice is, so it must be playable **in place**. The action row differs on purpose — naming, merging and discarding are identity decisions, and only an unnamed profile has a "this is ___" input.
+- `snippetListHtml` + `loadSnippetBody` are the single renderer/loader pair; the test pins one definition, one call in the loader, and one call from each fold.
+- Naming or merging a profile switches to the Known tab, because the profile just moved there.
+- `refreshPending` writes the count into the tab label — a hidden card with no affordance is how the profiles went unnoticed.
+- **Every list is sorted by name** (`byName`, `numeric: true` so "Speaker 2" precedes "Speaker 10" — these labels are generated, and a lexicographic order puts 10 between 1 and 2). Applies to the known list, the unnamed list and the flagged card's speaker groups, which is why `byName` accepts a string as well as a row.
+- **A redraw must not close what the user opened.** `refresh()` replaces both lists' `innerHTML`, so it captures the open fold ids (`captureOpenFolds` — `body-<name>` / `pbody-<name>`) and reopens them with their content afterwards (`restoreOpenFolds`, reusing `loadSnippetBody` + `knownActionsHtml`). Reviewing means open a profile, remove three snippets, look again; collapsing on every removal made that impossible. `showVoiceprintSubtab` therefore only toggles visibility and NEVER re-renders, for the same reason.
+- **A job in another pane must not hijack the tab.** `/api/asr/activity/stream` is global, so a `consolidate` or `rescan` job reaches the Transcribe pane's `attachActiveJob`, which called `activateTab('transcribe')` and entered a transcription job UI — pressing "Consolidate All" jumped the user out of the Voiceprints pane. The mode is now checked against `TRANSCRIPTION_MODES = ['transcribe', 'diarize']` **before** the tab switch. (The job still has to be registered server-side; that is what stops the TTL monitor unloading ECAPA mid-pass.)
+
+### Markup inside a JS template literal is not validated by anything
+An `onclick="f(${jsStr(n)})""` — a doubled closing quote, which is what a careless search-and-replace of `'${escHtml(x)}'` into `${jsStr(x)}` produces — silently kills the button. `node --check` parses past it (the markup is inside a template literal), and the design-system tests did not catch it either. `test_no_html_attribute_is_closed_twice` scans for `""` and `">>` outside `<style>`/`<script>`/line comments.
 
 ## Project Structure
 
@@ -160,12 +435,19 @@ asr-mcp/
 │   │   ├── voiceprint_router.py # CRUD + upload + merge + rename + rescan
 │   │   ├── transcript_router.py # User-scoped transcript CRUD + download
 │   │   ├── token_router.py     # GET/POST /token — client API token status + generation
+│   │   ├── admin_router.py    # /admin/users list + disable/enable/delete (require_admin)
+│   │   ├── auth_router.py     # login/logout/register/verify + Google sign-in
 │   │   ├── mcp_router.py      # MCP tools + resources + /call
 │   │   ├── schemas.py         # Pydantic request/response models
-│   │   ├── security.py        # API key auth + path validation
+│   │   ├── security.py        # API key auth + is_admin_user/require_admin + path validation
 │   │   ├── auth.py            # htpasswd parse + session auth + require_auth
 │   │   ├── exceptions.py      # Custom exceptions + handlers
 │   │   └── middleware.py      # Request logging
+│   ├── auth/
+│   │   ├── passwords.py       # scrypt hash/check + username/email normalisation (stdlib only)
+│   │   ├── mailer.py          # smtp_configured + verification_email + send_mail (injectable client)
+│   │   ├── store.py           # CredentialStore on the SQLAlchemy DB (accounts, throttle, google identities)
+│   │   └── google_auth.py     # OAuth urls/callback + authorization_url/exchange_code/fetch_userinfo
 │   ├── core/
 │   │   ├── model_state.py     # ModelState, is_gpu_oom, log_gpu_memory, GPU_SHRINK_RUN_OPTIONS, run_embedding
 │   │   ├── model_loader.py    # HuggingFace download + ORT session init (CUDA EP, arena caps, _preload_cuda_libs)
@@ -193,6 +475,8 @@ asr-mcp/
 │   │   └── service.py         # SpeakerService (SQLite-backed CRUD)
 │   ├── voiceprint/
 │   │   ├── service.py         # VoiceprintService (snippet CRUD, auto-collect, refine, merge)
+│   │   ├── audit.py           # Read-only integrity audit (8 findings)
+│   │   ├── rebuild.py         # Automatic from-scratch profile rebuild + its JSON queue
 │   │   └── utils.py           # Audio load/convert (ffmpeg), FLAC snippets
 │   ├── db/
 │   │   ├── models.py          # SQLAlchemy: voiceprints, snippets, sessions, transcripts
@@ -220,6 +504,12 @@ asr-mcp/
 ├── tests/                    # Pure-python unit tests (pytest, no GPU needed)
 │                            # test_ui_design_system.py = the CSS design system
 │                            # test_live_js_protocol.py = the browser live client
+│                            # test_voiceprint_consolidation.py = outlier snippets (load by path)
+│                            # test_voiceprint_panes.py = the Voiceprints tab's two sub-tabs
+│                            # test_user_scoping.py = per-user isolation (P1)
+│                            # test_auth_credentials.py = the credential store; test_auth_routes.py = email sign-up
+│                            # test_google_auth.py + test_google_routes.py = the OAuth client + routes
+│                            # test_admin_routes.py = the admin gate, user table, delete + /shutdown
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt output, voiceprints
 │   │                           # .txt = profiles banner + [HH:MM:SS] Speaker (NN%): paragraphs —
@@ -250,10 +540,12 @@ asr-mcp/
 | Table | Primary Key | Purpose |
 |-------|-------------|---------|
 | `voiceprints` | `(user_id, name)` composite | Speaker embeddings, pitch, energy, MFCC stats |
-| `snippets` | `id` (INTEGER) | Auto-collected audio snippets (FLAC files) |
+| `snippets` | `id` (INTEGER) | Auto-collected audio snippets (FLAC files); `review_flag`/`review_score`/`review_reason` hold the consolidation marks |
 | `sessions` | `id` (TEXT) | Session data with TTL expiration |
 | `transcripts` | `id` (INTEGER) | Stored transcription results |
 | `api_tokens` | `user_id` (TEXT) | One client API token per user (SHA-256 hash) |
+| `credentials` | `user_id` (TEXT) | Email-registered accounts: scrypt `password_hash`, `email` (partial UNIQUE index where `email <> ''`), `email_verified_at`, `verification_token` (sha256 only), `disabled_at` |
+| `google_identities` | `(provider, subject)` | One Google subject → exactly one `user_id` forever; `display_name`, `last_used_at`. NOT keyed on the email |
 
 ## API Endpoints
 
@@ -264,7 +556,7 @@ asr-mcp/
 | `/live` | GET | Session | SPA — Live tab (browser real-time transcription, `static/live.js`) |
 | `/voices` | GET | Session | SPA — Voiceprints tab |
 | `/transcriptions` | GET | Session | SPA — History tab |
-| `/settings` | GET | Session | SPA — Settings tab (status, client token, session) |
+| `/settings` | GET | Session | SPA — Settings tab (status, client token, session, admin accounts card) |
 | `/login` | GET | No | Login page |
 | `/api/asr/diarize` | POST | API key | Diarize audio by file path |
 | `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio (`?num_speakers=` is a query param, not form) |
@@ -272,7 +564,7 @@ asr-mcp/
 | `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save; `?language=hu` ISO 639-1 or `auto`, default `auto`) |
 | `/api/asr/languages` | GET | Session/API key | Static language list of the configured backend (no model load) — `{backend, supports_auto, languages:[{code,name}]}` |
 | `/api/asr/activity/stream` | GET | Session/API key | SSE push of job start/finish (snapshot on connect + keep-alive pings; replaces polling `/active`) |
-| `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; non-owners get events with `result` stripped |
+| `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; another user's job is a 404 |
 | `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
 | `/api/asr/ws/stream` | WS | Session/API key | Real-time streaming transcription (auth: session, `X-API-Key` header or `?token=`; closes 1008 *before* `accept()`) |
 | `/api/asr/stream` | POST | No | Always 501 — a stub that points at the WebSocket endpoint |
@@ -298,16 +590,33 @@ asr-mcp/
 | `/api/voiceprint/snippets/{snippet_id}` | DELETE | Session | Delete one snippet |
 | `/api/voiceprint/snippets/{snippet_id}/audio` | GET | Session | Stream snippet audio (FLAC) |
 | `/api/voiceprint/speakers/{speaker_name}` | DELETE | Session | Delete a voiceprint |
-| `/api/voiceprint/speakers/{name}/upload` | POST | Session/API key | Add snippet (optional `?start_sec=&end_sec=`) |
+| `/api/voiceprint/speakers/{name}/upload` | POST | Session/API key | Add snippet from a file (optional `?start_sec=&end_sec=`; `?replace_source=false` keeps earlier snippets from the same file — the default **replaces** them, see below) |
 | `/api/voiceprint/speakers/{name}/refine` | POST | Session/API key | Rebuild voiceprint from snippets |
+| `/api/voiceprint/integrity` | GET | Session | Read-only store audit (8 findings) |
+| `/api/voiceprint/integrity/cleanup` | POST | Session | Repair the findings that have one correct answer (`IntegrityCleanupRequest{dry_run=True, dead_snippets=True, ...}`) |
+| `/api/voiceprint/consolidate/stream` | POST | Session | Flag the outlier snippets of one speaker (`?speaker_name=`, omit = whole library) and re-fit from the kept ones, as an SSE stream |
+| `/api/voiceprint/flagged` | GET | Session | Snippets flagged for review, ranked by distance (`?speaker_name=`) — read-only |
+| `/api/voiceprint/flagged/{snippet_id}/keep` | POST | Session | Withdraw the flag; re-run consolidation to fold the snippet back into the profile |
+| `/api/voiceprint/flagged/remove` | POST | Session | Delete every flagged snippet in ONE pass, then re-refine each touched speaker once (`FlaggedRemoveRequest{dry_run=True, speaker_name?}`) |
 | `/api/token` | GET/POST | Session/API key | Client API token status / generate (one per user) |
 | `/api/transcripts` | GET | Session | List all transcriptions for user |
 | `/api/transcripts/{id}` | GET | Session | Get transcription by ID |
 | `/api/transcripts/{id}/download` | GET | Session | Download as plain text |
 | `/api/transcripts/{id}` | DELETE | Session | Delete transcription |
-| `/api/auth/login` | POST | No | Login (JSON + session cookie) |
+| `/api/auth/methods` | GET | No | Which sign-up methods this deployment offers — `{email, google, password_hint}` |
+| `/api/auth/login` | POST | No | Login — 401 wrong password, 403 with a reason (unverified/disabled) |
+| `/api/auth/login/session` | POST | No | Login from the form (302) |
 | `/api/auth/logout` | POST/GET | No | Logout |
-| `/api/user` | GET | No | Current user info |
+| `/api/auth/register` | POST | No | Email sign-up — 201 + a confirmation mail; never signs anybody in |
+| `/api/auth/verify` | GET | No | Consume the single-use email link (302; bad/spent/empty all answer alike) |
+| `/api/auth/google/start` | GET | No | Begin Google sign-in (302; 404 when unconfigured) |
+| `/api/auth/google/callback` | GET | No | Finish it — 302 to the SPA, or to `{prefix}/login?google=state\|declined\|failed\|closed` |
+| `/api/user` | GET | No | Current user info (session only) |
+| `/api/admin/users` | GET | Admin | Account table — never a hash or a verification token |
+| `/api/admin/users/{id}/disable` | POST | Admin | Suspend a registrable account |
+| `/api/admin/users/{id}/enable` | POST | Admin | Lift a suspension |
+| `/api/admin/users/{id}` | DELETE | Admin | Delete the account; `?purge=true` also drops its rows and `voices/<id>/` |
+| `/shutdown` | POST | Admin | Stop the server (was ungated; it cancels other users' jobs) |
 | `/api/mcp/tools` | GET | No | List MCP tools |
 | `/api/mcp/resources` | GET | No | List MCP resources |
 | `/api/mcp/call` | POST | No | Call MCP tool |
@@ -331,8 +640,20 @@ set in `.env` stays in the host and never reaches the container. Copy
 |----------|---------|-------------|
 | `TRANSCRIBE_SESSION_SECRET` | (required) | Secret key for session cookies |
 | `TRANSCRIBE_HTPASSWD_PATH` | `/app/htpasswd` | Path to htpasswd file (compose sets `/app/data/.htpasswd`) |
-| `TRANSCRIBE_API_KEYS` | `[]` | JSON list of static API keys; a request with a matching `X-API-Key` runs as the `default` user |
+| `TRANSCRIBE_API_KEYS` | `[]` | JSON list of static API keys; a request with a matching `X-API-Key` runs as the synthetic user `user_<sha256(key)[:16]>`, never `default` |
 | `TRANSCRIBE_PREFIX` | `""` | URL prefix for reverse proxy |
+| `TRANSCRIBE_REGISTRATION_ENABLED` | `false` | Offer email/Google sign-up on the login page; also forces auth (open mode is refused while it is on) |
+| `TRANSCRIBE_GOOGLE_CLIENT_ID` | `""` | Google OAuth client id (both halves required, or `/api/auth/google/start` is a 404) |
+| `TRANSCRIBE_GOOGLE_CLIENT_SECRET` | `""` | Google OAuth client secret |
+| `TRANSCRIBE_EXTERNAL_URL` | `""` | Public base URL for the verification mail and the Google `redirect_uri`; falls back to `request.base_url`. May include `TRANSCRIBE_PREFIX` or not — `_public_base` adds the prefix only when absent (lesson 51) |
+| `TRANSCRIBE_SMTP_HOST` | `""` | SMTP host — email sign-up needs this AND `TRANSCRIBE_SMTP_FROM` |
+| `TRANSCRIBE_SMTP_PORT` | `587` | SMTP port |
+| `TRANSCRIBE_SMTP_USER` | `""` | SMTP user (login is skipped when empty — a relay on a trusted network may take none) |
+| `TRANSCRIBE_SMTP_PASSWORD` | `""` | SMTP password |
+| `TRANSCRIBE_SMTP_FROM` | `""` | Envelope sender for the confirmation mail |
+| `TRANSCRIBE_SMTP_STARTTLS` | `true` | Issue STARTTLS before the login |
+| `TRANSCRIBE_SMTP_TIMEOUT` | `20.0` | SMTP socket timeout (seconds) |
+| `TRANSCRIBE_ADMIN_USER` | `""` | The one account allowed to reach `/api/admin/*` and `POST /shutdown`; empty means **nobody** |
 | `TRANSCRIBE_CUDA_DEVICE` | `cuda:0` | CUDA device ordinal |
 | `TRANSCRIBE_HOST` | `0.0.0.0` | Server bind host |
 | `TRANSCRIBE_PORT` | `8080` | Server port |
@@ -365,6 +686,7 @@ set in `.env` stays in the host and never reaches the container. Copy
 
 ## Known Issues
 
+- **Shared GPU**: arena caps come from the card's *total* size, so another workload on the same device can leave too little free and cuBLAS fails at `cublasCreate()` (lesson 44). Services now fall back to CPU rather than dying, but that is slow — free the VRAM for real throughput
 - **CUDA OOM on large files**: arena caps + per-run shrinkage + reload-fresh-arena + CPU fallback now recover automatically (window may be slow on CPU, but no silent holes); reduce max_audio_duration_sec if still OOM
 - **No CUDA available**: Server starts but models fail to load; API returns errors for ASR operations
 - **SQLite locking**: Concurrent writes may fail under heavy load; WAL mode recommended for production
@@ -388,9 +710,26 @@ anything the rule covers.
 | 30 | Uncertain speaker: suppress the IDENTITY, keep the text; one policy module, `uncertainty.enabled: false` is the rollback | [diarization](docs/lessons/diarization-and-speakers.md) · [user docs](docs/uncertain-speakers.md) |
 | 32 | `num_speakers` selects a DIFFERENT clustering path (hard k, no greedy merge) | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 33 | Verify diarization on a SHORT clip too — 52-min files hide over-clustering | [diarization](docs/lessons/diarization-and-speakers.md) |
-| 39 | A learned-but-unnamed speaker is a PENDING profile: excluded from every match until the user names it (or merges it into someone they already have), and the client must say so out loud | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 39 | A learned-but-unnamed speaker is a PENDING profile: excluded from every match until the user names it (or merges it into someone they already have), the client must say so out loud, and the UI must let the user LISTEN to it — an unnamed profile whose audio cannot be played is a row of counts, not an identification | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 40 | ONE boundary engine (`speaker/boundary.py::cut_between`) decides every cut; a cluster is not a person, so naming is withheld when the largest cluster owns the speech | [diarization](docs/lessons/diarization-and-speakers.md) |
 | 41 | Learn a voiceprint from the boundaries the TRANSCRIPT uses (trimmed to whole VAD sections) — a mid-word snippet becomes a reference for cutting the next run's boundaries | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 43 | Naming reads a DISTANCE and learning reads a CONFIDENCE; a match in the 0.325–0.35 band gets the speaker's name and is refused for learning, on purpose. Learn from `docs/lessons/diarization-and-speakers.md` before touching either threshold. | [diarization](docs/lessons/diarization-and-speakers.md) · [user docs](docs/uncertain-speakers.md) |
+| 45 | Flagging an outlier snippet is an ACCUSATION: conservative by construction (MAD cut AND the 0.35 naming floor), never a deletion — flag, let the user keep or remove, and never let a bulk delete re-embed per snippet. One embedding pass feeds both refine and consolidation. | [diarization](docs/lessons/diarization-and-speakers.md) |
+| 46 | A cohesion split whose groups come out too close is RE-JOINED into one part, not refused — refusing discarded the largest clusters on every file, and a split closer than a single voice's own spread is evidence of one voice. Do NOT gate any group, re-joined or not, on its maximum pairwise distance: it grows with the span count, and a real speaker the user had already learned scored higher on it than the synthetic blend the gate was built to reject. | [diarization](docs/lessons/diarization-and-speakers.md) |
+
+### Identity, registration and admin
+| # | Rule | Detail |
+|---|---|---|
+| 47 | Identity is a STRING resolved per request and threaded down: session → DB token → static key (`user_<sha256(key)[:16]>`, **never** `default`) → 401. Every DB accessor defaults to `DEFAULT_USER`, so a call site that forgets `user_id=` silently reads another identity's rows instead of failing. `_websocket_user` and `get_current_user` share ONE resolver (`resolve_api_key_user`) so one key has one scope on both transports. | [auth](docs/lessons/identity-registration-admin.md) |
+| 48 | Email sign-up is **throttle-then-flag** (10/600 s per client, rightmost `X-Forwarded-For` hop; then the flag, **404** so a disabled route is indistinguishable from an unmounted one), creates an UNVERIFIED row, and **never signs anybody in**. A mail failure DELETES the row (503). An unverified or disabled account is a **403 with a reason**; a wrong password is a 401. | [auth](docs/lessons/identity-registration-admin.md) |
+| 49 | A Google sign-up's `user_id` IS the normalised email address, resolved by **subject, never by address**. `email_taken` deliberately does NOT consult `google_identities`, so a username signup for an address a Google vault uses is allowed and safe. `/api/auth/google/start` is gated on **configuration, not the registration flag** — turning registration off must not sign out existing users. The `oauth_state` lives in the server-side session and is blanked **before** it is compared (consumed either way). | [auth](docs/lessons/identity-registration-admin.md) |
+| 50 | Authorization is a DEPLOYMENT CONSTANT, not a role column: `TRANSCRIBE_ADMIN_USER` (default empty ⇒ **nobody**) is a plain equality. An admin delete **keeps** data and reports counts unless `?purge=true` is passed explicitly — one boolean argument must not be able to destroy another user's recordings. `/shutdown` is gated on `require_admin` because stopping the process cancels other users' jobs. | [auth](docs/lessons/identity-registration-admin.md) |
+| 51 | An absolute URL must carry the URL prefix EXACTLY once, however the base was spelled. `TRANSCRIBE_EXTERNAL_URL` is set either way in practice (`https://host` or `https://host/asr-mcp`), so `_public_base` appends the prefix only when the base does not already end with it **on a path-segment boundary**. Unconditional appending built `/asr-mcp/asr-mcp/...`, and the symptom was a 404 on the confirmation link — indistinguishable, to the user, from a token being refused. The confirmation link and the Google redirect URI must be built by the SAME helper. | [auth](docs/lessons/identity-registration-admin.md) |
+
+### GPU sharing
+| # | Rule | Detail |
+|---|---|---|
+| 44 | `is_gpu_oom` must recognise every wording a runtime uses, INCLUDING a load-time failure — cuBLAS fails at `cublasCreate()` with `CUBLAS_STATUS_ALLOC_FAILED`, which mentions no allocation of ours, and an unbuilt session kills every embedding endpoint | [gpu](docs/lessons/gpu-and-onnx-runtime.md) |
 
 ### ASR decoding internals (Cohere ONNX)
 | # | Rule | Detail |
@@ -450,6 +789,10 @@ anything the rule covers.
 - [docs/plans/boundary-and-voice-quality-plan.md](docs/plans/boundary-and-voice-quality-plan.md)
   — the P0–P4 boundary/learning plan, its findings, the **measured** A/B behind
   lesson 40, and the honest list of what is still uncalibrated.
+- [docs/lessons/identity-registration-admin.md](docs/lessons/identity-registration-admin.md)
+  — the auth/registration port: what the per-user separation actually fixed,
+  the credential store, email sign-up, Google sign-in and the admin, with the
+  port-parity decisions and the call-site traps each phase surfaced.
 
 ## Historical notes (no longer true — kept so they are not re-introduced)
 

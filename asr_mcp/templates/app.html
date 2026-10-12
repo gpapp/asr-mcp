@@ -51,13 +51,18 @@
         }
         .brand { font-weight: 800; letter-spacing: .04em; font-size: 1.02rem; display: flex; align-items: center; gap: .55rem; white-space: nowrap; }
         .brand-mark { width: 13px; height: 13px; border-radius: 4px; background: var(--grad); box-shadow: 0 0 12px rgba(124,92,255,.85); }
+        /* The tab pill. ONE primitive for both tab strips: the header nav
+           (anchors) and the in-pane sub-tabs (buttons) are the same control,
+           so they must not become two declarations that drift apart. */
         .tabs { display: flex; gap: .3rem; flex: 1; flex-wrap: wrap; }
-        .tabs a {
+        .pill-tab {
             color: #aab4d4; text-decoration: none; font-size: .87rem; font-weight: 600;
-            padding: .42rem .95rem; border-radius: 999px; transition: background .16s, color .16s;
+            padding: .42rem .95rem; border-radius: 999px; border: 0; background: none;
+            font-family: inherit; cursor: pointer;
+            transition: background .16s, color .16s;
         }
-        .tabs a:hover { color: #fff; background: rgba(255,255,255,.09); }
-        .tabs a.active { color: #171a2e; background: #fff; box-shadow: 0 6px 16px -8px rgba(0,0,0,.6); }
+        .pill-tab:hover { color: #fff; background: rgba(255,255,255,.09); }
+        .pill-tab.active { color: #171a2e; background: #fff; box-shadow: 0 6px 16px -8px rgba(0,0,0,.6); }
         .hdr-status {
             display: flex; align-items: center; gap: .45rem; font-size: .78rem; color: #c9d1ee;
             background: rgba(255,255,255,.07); padding: .35rem .75rem; border-radius: 999px; white-space: nowrap;
@@ -303,15 +308,17 @@
         .toast.error { background: var(--bad-ink); }
 
         .toolbar { display: flex; gap: .6rem; margin-bottom: 1.3rem; flex-wrap: wrap; }
-        #rescanStatus {
+        /* One status line for any long voiceprint job (rescan, consolidation).
+           .status-row is the primitive; the ids only name the two users of it. */
+        .status-row {
             display: none; margin-bottom: 1rem; background: #fff; border: 1px solid var(--line);
             border-radius: 12px; padding: .8rem 1.1rem; font-size: .85rem; align-items: center; gap: .8rem;
             box-shadow: var(--shadow);
         }
-        #rescanStatus.visible { display: flex; }
-        #rescanStatus .spinner { width: 16px; height: 16px; border: 2px solid #d7ddf0; border-top-color: var(--brand); flex-shrink: 0; }
-        #rescanStatus .status-stage { font-weight: 700; color: var(--ink); }
-        #rescanStatus .status-count { color: var(--muted); margin-left: auto; white-space: nowrap; }
+        .status-row.visible { display: flex; }
+        .status-row .spinner { width: 16px; height: 16px; border: 2px solid #d7ddf0; border-top-color: var(--brand); flex-shrink: 0; }
+        .status-row .status-stage { font-weight: 700; color: var(--ink); }
+        .status-row .status-count { color: var(--muted); margin-left: auto; white-space: nowrap; }
 
         .card-header {
             padding: .85rem 1.2rem; display: flex; justify-content: space-between; align-items: center;
@@ -438,7 +445,7 @@
                 margin: 0 -.6rem; padding: 0 .6rem .15rem;
             }
             .tabs::-webkit-scrollbar { display: none; }
-            .tabs a { flex-shrink: 0; padding: .55rem .85rem; font-size: .84rem; }
+            .pill-tab { flex-shrink: 0; padding: .55rem .85rem; font-size: .84rem; }
 
             .pane-inner { padding: .9rem .7rem 3rem; }
             .card { border-radius: 12px; margin-bottom: 1rem; }
@@ -521,15 +528,15 @@
                             <input type="file" id="audioFile" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus" multiple onchange="fileSelected(this)">
                             <div class="formats">WAV, MP3, MP4, MKV, FLAC, OGG, M4A, WebM, OPUS</div>
                         </div>
-                        <div id="fileName" hidden></div>
+                        <div id="fileName" class="hidden"></div>
 
-                        <div id="progressArea" class="progress-area" hidden>
+                        <div id="progressArea" class="progress-area hidden">
                             <div class="prog-block">
                                 <div class="prog-label">Diarization</div>
                                 <div class="pbar"><div id="diarProgressBar">0%</div></div>
                                 <div id="diarProgressStage" class="prog-stage">Preparing...</div>
                             </div>
-                            <div id="transcriptionArea" hidden>
+                            <div id="transcriptionArea" class="hidden">
                                 <div class="prog-label">Transcription</div>
                                 <div class="tt-area" id="transcriptionBarArea">
                                     <div id="transcriptionSegments"></div>
@@ -537,19 +544,28 @@
                                         <div id="transcriptionOverlayFill" class="tt-overlay-fill"></div>
                                     </div>
                                     <div id="transcriptionCaretLayer" class="tt-caret-layer">
-                                        <div id="transcriptionPointer" class="tt-pointer" hidden></div>
-                                        <div id="transcriptionJumpCaret" class="tt-pointer" hidden></div>
+                                        <div id="transcriptionPointer" class="tt-pointer hidden"></div>
+                                        <div id="transcriptionJumpCaret" class="tt-pointer hidden"></div>
                                     </div>
                                 </div>
                                 <div id="transcriptionPointerLabel" class="tt-pointer-label"></div>
-                                <div id="transcriptionLegend" hidden></div>
-                                <div id="transcriptionTextPane" class="text-pane pane-short tt-text-pane" hidden></div>
+                                <div id="transcriptionLegend" class="hidden"></div>
+                                <div id="transcriptionTextPane" class="text-pane pane-short tt-text-pane hidden"></div>
                                 <div id="transcriptionStage" class="prog-stage">Waiting for diarization...</div>
                             </div>
                             <div class="prog-actions">
-                                <button id="cancelJobBtn" type="button" class="btn-cancel" onclick="cancelActiveJob()" hidden>Cancel</button>
+                                <button id="cancelJobBtn" type="button" class="btn-cancel hidden" onclick="cancelActiveJob()">Cancel</button>
                             </div>
                         </div>
+
+                        <!--
+                            Outside #progressArea on purpose: the progress block
+                            collapses itself a few seconds after the job ends,
+                            and this note is the part the user is meant to read
+                            afterwards. A summary that disappears with the
+                            progress bar is not a summary.
+                        -->
+                        <div id="learningNote" class="note hidden"></div>
 
                         <div class="options">
                             <label>Output:
@@ -569,7 +585,7 @@
                             <button class="btn btn-primary" id="processBtn" onclick="processAudio()" disabled>Process Audio</button>
                         </div>
 
-                        <div class="results-area" id="resultsArea" hidden>
+                        <div class="results-area hidden" id="resultsArea">
                             <h3>Results</h3>
                             <div id="timelineContainer"></div>
                             <div id="resultsContent"></div>
@@ -651,17 +667,38 @@
                     <button class="btn btn-success" onclick="rescanVoices()">Rescan Voices Directory</button>
                     <button class="btn btn-primary" onclick="refresh()">Refresh</button>
                     <button class="btn btn-ghost" onclick="openMergeDialog()">Merge Speakers</button>
+                    <button class="btn btn-ghost" onclick="consolidateLibrary()">Consolidate All</button>
                 </div>
 
-                <div id="rescanStatus">
+                <div id="rescanStatus" class="status-row">
                     <div class="spinner"></div>
                     <span class="status-stage">Scanning...</span>
                     <span class="status-count"></span>
                 </div>
 
-                <div id="pending-list" hidden></div>
+                <div id="consolidateStatus" class="status-row">
+                    <div class="spinner"></div>
+                    <span class="status-stage">Consolidating...</span>
+                    <span class="status-count"></span>
+                </div>
+
+                <!-- Two populations that must not be confused: a NAMED profile
+                     matches and names people, an UNNAMED one is a voice the
+                     learner heard but cannot attach to anyone yet. They used to
+                     share one list, with the unnamed ones parked in a card above
+                     the known speakers. -->
+                <nav class="tabs" id="vpSubtabs">
+                    <button type="button" class="pill-tab active" id="vpSubtab-known"
+                            onclick="showVoiceprintSubtab('known')">Known speakers</button>
+                    <button type="button" class="pill-tab" id="vpSubtab-unnamed"
+                            onclick="showVoiceprintSubtab('unnamed')">Unnamed</button>
+                </nav>
+
+                <div id="flagged-list" class="hidden"></div>
 
                 <div id="speakers-list"></div>
+
+                <div id="pending-list" class="hidden"></div>
             </div>
         </section>
 
@@ -674,7 +711,7 @@
                             <span id="countBadge"></span>
                         </div>
                         <div class="list-scroll" id="listContainer"></div>
-                        <div id="emptyState" class="empty" hidden>
+                        <div id="emptyState" class="empty hidden">
                             <div class="icon">&#128196;</div>
                             <p>No transcriptions yet.</p>
                             <p class="note">Process audio files to see them here.</p>
@@ -684,7 +721,7 @@
                     <div class="detail-pane">
                         <div class="detail-head">
                             <span class="title" id="detailTitle">Transcription</span>
-                            <div class="actions" id="detailActions" hidden>
+                            <div class="actions hidden" id="detailActions">
                                 <button class="btn btn-success btn-sm" onclick="downloadTranscription(currentId)">Download</button>
                                 <button class="btn btn-danger btn-sm" onclick="deleteTranscription(currentId)">Delete</button>
                             </div>
@@ -725,8 +762,8 @@
                         </p>
                         <div class="row">
                             <button class="btn btn-primary" id="genTokenBtn" onclick="generateClientToken()">Generate token</button>
-                            <code id="tokenValue" class="code-block" hidden></code>
-                            <button class="btn btn-ghost btn-sm" id="copyTokenBtn" hidden onclick="copyClientToken()">Copy</button>
+                            <code id="tokenValue" class="code-block hidden"></code>
+                            <button class="btn btn-ghost btn-sm hidden" id="copyTokenBtn" onclick="copyClientToken()">Copy</button>
                         </div>
                     </div>
                 </div>
@@ -737,6 +774,24 @@
                         <div class="row-spread">
                             <div class="prose" id="sessionInfo">Loading...</div>
                             <button class="btn btn-ghost btn-sm" onclick="logout()">Log out</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card hidden" id="adminCard">
+                    <div class="card-title">Accounts</div>
+                    <div class="card-body">
+                        <p class="prose mb-09">
+                            Administrator only. Removing an account keeps its speakers, snippets and History so a deletion can be undone by recreating the account; tick <strong>also delete recordings</strong> to drop those rows and unlink the audio as well.
+                        </p>
+                        <div class="row-spread">
+                            <div class="prose" id="adminSummary">Loading...</div>
+                            <button class="btn btn-ghost btn-sm" onclick="loadAdminUsers()">Refresh</button>
+                        </div>
+                        <div class="mt-1" id="adminUsers"></div>
+                        <div class="row mt-1">
+                            <button class="btn btn-ghost btn-sm" id="shutdownBtn" onclick="shutdownServer()">Shut down server</button>
+                            <span class="note" id="adminNote"></span>
                         </div>
                     </div>
                 </div>
@@ -779,6 +834,11 @@
         let stageTicker = null;
         let jobUiActive = false;
         let activeSseState = null;
+        // Pending "collapse the progress panel" timer. Held in one place so a
+        // job that starts (enterJobUi) can cancel a collapse scheduled by the
+        // previous job — otherwise the old timer hides the progress area and
+        // the Cancel button of a LIVE run a few seconds in.
+        let progressHideTimer = null;
 
         function escHtml(s) {
             const d = document.createElement('div');
@@ -786,8 +846,29 @@
             return d.innerHTML;
         }
 
+        // A JS string literal that is safe INSIDE an onclick="..." attribute.
+        // escHtml() is not enough: it escapes & < > but leaves ' and " alone,
+        // and the browser HTML-decodes the attribute before the JS is parsed,
+        // so escHtml("O'Brien") in onclick="f('O'Brien')" is a SyntaxError and
+        // the button silently does nothing. A speaker name is free text -- a
+        // learned profile takes its name from a source filename, so an
+        // apostrophe arrives without anybody typing it.
+        function jsStr(s) {
+            return JSON.stringify(String(s)).replace(/"/g, '&quot;');
+        }
+
         function basename(path) {
             return path.split(/[/\\]/).pop();
+        }
+
+        // Name order, for every list of speakers. Numeric so "Speaker 2" sorts
+        // before "Speaker 10" instead of after it, and case/space insensitive
+        // so "ada Lovelace" lands next to "Ada Lovelace". The profile names
+        // come from filenames, so both variants are real.
+        function byName(a, b) {
+            const x = typeof a === 'string' ? a : a.name;
+            const y = typeof b === 'string' ? b : b.name;
+            return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
         }
 
         function toast(msg, isError) {
@@ -809,6 +890,82 @@
             const el = typeof elOrId === 'string' ? document.getElementById(elOrId) : elOrId;
             if (el) el.classList.toggle('hidden', !on);
             return el;
+        }
+
+        /**
+         * One line per fact that the user could otherwise only get from the
+         * server log: what was learned, what was stored, and — the part that
+         * used to be invisible — which known speaker was NOT collected for,
+         * and why.
+         *
+         * Reads the `learning` block of the `diarization_complete` event (see
+         * `_learning_summary` in asr_router.py). It is purely additive: a
+         * server that does not send it leaves the note hidden, and a run where
+         * everything was collected says so in as many words.
+         */
+        function renderLearningNote(info) {
+            const el = document.getElementById('learningNote');
+            if (!el) return;
+            if (!info) { show(el, false); el.innerHTML = ''; return; }
+            const lines = [];
+            const profiles = info.profiles || [];
+            if (profiles.length) {
+                const created = profiles.filter(p => !p.existing);
+                const extended = profiles.filter(p => p.existing);
+                if (created.length) {
+                    lines.push('<strong>' + created.length + ' new speaker' +
+                        (created.length > 1 ? 's' : '') + '</strong> learned and waiting for a name in the Voiceprints tab — until you name ' +
+                        (created.length > 1 ? 'them' : 'it') + ', their speech reads as ' + UNKNOWN_SPEAKER + '.');
+                }
+                if (extended.length) {
+                    lines.push(extended.length + ' pending speaker' +
+                        (extended.length > 1 ? 's were' : ' was') + ' given more audio.');
+                }
+            }
+            if (info.snippets_added) {
+                lines.push(info.snippets_added + ' snippet' +
+                    (info.snippets_added > 1 ? 's' : '') + ' added to known speaker profiles.');
+            }
+            (info.not_collected || []).forEach(n => {
+                lines.push('<strong>' + escHtml(n.speaker) + '</strong>: ' +
+                    escHtml(learningReasonText(n.reason)) + '.');
+            });
+            (info.not_learned || []).forEach(n => {
+                lines.push('Cluster ' + escHtml(n.cluster) + ' not learned (' +
+                    escHtml(String(n.reason || 'no reason recorded').replace(/_/g, ' ')) + ').');
+            });
+            const refused = info.refused_total || 0;
+            if (refused) {
+                const parts = Object.keys(info.refused_reasons || {}).map(k => {
+                    const c = info.refused_reasons[k];
+                    return c + ' ' + learningReasonText(k) + (c > 1 ? 's' : '');
+                });
+                lines.push(refused + ' span' + (refused > 1 ? 's' : '') +
+                    ' were not stored (' + (parts.length ? parts.join(', ') : 'no reason recorded') +
+                    '). The words are still in the transcript.');
+            }
+            if (!lines.length) { show(el, false); el.innerHTML = ''; return; }
+            el.innerHTML = lines.map(l => '<div>' + l + '</div>').join('');
+            show(el, true);
+        }
+
+        /** Turn a stable reason string into something a person can act on. */
+        function learningReasonText(reason) {
+            const map = {
+                no_identity: 'no speaker at all',
+                unknown_label: 'no speaker at all',
+                overlap_label: 'overlapping speech',
+                generic_label: 'an unnamed cluster',
+                explicitly_uncertain: 'label distrusted by the pipeline',
+                low_confidence: 'weak voiceprint match',
+                low_margin: 'two speakers matched almost equally well',
+                too_short: 'too little audio to judge',
+                at_snippet_cap: 'already at the snippet cap',
+                too_few_spans: 'not enough separate spans',
+                generic: 'an unnamed cluster',
+                not_registered: 'no profile for this name'
+            };
+            return map[reason] || String(reason || 'unknown').replace(/_/g, ' ');
         }
 
         function formatDuration(sec) {
@@ -858,7 +1015,7 @@
             });
             if (name === 'voiceprints') refresh();
             if (name === 'history') loadTranscripts();
-            if (name === 'settings') checkStatus();
+            if (name === 'settings') { checkStatus(); loadAdminUsers(); }
             // AudioWorklet needs a secure context (https or localhost) and the
             // page may never have asked for a mic, so this must happen on a
             // user gesture -- entering the tab is one, getUserMedia is not
@@ -927,6 +1084,114 @@
 
         function logout() {
             window.location.href = P + '/api/auth/logout';
+        }
+
+        // --- Administrator: the account table ---
+
+        async function adminFetch(path, opts) {
+            const r = await fetch(P + '/api' + path,
+                                  Object.assign({ credentials: 'same-origin' }, opts || {}));
+            if (!r.ok) {
+                let detail = 'HTTP ' + r.status;
+                try { detail = (await r.json()).detail || detail; } catch (e) { /* not JSON */ }
+                throw new Error(detail);
+            }
+            return r.json();
+        }
+
+        async function loadAdminUsers() {
+            const host = document.getElementById('adminUsers');
+            const summary = document.getElementById('adminSummary');
+            let d;
+            try {
+                d = await adminFetch('/admin/users');
+            } catch (e) {
+                // 403 (or an unreachable server) means this account is not the
+                // administrator. The card simply does not exist for them: a
+                // visible, disabled one invites a hunt for a way in.
+                show('adminCard', false);
+                return;
+            }
+            show('adminCard', true);
+            const counts = d.users.reduce((acc, u) => {
+                acc.vp += u.data.voiceprints;
+                acc.sn += u.data.snippets;
+                acc.tr += u.data.transcripts;
+                return acc;
+            }, { vp: 0, sn: 0, tr: 0 });
+            summary.textContent = d.users.length + ' accounts · ' + counts.vp +
+                ' speakers · ' + counts.sn + ' snippets · ' + counts.tr +
+                ' transcripts' + (d.registration.enabled ? ' · signup open' : '');
+            host.innerHTML = d.users.map(adminUserHtml).join('');
+        }
+
+        function adminUserHtml(u) {
+            const badges = u.sources.map(s => '<span class="badge badge-gray">' + escHtml(s) + '</span>').join(' ');
+            const flags = [];
+            if (u.is_admin) flags.push('<span class="pill ok">administrator</span>');
+            if (u.disabled) flags.push('<span class="pill bad">disabled</span>');
+            else if (!u.verified && u.sources.includes('password')) flags.push('<span class="pill bad">unconfirmed</span>');
+            const data = u.data;
+            let sub = escHtml(u.user_id);
+            if (u.email) sub += ' · ' + escHtml(u.email);
+            if (u.created_at) sub += ' · joined ' + escHtml(formatDate(u.created_at));
+            let counts = data.voiceprints + ' speakers · ' + data.snippets + ' snippets · ' +
+                data.transcripts + ' transcripts';
+            if (data.api_tokens) counts += ' · token issued';
+            const actions = [];
+            if (u.can_manage) {
+                actions.push('<button class="btn btn-ghost btn-sm" onclick="adminSetDisabled(' +
+                    jsStr(u.user_id) + ', ' + (u.disabled ? 'false' : 'true') + ')">' +
+                    (u.disabled ? 'Enable' : 'Disable') + '</button>');
+            }
+            if (u.can_delete) {
+                actions.push('<label class="note"><input type="checkbox" id="ap-' +
+                    escHtml(u.user_id) + '"> also delete recordings</label>');
+                actions.push('<button class="btn btn-danger btn-sm" onclick="adminDeleteUser(' +
+                    jsStr(u.user_id) + ')">Delete</button>');
+            }
+            if (u.manage_note) counts += ' · ' + escHtml(u.manage_note);
+            return '<div class="status-item"><div class="label">' + sub + '</div>' +
+                '<div class="value">' + (flags.length ? flags.join(' ') : badges) + '</div>' +
+                '<div class="sub">' + counts + '</div>' +
+                (actions.length ? '<div class="row mt-1">' + actions.join('') + '</div>' : '') +
+                '</div>';
+        }
+
+        async function adminSetDisabled(userId, disabled) {
+            try {
+                await adminFetch('/admin/users/' + encodeURIComponent(userId) +
+                    (disabled ? '/disable' : '/enable'), { method: 'POST' });
+                loadAdminUsers();
+            } catch (e) {
+                toast(e.message, true);
+            }
+        }
+
+        async function adminDeleteUser(userId) {
+            const box = document.getElementById('ap-' + userId);
+            const purge = !!(box && box.checked);
+            const what = purge ? ' Its speakers, snippets, History and recordings are deleted too.' : '';
+            if (!confirm('Delete the account ' + userId + '?' + what)) return;
+            try {
+                await adminFetch('/admin/users/' + encodeURIComponent(userId) +
+                    '?purge=' + (purge ? 'true' : 'false'), { method: 'DELETE' });
+                toast('Deleted ' + userId);
+                loadAdminUsers();
+            } catch (e) {
+                toast(e.message, true);
+            }
+        }
+
+        async function shutdownServer() {
+            if (!confirm('Shut the server down? Jobs in flight are cancelled.')) return;
+            try {
+                const r = await fetch(P + '/shutdown', { method: 'POST', credentials: 'same-origin' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                document.getElementById('adminNote').textContent = 'Shutting down...';
+            } catch (e) {
+                toast(e.message, true);
+            }
         }
 
         function setMiniBar(id, pct) {
@@ -1169,6 +1434,7 @@
 
         function enterJobUi(label) {
             jobUiActive = true;
+            cancelProgressHide();
             show('uploadArea', false);
             show(document.querySelector('#tab-transcribe .options'), false);
             const fn = document.getElementById('fileName');
@@ -1179,6 +1445,10 @@
             btn.innerHTML = '<span class="spinner"></span>Processing...';
             const resultsArea = document.getElementById('resultsArea');
             show(resultsArea, false);
+            // The previous run's learning summary is about a different file.
+            // Leaving it up would attribute this run's speakers to the last one.
+            show('learningNote', false);
+            document.getElementById('learningNote').innerHTML = '';
             document.getElementById('timelineContainer').innerHTML = '';
             const progressArea = document.getElementById('progressArea');
             show(progressArea, true);
@@ -1205,6 +1475,29 @@
             document.getElementById('transcriptionOverlayFill').style.left = '0%';
         }
 
+        function cancelProgressHide() {
+            if (progressHideTimer !== null) {
+                clearTimeout(progressHideTimer);
+                progressHideTimer = null;
+            }
+        }
+
+        /**
+         * Collapse the progress panel shortly after a job ends.
+         *
+         * The delay exists so the finished progress bar and the transcript
+         * pane stay readable for a moment. Every job-end path funnels through
+         * exitJobUi(), which owns this, so the timer is always cancelled by the
+         * next enterJobUi() and can never hide a running job's UI.
+         */
+        function scheduleProgressHide() {
+            cancelProgressHide();
+            progressHideTimer = setTimeout(() => {
+                progressHideTimer = null;
+                show('progressArea', false);
+            }, 5000);
+        }
+
         function exitJobUi() {
             jobUiActive = false;
             activeSseState = null;
@@ -1212,6 +1505,7 @@
             stopStageTicker();
             show('uploadArea', true);
             show(document.querySelector('#tab-transcribe .options'), true);
+            scheduleProgressHide();
             const btn = document.getElementById('processBtn');
             const files = document.getElementById('audioFile').files;
             btn.innerHTML = 'Process Audio';
@@ -1318,6 +1612,11 @@
                 st.diarProgressBar.style.width = '100%';
                 st.diarProgressBar.textContent = '100%';
                 st.diarProgressStage.textContent = 'Complete!';
+                // A diarization-only run has no `diarization_complete` event, so
+                // the learning note is rendered from the final result instead.
+                // Without it a profile learned by a diarize-only run stays
+                // invisible until the user goes looking for it.
+                if (data.result.learning) renderLearningNote(data.result.learning);
                 const nUncertainDiar = data.result.uncertain_segments ||
                     ((data.result.segments || []).filter(s => s && s.uncertain).length);
                 if (nUncertainDiar) {
@@ -1352,6 +1651,7 @@
                     const segments = data.segments || [];
                     st.audioDur = data.audio_duration_sec || 0;
                     st.allSpeakers = [...new Set(segments.map(speakerKey))].sort();
+                    renderLearningNote(data.learning);
 
                     if (st.audioDur > 0 && segments.length) {
                         show(st.transcriptionArea, true);
@@ -1555,8 +1855,16 @@
             show('resultsArea', true);
         }
 
+        // The modes the transcribe pane's job UI can actually render. The
+        // /activity/stream reader is GLOBAL, so a job started in the Voiceprints
+        // tab arrives here too -- and attaching to one switched the user out of
+        // the pane they started it in and into a progress UI that has nothing to
+        // show for it ("Consolidate All" jumped to the Transcribe tab).
+        const TRANSCRIPTION_MODES = ['transcribe', 'diarize'];
+
         async function attachActiveJob(job) {
             const mode = (job && job.mode) || 'transcribe';
+            if (!TRANSCRIPTION_MODES.includes(mode)) return;
             const fname = (job && job.filename) || 'audio';
             if (!document.getElementById('tab-transcribe').classList.contains('active')) {
                 history.pushState(null, '', P + '/gui');
@@ -1568,37 +1876,38 @@
             }
             const st = newSseState(mode);
             try {
-                const r = await fetch(P + '/api/asr/active/stream', { credentials: 'same-origin' });
-                if (!r.ok) throw new Error('Active job ended before attach');
-                await readSseBody(r.body, st);
-            } catch (e) {
-                toast('Failed to attach to running job: ' + e.message, true);
-                exitJobUi();
-                return;
-            }
-            if (st.cancelled) {
-                exitJobUi();
-                return;
-            }
-            if (st.noResult) {
-                exitJobUi();
+                // Every exit below runs the teardown: the job UI must come back
+                // whatever happens, including a stream that dies mid-run. A tab
+                // stuck on "Processing..." with no options and no Cancel button
+                // is the failure this finally exists to prevent.
+                try {
+                    const r = await fetch(P + '/api/asr/active/stream', { credentials: 'same-origin' });
+                    if (!r.ok) throw new Error('Active job ended before attach');
+                    await readSseBody(r.body, st);
+                } catch (e) {
+                    toast('Failed to attach to running job: ' + e.message, true);
+                    return;
+                }
+                if (st.cancelled) {
+                    return;
+                }
+                if (st.noResult) {
+                    toast('Processing complete');
+                    return;
+                }
+                if (!st.finalData) {
+                    toast('Lost connection to running job', true);
+                    return;
+                }
+                const allResults = [];
+                st.finalData._fileName = fname;
+                allResults.push({ file: fname, result: st.finalData });
+                renderResultToTimeline(st.finalData, document.getElementById('timelineContainer'));
+                showDownloadLink(allResults);
                 toast('Processing complete');
-                setTimeout(() => { show('progressArea', false); }, 5000);
-                return;
-            }
-            if (!st.finalData) {
-                toast('Lost connection to running job', true);
+            } finally {
                 exitJobUi();
-                return;
             }
-            const allResults = [];
-            st.finalData._fileName = fname;
-            allResults.push({ file: fname, result: st.finalData });
-            renderResultToTimeline(st.finalData, document.getElementById('timelineContainer'));
-            showDownloadLink(allResults);
-            exitJobUi();
-            toast('Processing complete');
-            setTimeout(() => { show('progressArea', false); }, 5000);
         }
 
         async function processAudio() {
@@ -1614,61 +1923,70 @@
             const total = fileInput.files.length;
             enterJobUi(total === 1 ? fileInput.files[0].name : total + ' files');
 
-            for (let i = 0; i < total; i++) {
-                const file = fileInput.files[i];
-                btn.innerHTML = '<span class="spinner"></span>Processing ' + (i + 1) + '/' + total + '...';
-                enterJobUi('Processing ' + (i + 1) + '/' + total + ': ' + file.name);
+            try {
+                for (let i = 0; i < total; i++) {
+                    const file = fileInput.files[i];
+                    btn.innerHTML = '<span class="spinner"></span>Processing ' + (i + 1) + '/' + total + '...';
+                    // enterJobUi() also cancels any pending progress-panel
+                    // collapse from the previous file, so file N+1's progress
+                    // area cannot be hidden by file N's timer.
+                    enterJobUi('Processing ' + (i + 1) + '/' + total + ': ' + file.name);
 
-                const form = new FormData();
-                form.append('file', file);
-                if (numSpeakers) form.append('num_speakers', numSpeakers);
+                    const form = new FormData();
+                    form.append('file', file);
+                    if (numSpeakers) form.append('num_speakers', numSpeakers);
 
-                try {
-                    const endpoint = mode === 'transcribe'
-                        ? P + '/api/asr/transcribe/upload?language=' + encodeURIComponent(document.getElementById('langSel').value || 'auto')
-                        : P + '/api/asr/diarize/upload';
-                    const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
+                    try {
+                        const endpoint = mode === 'transcribe'
+                            ? P + '/api/asr/transcribe/upload?language=' + encodeURIComponent(document.getElementById('langSel').value || 'auto')
+                            : P + '/api/asr/diarize/upload';
+                        const r = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', body: form });
 
-                    if (r.status === 409) {
-                        let info = {};
-                        try { info = await r.json(); } catch (e) { }
-                        if (info.job) {
-                            toast('Already processing — attaching to running job');
-                            await attachActiveJob(info.job);
-                        } else {
-                            toast(info.detail || 'Another transcription is already in progress', true);
+                        if (r.status === 409) {
+                            let info = {};
+                            try { info = await r.json(); } catch (e) { }
+                            if (info.job) {
+                                toast('Already processing — attaching to running job');
+                                await attachActiveJob(info.job);
+                            } else {
+                                toast(info.detail || 'Another transcription is already in progress', true);
+                            }
+                            return;
                         }
-                        return;
-                    }
 
-                    if (!r.ok) {
-                        const errText = await r.text();
-                        throw new Error(errText);
-                    }
+                        if (!r.ok) {
+                            const errText = await r.text();
+                            throw new Error(errText);
+                        }
 
-                    const st = newSseState(mode);
-                    await readSseBody(r.body, st);
+                        const st = newSseState(mode);
+                        await readSseBody(r.body, st);
 
-                    if (st.cancelled) {
-                        allResults.push({ file: file.name, error: 'Cancelled' });
-                        break;
-                    }
+                        if (st.cancelled) {
+                            allResults.push({ file: file.name, error: 'Cancelled' });
+                            break;
+                        }
 
-                    if (st.finalData) {
-                        st.finalData._fileName = file.name;
-                        allResults.push({ file: file.name, result: st.finalData });
-                        renderResultToTimeline(st.finalData, timelineContainer);
+                        if (st.finalData) {
+                            st.finalData._fileName = file.name;
+                            allResults.push({ file: file.name, result: st.finalData });
+                            renderResultToTimeline(st.finalData, timelineContainer);
+                        }
+                    } catch (e) {
+                        allResults.push({ file: file.name, error: e.message });
+                        toast('Error processing ' + file.name + ': ' + e.message, true);
                     }
-                } catch (e) {
-                    allResults.push({ file: file.name, error: e.message });
-                    toast('Error processing ' + file.name + ': ' + e.message, true);
                 }
-            }
 
-            showDownloadLink(allResults);
-            toast('Processing complete');
-            exitJobUi();
-            setTimeout(() => { show('progressArea', false); }, 5000);
+                showDownloadLink(allResults);
+                toast('Processing complete');
+            } finally {
+                // The job UI is torn down here, not on the happy path: a 409
+                // without a job payload, an unexpected throw, or an early
+                // return must not leave the options row and the Cancel button
+                // hidden with no way back.
+                exitJobUi();
+            }
         }
 
         async function cancelActiveJob() {
@@ -1719,8 +2037,25 @@
                                     if (!line.startsWith('data:')) continue;
                                     let d;
                                     try { d = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+                                    // The server is authoritative about whether a
+                                    // job is running. It pushes a start event
+                                    // (attach and follow it) and a finish event
+                                    // (release the job UI), so visibility is
+                                    // never left to a timer or to the local
+                                    // stream having survived the whole run.
                                     if (d.active && d.job && !jobUiActive) {
                                         attachActiveJob(d.job).catch(() => {});
+                                    } else if (!d.active && !d.job) {
+                                        // Initial snapshot of an idle server: nothing to do.
+                                    } else if (!d.active && d.job) {
+                                        // A job finished. If we were following
+                                        // it, the /active/stream reader also ends
+                                        // and its finally tears the UI down;
+                                        // doing it here as well makes a dropped
+                                        // or hung progress stream recoverable
+                                        // instead of leaving the tab stuck on
+                                        // "Processing..." with no options row.
+                                        if (jobUiActive) exitJobUi();
                                     }
                                 }
                             }
@@ -1734,13 +2069,101 @@
 
         // --- Voiceprints tab ---
 
+        // Two sub-tabs, because the two populations answer different questions.
+        // A KNOWN speaker is a profile that names people; an UNNAMED one is a
+        // voice the learner heard and could not attach to anyone, so it is
+        // excluded from every match and its audio is the ONLY evidence of who
+        // it is. Putting them in one list made the named list unreadable and
+        // the unnamed ones look like speakers you had already reviewed.
+        let vpSubtab = 'known';
+
+        function showVoiceprintSubtab(which) {
+            vpSubtab = (which === 'unnamed') ? 'unnamed' : 'known';
+            show('vpSubtab-known', true);
+            show('vpSubtab-unnamed', true);
+            document.getElementById('vpSubtab-known').classList.toggle('active', vpSubtab === 'known');
+            document.getElementById('vpSubtab-unnamed').classList.toggle('active', vpSubtab === 'unnamed');
+            show('speakers-list', vpSubtab === 'known');
+            show('pending-list', vpSubtab === 'unnamed');
+            // Deliberately does NOT re-render: both lists are rendered by
+            // refresh(), and re-rendering on every switch is what collapsed an
+            // open fold when the user came back to the tab.
+        }
+
+        function showKnownList() {
+            const el = document.getElementById('speakers-list');
+            if (!speakersData.length) {
+                el.innerHTML = '<div class="card"><div class="empty">No speakers found. Drop audio files into the voices directory and click Rescan, or run a diarization to auto-collect snippets.</div></div>';
+                return;
+            }
+            el.innerHTML = speakersData.map(s => `
+                <div class="card" id="speaker-${escHtml(s.name)}">
+                    <div class="card-header" onclick="toggleSpeaker(${jsStr(s.name)})">
+                        <h3>
+                            ${escHtml(s.name)}
+                            ${s.has_voiceprint ? '<span class="badge badge-green">voiceprint</span>' : '<span class="badge badge-gray">no voiceprint</span>'}
+                            ${flaggedData.filter(f => f.speaker_name === s.name).length
+                                ? `<span class="badge badge-red">${flaggedData.filter(f => f.speaker_name === s.name).length} flagged</span>` : ''}
+                        </h3>
+                        <div class="meta">
+                            <span>${s.snippet_count} snippets</span>
+                            <span>${formatDuration(s.total_duration_sec)}</span>
+                            ${s.pitch_hz ? '<span>' + s.pitch_hz.toFixed(0) + ' Hz</span>' : ''}
+                        </div>
+                    </div>
+                    <div class="card-body-fold" id="body-${escHtml(s.name)}">
+                        <div class="empty">Loading snippets...</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
         async function refresh() {
+            const open = captureOpenFolds();
             const data = await apiFetch('/speakers');
-            // Pending profiles get their own card above; showing them here too
+            // Pending profiles have their own sub-tab; showing them here too
             // would list the same snippets twice.
-            speakersData = (data.speakers || []).filter(s => !s.pending);
-            renderSpeakers();
+            speakersData = (data.speakers || []).filter(s => !s.pending).sort(byName);
+            // Flagged counts are drawn into the speaker headers, so the list has
+            // to be loaded BEFORE the speakers are rendered.
+            await refreshFlagged();
+            showKnownList();
             await refreshPending();
+            showVoiceprintSubtab(vpSubtab);
+            // Re-rendering the lists replaces their innerHTML, which closes
+            // every fold the user had opened. Reviewing means opening a
+            // speaker, removing three snippets and checking the profile again,
+            // so the folds the user had open are restored with their content.
+            await restoreOpenFolds(open);
+        }
+
+        // --- Folds survive a refresh ---
+        //
+        // The fold ids are `body-<name>` (known) and `pbody-<name>` (unnamed),
+        // so the name can be recovered from the id and the same loader serves
+        // both. Note the order of the prefix tests: `pbody-` starts with `p`,
+        // but `body-` is a substring check that would also match it.
+        function captureOpenFolds() {
+            return Array.from(document.querySelectorAll('.card-body-fold.open'))
+                .map(el => el.id).filter(Boolean);
+        }
+
+        function foldName(id) {
+            if (id.startsWith('pbody-')) return [id.slice(6), true];
+            if (id.startsWith('body-')) return [id.slice(5), false];
+            return [null, false];
+        }
+
+        async function restoreOpenFolds(ids) {
+            for (const id of ids) {
+                const el = document.getElementById(id);
+                const [name, unnamed] = foldName(id);
+                if (!el || !name) continue;
+                el.classList.add('open');
+                el.innerHTML = '<div class="empty">Loading snippets...</div>';
+                await loadSnippetBody(id, name);
+                if (!unnamed) el.insertAdjacentHTML('beforeend', knownActionsHtml(name));
+            }
         }
 
         // Pending profiles: speakers the diarizer learned from a recording that
@@ -1778,58 +2201,347 @@
                             <span>match ${(c.confidence * 100).toFixed(0)}%</span>
                             <span>${c.snippet_count} snippets already</span>
                         </div>
-                        <button class="btn btn-warning btn-sm" onclick="mergePending('${escHtml(name)}', '${escHtml(c.name)}')">
+                        <button class="btn btn-warning btn-sm" onclick="mergePending(${jsStr(name)}, ${jsStr(c.name)})">
                             Merge into ${escHtml(c.name)}
                         </button>
                     </div>`).join('');
         }
 
-        async function refreshPending() {
+        // --- Snippet lists ---
+        //
+        // One renderer for both sub-tabs. A named profile and an unnamed one
+        // hold the same thing -- FLAC snippets with the same player, the same
+        // source line and the same remove button -- so a second copy of this
+        // markup would be a second list to keep in step. The unnamed case is
+        // the one that matters most: it is the only evidence of who the voice
+        // is, so it has to be playable and removable here, not a row of
+        // counts the user has to take on trust.
+        function snippetListHtml(name, snippets) {
+            return `<ul class="speaker-list">
+                ${snippets.map(s => `
+                    <li>
+                        <div class="snippet-head">
+                            <button class="btn-play" id="play-${s.id}" onclick="togglePlay(${s.id})" title="Play">&#9654;</button>
+                            <strong>${escHtml(basename(s.file_path))}</strong>
+                            <span class="snippet-dur">${s.duration_sec.toFixed(1)}s</span>
+                            ${s.source_audio ? '<span class="snippet-src">from ' + escHtml(basename(s.source_audio)) + '</span>' : ''}
+                            ${s.review_flag ? '<span class="badge badge-red">flagged</span>' : ''}
+                        </div>
+                        <div class="actions">
+                            <button class="btn btn-danger btn-sm" onclick="deleteSnippet(${s.id}, ${jsStr(name)})">Remove</button>
+                        </div>
+                    </li>
+                `).join('')}
+            </ul>`;
+        }
+
+        async function loadSnippetBody(bodyId, name) {
+            const body = document.getElementById(bodyId);
+            try {
+                const data = await apiFetch('/speakers/' + encodeURIComponent(name) + '/snippets');
+                if (!data.snippets || !data.snippets.length) {
+                    body.innerHTML = '<div class="empty">No snippets</div>';
+                    return;
+                }
+                body.innerHTML = snippetListHtml(name, data.snippets);
+            } catch (e) {
+                body.innerHTML = '<div class="empty">Failed to load snippets</div>';
+            }
+        }
+
+        // The action row belongs to the KNOWN profile only: naming, merging,
+        // refining and deleting a person are all identity decisions, and an
+        // unnamed profile gets the "this is ___" row instead. Extracted because
+        // restoring an open fold needs the same row, and two copies would drift.
+        function knownActionsHtml(name) {
+            return `
+                <div class="form-inline">
+                    <span class="form-label">Add snippet:</span>
+                    <input type="file" id="upload-${escHtml(name)}" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus">
+                    <button class="btn btn-primary btn-sm" onclick="uploadSnippet(${jsStr(name)})">Upload</button>
+                    <button class="btn btn-warning btn-sm" onclick="renamePrompt(${jsStr(name)})">Rename</button>
+                    <button class="btn btn-primary btn-sm" onclick="consolidateSpeaker(${jsStr(name)})">Consolidate</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteSpeaker(${jsStr(name)})">Delete Speaker</button>
+                </div>
+            `;
+        }
+
+        async function toggleSpeaker(name) {
+            const body = document.getElementById('body-' + name);
+            if (body.classList.contains('open')) {
+                body.classList.remove('open');
+                return;
+            }
+            body.classList.add('open');
+            body.innerHTML = '<div class="empty">Loading snippets...</div>';
+            await loadSnippetBody('body-' + name, name);
+            body.insertAdjacentHTML('beforeend', knownActionsHtml(name));
+        }
+
+        // The same fold, for a profile that has no name yet. The header is a
+        // button because "which voice is this?" is answered by listening, not
+        // by reading a count.
+        async function togglePending(name) {
+            const body = document.getElementById('pbody-' + name);
+            if (body.classList.contains('open')) {
+                body.classList.remove('open');
+                return;
+            }
+            body.classList.add('open');
+            body.innerHTML = '<div class="empty">Loading snippets...</div>';
+            await loadSnippetBody('pbody-' + name, name);
+        }
+
+        function showPendingList() {
             const el = document.getElementById('pending-list');
+            if (!pendingData.length) {
+                el.innerHTML = '<div class="card"><div class="empty">No unnamed speakers. A profile appears here when a recording contains a voice that is not one of your named speakers.</div></div>';
+                return;
+            }
+            el.innerHTML = pendingData.map(p => `
+                <div class="card" id="pending-${escHtml(p.name)}">
+                    <div class="card-header" onclick="togglePending(${jsStr(p.name)})">
+                        <h3>
+                            ${escHtml(p.name)}
+                            <span class="badge badge-gray">unnamed</span>
+                            ${flaggedData.filter(f => f.speaker_name === p.name).length
+                                ? `<span class="badge badge-red">${flaggedData.filter(f => f.speaker_name === p.name).length} flagged</span>` : ''}
+                        </h3>
+                        <div class="meta">
+                            <span>${p.snippet_count} snippets</span>
+                            <span>${formatDuration(p.total_duration_sec)}</span>
+                            ${p.created_at ? '<span>learned ' + escHtml(p.created_at.slice(0, 10)) + '</span>' : ''}
+                        </div>
+                    </div>
+                    <div class="card-body-fold" id="pbody-${escHtml(p.name)}"></div>
+                    <div class="card-body">
+                        <p class="note">Listen to the snippets above to work out who this is. This profile is not in the
+                            match set while it is unnamed, so its speech is attributed as <strong>UNKNOWN</strong>.
+                            If it is somebody you already added, merge it &mdash; naming it again would give one
+                            person two profiles and split their speech between them.</p>
+                        ${renderPendingCandidates(p.name)}
+                        <div class="form-inline">
+                            <span class="form-label">This is:</span>
+                            <input type="text" placeholder="Speaker name" id="pending-name-${escHtml(p.name)}" maxlength="255">
+                            <button class="btn btn-primary btn-sm" onclick="confirmPending(${jsStr(p.name)})">Save name</button>
+                            <button class="btn btn-primary btn-sm" onclick="consolidateSpeaker(${jsStr(p.name)})">Consolidate</button>
+                            <button class="btn btn-danger btn-sm" onclick="deleteSpeaker(${jsStr(p.name)})">Discard</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function refreshPending() {
             let pending = [];
             try {
                 // The response field is `speakers` (VoiceprintSpeakerListResponse).
                 const data = await apiFetch('/pending');
-                pending = data.speakers || [];
+                pending = (data.speakers || []).sort(byName);
                 pendingData = pending;
             } catch (e) {
-                el.hidden = true;
+                pendingData = [];
                 return;
             }
-            if (!pending.length) {
-                el.hidden = true;
+            if (pending.length) pendingCandidates = await loadPendingCandidates(pending);
+            else pendingCandidates = {};
+            show('pending-list', vpSubtab === 'unnamed');
+            showPendingList();
+            // The sub-tab label carries the count, so it is written after the
+            // fetch: the tab bar is how you find the unnamed profiles at all.
+            document.getElementById('vpSubtab-unnamed').textContent =
+                pending.length ? `Unnamed (${pending.length})` : 'Unnamed';
+        }
+
+        // --- Consolidation / flagged snippets ---
+        //
+        // A flagged snippet is an ACCUSATION WITH EVIDENCE, not a deletion:
+        // the score is the cosine distance from the profile's centre and the
+        // reason says which rule fired. Nothing is removed until the user
+        // presses Remove, so the default must always be the cheap read.
+
+        let flaggedData = [];
+
+        function renderFlagged() {
+            const el = document.getElementById('flagged-list');
+            if (!flaggedData.length) {
+                show(el, false);
                 el.innerHTML = '';
                 return;
             }
-            pendingCandidates = await loadPendingCandidates(pending);
-            el.hidden = false;
+            const bySpeaker = {};
+            flaggedData.forEach(f => { (bySpeaker[f.speaker_name] = bySpeaker[f.speaker_name] || []).push(f); });
+            const names = Object.keys(bySpeaker).sort(byName);
+            show(el, true);
             el.innerHTML = `
                 <div class="card">
-                    <div class="card-header">
-                        <h3>Unnamed speakers <span class="badge badge-gray">${pending.length}</span></h3>
-                        <div class="meta"><span>learned from recordings, not yet matched against anything</span></div>
+                    <div class="card-title">
+                        Flagged for review
+                        <span class="badge badge-red">${flaggedData.length}</span>
                     </div>
-                    <p class="note">Name these to make them recognisable. Until you do, their speech is attributed as
-                        <strong>UNKNOWN</strong> (the words are always kept) and they never win a voiceprint match.
-                        If one of them is a person you already added, merge it instead of naming it again.</p>
-                    ${pending.map(p => `
-                        <div class="row row-spread">
-                            <div class="meta">
-                                <strong>${escHtml(p.name)}</strong>
-                                <span>${p.snippet_count} snippets</span>
-                                <span>${formatDuration(p.total_duration_sec)}</span>
-                                <span>from ${escHtml(p.source || 'a recording')}</span>
-                            </div>
-                            <div class="row">
-                                <input type="text" placeholder="Speaker name" id="pending-name-${escHtml(p.name)}" maxlength="255">
-                                <button class="btn btn-primary btn-sm" onclick="confirmPending('${escHtml(p.name)}')">Save name</button>
-                            </div>
+                    <div class="card-body">
+                        <p class="note">These snippets sit far from the centre of their own profile &mdash;
+                            often another person, a misidentified voice, or bad audio. They are already
+                            <strong>excluded</strong> from the profile, but the audio is still here and
+                            nothing is deleted until you press Remove.</p>
+                        <div class="row mb-09">
+                            <button class="btn btn-danger btn-sm" onclick="removeFlagged()">Remove all ${flaggedData.length} flagged</button>
+                            <button class="btn btn-ghost btn-sm" onclick="consolidateLibrary()">Re-run consolidation</button>
                         </div>
-                        ${renderPendingCandidates(p.name)}
-                    `).join('')}
+                        ${names.map(n => `
+                            <div class="row row-spread">
+                                <div class="meta">
+                                    <strong>${escHtml(n)}</strong>
+                                    <span>${bySpeaker[n].length} flagged</span>
+                                    <button class="btn btn-danger btn-sm" onclick="removeFlagged(${jsStr(n)})">
+                                        Remove all for ${escHtml(n)}
+                                    </button>
+                                </div>
+                            </div>
+                            <ul class="speaker-list">
+                                ${bySpeaker[n].map(f => `
+                                    <li>
+                                        <div class="snippet-head">
+                                            <button class="btn-play" id="play-${f.id}" onclick="togglePlay(${f.id})" title="Play">&#9654;</button>
+                                            <strong>${escHtml(basename(f.file_path))}</strong>
+                                            <span class="snippet-dur">${f.duration_sec.toFixed(1)}s</span>
+                                            ${f.source_audio ? '<span class="snippet-src">from ' + escHtml(basename(f.source_audio)) + '</span>' : ''}
+                                            <span class="badge badge-red">distance ${f.review_score.toFixed(3)}</span>
+                                        </div>
+                                        ${f.review_reason ? `<div class="note warn">${escHtml(f.review_reason)}</div>` : ''}
+                                        <div class="actions">
+                                            <button class="btn btn-primary btn-sm" onclick="keepFlagged(${f.id})">Keep</button>
+                                            <button class="btn btn-danger btn-sm" onclick="removeOneFlagged(${f.id}, ${jsStr(n)})">Remove</button>
+                                        </div>
+                                    </li>
+                                `).join('')}
+                            </ul>
+                        `).join('')}
+                    </div>
                 </div>
             `;
         }
+
+        async function refreshFlagged() {
+            const el = document.getElementById('flagged-list');
+            try {
+                const data = await apiFetch('/flagged');
+                flaggedData = data.snippets || [];
+            } catch (e) {
+                show(el, false);
+                return;
+            }
+            renderFlagged();
+        }
+
+        async function keepFlagged(snippetId) {
+            await apiFetch('/flagged/' + snippetId + '/keep', { method: 'POST' });
+            toast('Kept \u2014 re-run consolidation to fold it back into the profile');
+            refreshFlagged();
+        }
+
+        async function removeOneFlagged(snippetId, speakerName) {
+            if (!confirm('Remove this snippet from "' + speakerName + '"?\n\n'
+                + 'The audio file is deleted and the profile is rebuilt without it. This cannot be undone.')) return;
+            await apiFetch('/snippets/' + snippetId, { method: 'DELETE' });
+            toast('Snippet removed');
+            await refreshFlagged();
+            refresh();
+        }
+
+        // The server defaults to dry_run: true, so the first call can only ever
+        // report what WOULD go. Nothing is deleted until the user confirms the
+        // count that came back.
+        async function removeFlagged(speakerName) {
+            let plan;
+            try {
+                plan = await apiFetch('/flagged/remove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ speaker_name: speakerName || null, dry_run: true }),
+                });
+            } catch (e) { return; }
+            const secs = (plan.removed_seconds || 0);
+            if (!plan.removed_count) { toast('Nothing flagged to remove'); return; }
+            if (!confirm('Remove ' + plan.removed_count + ' flagged snippet(s) (' + formatDuration(secs) + ')?\n\n'
+                + 'The audio files are deleted and each affected profile is rebuilt.\nThis cannot be undone.')) return;
+            const res = await apiFetch('/flagged/remove', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ speaker_name: speakerName || null, dry_run: false }),
+            });
+            toast('Removed ' + res.removed_count + ' flagged snippet(s)');
+            await refreshFlagged();
+            refresh();
+        }
+
+        let consolidateInFlight = false;
+
+        async function consolidateStream(speakerName) {
+            if (consolidateInFlight) return;
+            consolidateInFlight = true;
+            const statusEl = document.getElementById('consolidateStatus');
+            const stageEl = statusEl.querySelector('.status-stage');
+            const countEl = statusEl.querySelector('.status-count');
+            statusEl.classList.add('visible');
+            stageEl.textContent = speakerName ? 'Consolidating ' + speakerName + '...' : 'Consolidating every profile...';
+            countEl.textContent = '';
+            try {
+                const q = speakerName ? '?speaker_name=' + encodeURIComponent(speakerName) : '';
+                const r = await fetch(API + '/consolidate/stream' + q, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                });
+                if (r.status === 409) {
+                    let info = {};
+                    try { info = await r.json(); } catch (e) { }
+                    throw new Error(info.detail || 'Another job is already running');
+                }
+                if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+
+                const reader = r.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let finalResult = null;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        let data;
+                        try { data = JSON.parse(line.slice(6)); } catch (e) { continue; }
+                        if (data.stage === 'error') throw new Error(data.error || 'Consolidation failed');
+                        if (data.stage === 'done') { finalResult = data.result; continue; }
+                        if (data.stage) stageEl.textContent = data.stage;
+                        if (data.progress !== undefined) {
+                            countEl.textContent = Math.round(data.progress * 100) + '%';
+                        }
+                    }
+                    if (finalResult) break;
+                }
+                if (finalResult) {
+                    const flagged = finalResult.flagged_count || 0;
+                    toast(flagged
+                        ? 'Consolidated ' + finalResult.speakers + ' profile(s), ' + flagged + ' snippet(s) flagged for review'
+                        : 'Consolidated ' + finalResult.speakers + ' profile(s) \u2014 no outliers found');
+                } else {
+                    toast('Consolidation finished');
+                }
+            } catch (e) {
+                toast('Consolidation failed: ' + e.message, true);
+            } finally {
+                consolidateInFlight = false;
+                statusEl.classList.remove('visible');
+                await refreshFlagged();
+                refresh();
+            }
+        }
+
+        function consolidateSpeaker(speakerName) { consolidateStream(speakerName); }
+        function consolidateLibrary() { consolidateStream(null); }
 
         async function confirmPending(pendingName) {
             const input = document.getElementById('pending-name-' + pendingName);
@@ -1842,6 +2554,10 @@
                     body: JSON.stringify({ new_name: newName })
                 });
                 toast('"' + res.name + '" is now recognisable');
+                // The profile just moved out of the unnamed tab and into the
+                // known one, so follow it there rather than leaving the user on
+                // a list that no longer contains what they just created.
+                vpSubtab = 'known';
                 await refresh();
             } catch (e) {
                 toast(e.message || 'Could not save the name', true);
@@ -1859,77 +2575,10 @@
                     body: JSON.stringify({ into: targetName })
                 });
                 toast('Merged ' + (res.snippets_moved || 0) + ' snippet(s) into "' + targetName + '"');
+                vpSubtab = 'known';
                 await refresh();
             } catch (e) {
                 toast(e.message || 'Could not merge the profile', true);
-            }
-        }
-
-        function renderSpeakers() {
-            const el = document.getElementById('speakers-list');
-            if (!speakersData.length) {
-                el.innerHTML = '<div class="card"><div class="empty">No speakers found. Drop audio files into the voices directory and click Rescan, or run a diarization to auto-collect snippets.</div></div>';
-                return;
-            }
-            el.innerHTML = speakersData.map(s => `
-                <div class="card" id="speaker-${escHtml(s.name)}">
-                    <div class="card-header" onclick="toggleSpeaker('${escHtml(s.name)}')">
-                        <h3>
-                            ${escHtml(s.name)}
-                            ${s.has_voiceprint ? '<span class="badge badge-green">voiceprint</span>' : '<span class="badge badge-gray">no voiceprint</span>'}
-                        </h3>
-                        <div class="meta">
-                            <span>${s.snippet_count} snippets</span>
-                            <span>${formatDuration(s.total_duration_sec)}</span>
-                            ${s.pitch_hz ? '<span>' + s.pitch_hz.toFixed(0) + ' Hz</span>' : ''}
-                        </div>
-                    </div>
-                    <div class="card-body-fold" id="body-${escHtml(s.name)}">
-                        <div class="empty">Loading snippets...</div>
-                    </div>
-                </div>
-            `).join('');
-        }
-
-        async function toggleSpeaker(name) {
-            const body = document.getElementById('body-' + name);
-            if (body.classList.contains('open')) {
-                body.classList.remove('open');
-                return;
-            }
-            body.classList.add('open');
-            try {
-                const data = await apiFetch('/speakers/' + encodeURIComponent(name) + '/snippets');
-                if (!data.snippets || !data.snippets.length) {
-                    body.innerHTML = '<div class="empty">No snippets</div>';
-                    return;
-                }
-                body.innerHTML = `
-                    <ul class="speaker-list">
-                        ${data.snippets.map(s => `
-                            <li>
-                                <div class="snippet-head">
-                                    <button class="btn-play" id="play-${s.id}" onclick="togglePlay(${s.id})" title="Play">&#9654;</button>
-                                    <strong>${escHtml(basename(s.file_path))}</strong>
-                                    <span class="snippet-dur">${s.duration_sec.toFixed(1)}s</span>
-                                    ${s.source_audio ? '<span class="snippet-src">from ' + escHtml(basename(s.source_audio)) + '</span>' : ''}
-                                </div>
-                                <div class="actions">
-                                    <button class="btn btn-danger btn-sm" onclick="deleteSnippet(${s.id}, '${escHtml(name)}')">Remove</button>
-                                </div>
-                            </li>
-                        `).join('')}
-                    </ul>
-                    <div class="form-inline">
-                        <span class="form-label">Add snippet:</span>
-                        <input type="file" id="upload-${escHtml(name)}" accept="audio/*,.wav,.mp3,.mp4,.mkv,.flac,.ogg,.m4a,.webm,.opus">
-                        <button class="btn btn-primary btn-sm" onclick="uploadSnippet('${escHtml(name)}')">Upload</button>
-                        <button class="btn btn-warning btn-sm" onclick="renamePrompt('${escHtml(name)}')">Rename</button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteSpeaker('${escHtml(name)}')">Delete Speaker</button>
-                    </div>
-                `;
-            } catch (e) {
-                body.innerHTML = '<div class="empty">Failed to load snippets</div>';
             }
         }
 
@@ -1937,8 +2586,21 @@
             if (!confirm('Remove this snippet? The voiceprint will be auto-refined.')) return;
             await apiFetch('/snippets/' + id, { method: 'DELETE' });
             toast('Snippet removed');
-            toggleSpeaker(speakerName);
-            refresh();
+            // refresh() rebuilds both lists, which drops the open fold; re-open
+            // the one the snippet was in so a review session does not have to
+            // click back in after every removal.
+            const wasUnnamed = pendingData.some(p => p.name === speakerName);
+            await refresh();
+            if (wasUnnamed) {
+                const body = document.getElementById('pbody-' + speakerName);
+                if (body && !body.classList.contains('open')) {
+                    body.classList.add('open');
+                    await loadSnippetBody('pbody-' + speakerName, speakerName);
+                }
+            } else {
+                const body = document.getElementById('body-' + speakerName);
+                if (body && body.classList.contains('open')) await loadSnippetBody('body-' + speakerName, speakerName);
+            }
         }
 
         async function uploadSnippet(name) {
@@ -1954,8 +2616,15 @@
             }
             const form = new FormData();
             form.append('file', input.files[0]);
-            await apiFetch('/speakers/' + encodeURIComponent(name) + '/upload', { method: 'POST', body: form });
-            toast('Snippet uploaded, voiceprint refining...');
+            const res = await apiFetch('/speakers/' + encodeURIComponent(name) + '/upload', { method: 'POST', body: form });
+            const replaced = res && res.replaced_snippets ? res.replaced_snippets : 0;
+            // The toast used to promise a refine that never happened: the
+            // upload only stores a snippet. Rebuild the profile now, over the
+            // final snippet set (the replaced ones are already gone).
+            await apiFetch('/speakers/' + encodeURIComponent(name) + '/refine', { method: 'POST' });
+            toast(replaced
+                ? 'Snippet uploaded, ' + replaced + ' earlier snippet(s) from this file replaced, voiceprint refined'
+                : 'Snippet uploaded, voiceprint refined');
             input.value = '';
             toggleSpeaker(name);
             refresh();

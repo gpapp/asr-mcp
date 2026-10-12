@@ -10,7 +10,7 @@ from asr_mcp.api.schemas import (
     SpeakerRegisterRequest, SpeakerIdentifyRequest,
     SpeakerIdentifyResponse, SpeakerInfoResponse, SpeakerListResponse,
 )
-from asr_mcp.api.security import verify_api_key, validate_upload_filename
+from asr_mcp.api.security import get_current_user, validate_upload_filename
 from asr_mcp.config.settings import Settings, get_settings
 
 logger = logging.getLogger("asr_mcp.api.speaker_router")
@@ -21,21 +21,22 @@ router = APIRouter(prefix="/speaker", tags=["Speaker"])
 async def register_speaker(
     req: SpeakerRegisterRequest,
     settings: Settings = Depends(get_settings),
-    _: str = Depends(verify_api_key),
+    user: str = Depends(get_current_user),
 ):
     from asr_mcp.core.model_state import state
-    from asr_mcp.speaker.service import SpeakerService
     from asr_mcp.db.manager import DatabaseManager
+    from asr_mcp.voiceprint.service import VoiceprintService
 
     state.ensure_diarize_ready()
     db = DatabaseManager(settings.db_path)
-    service = SpeakerService(settings.data_dir, db)
-    service._db._db = db
+    service = VoiceprintService(settings.data_dir, db)
+    service.set_voices_dir(settings.voices_dir)
 
     if req.wav_path and req.start_sec is not None and req.end_sec is not None:
         result = service.register_from_audio(
             name=req.name, wav_path=req.wav_path,
             start_sec=req.start_sec, end_sec=req.end_sec,
+            user_id=user,
         )
     else:
         return {"error": "Provide wav_path with start_sec and end_sec"}
@@ -49,7 +50,7 @@ async def register_speaker_upload(
     file: UploadFile = File(...),
     start_sec: float = 0.0,
     end_sec: float = None,
-    _: str = Depends(verify_api_key),
+    user: str = Depends(get_current_user),
 ):
     settings = get_settings()
     from asr_mcp.db.manager import DatabaseManager
@@ -91,6 +92,7 @@ async def register_speaker_upload(
         energy_rms=energy_rms,
         total_speech_sec=(end_sec - start_sec),
         sample_count=1,
+        user_id=user,
     )
 
     try:
@@ -106,7 +108,7 @@ async def register_speaker_upload(
 async def identify_speaker(
     req: SpeakerIdentifyRequest,
     settings: Settings = Depends(get_settings),
-    _: str = Depends(verify_api_key),
+    user: str = Depends(get_current_user),
 ):
     from asr_mcp.core.model_state import state
     from asr_mcp.speaker.embedding import extract_embedding
@@ -120,7 +122,7 @@ async def identify_speaker(
 
     db = DatabaseManager(settings.db_path)
     service = SpeakerService(settings.data_dir, db)
-    results = service.identify_speaker(embedding, top_k=req.top_k)
+    results = service.identify_speaker(embedding, top_k=req.top_k, user_id=user)
 
     return [SpeakerIdentifyResponse(**r) for r in results]
 
@@ -128,14 +130,14 @@ async def identify_speaker(
 @router.get("/list", response_model=SpeakerListResponse)
 async def list_speakers(
     settings: Settings = Depends(get_settings),
-    _: str = Depends(verify_api_key),
+    user: str = Depends(get_current_user),
 ):
     from asr_mcp.db.manager import DatabaseManager
     from asr_mcp.speaker.service import SpeakerService
 
     db = DatabaseManager(settings.db_path)
     service = SpeakerService(settings.data_dir, db)
-    speakers = service.list_speakers()
+    speakers = service.list_speakers(user_id=user)
 
     response_speakers = {}
     for name, info in speakers.items():
@@ -155,14 +157,14 @@ async def list_speakers(
 async def delete_speaker(
     speaker_name: str,
     settings: Settings = Depends(get_settings),
-    _: str = Depends(verify_api_key),
+    user: str = Depends(get_current_user),
 ):
     from asr_mcp.db.manager import DatabaseManager
     from asr_mcp.speaker.service import SpeakerService
 
     db = DatabaseManager(settings.db_path)
     service = SpeakerService(settings.data_dir, db)
-    deleted = service.remove_speaker(speaker_name)
+    deleted = service.remove_speaker(speaker_name, user_id=user)
     if deleted:
         return {"status": "deleted", "name": speaker_name}
     return {"error": f"Speaker '{speaker_name}' not found"}

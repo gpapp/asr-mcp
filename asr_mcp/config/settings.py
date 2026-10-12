@@ -93,6 +93,44 @@ class Settings(BaseSettings):
     enable_cors: bool = True
     cors_origins: list[str] = Field(default=["*"])
 
+    # Self-service registration. Off by default: an endpoint that creates
+    # accounts should be something an operator turned on rather than something a
+    # deployment inherits by upgrading. While it is off, an unauthenticated
+    # caller with no TRANSCRIBE_API_KEYS configured resolves to `default`; once
+    # it is on, that fallback is refused and every request must present a
+    # session, a database token or a static key (see get_current_user).
+    registration_enabled: bool = Field(
+        default=False,
+        description="Allow self-service signup by email and/or Google",
+    )
+
+    # Google sign-in (OAuth 2.0 authorization-code flow). Both halves are
+    # required and neither is optional: the secret is what makes the code
+    # exchange a confidential-client exchange. A deployment with only a client
+    # id can start a login and cannot finish it, so the button is not offered.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    # Absolute base URL this deployment is served from, used to build the
+    # redirect_uri registered with Google. Empty falls back to deriving it from
+    # the incoming request, which is correct when nothing rewrites the Host
+    # header and wrong the moment a proxy does.
+    external_url: str = ""
+
+    # Confirmation mail. Only host and from are load-bearing: a relay on a
+    # trusted network may take no credentials, and one with no host can send
+    # nothing at all -- which is why smtp_configured() checks exactly those two.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_starttls: bool = True
+    smtp_timeout: float = 20.0
+
+    # The one account allowed to reach the admin routes. Empty means nobody is
+    # admin, not "every admin"; the routes answer 403 and name this variable.
+    admin_user: str = ""
+
     # Rate limiting
     enable_rate_limit: bool = True
     rate_limit: str = "60/minute"

@@ -64,3 +64,64 @@ nearest or most common speaker:
   52-minute podcast is unaffected (the same thresholds give an identical
   52.2/32.4/11.1 split across `distance_threshold` 0.35–0.65), which is why
   long-file testing alone never surfaces it. See AGENTS.md lesson 33.
+
+## Why a colleague did not become a voiceprint
+
+Every run of `/api/asr/transcribe/upload` also *learns*: audio from a named
+speaker is added to their profile, and an unidentified cluster becomes a
+**pending** profile you are asked to name. That happens silently unless
+something was refused, so the `diarization_complete` SSE event carries a
+`learning` block, and the web UI renders it as a note under the transcript:
+
+```json
+"learning": {
+  "snippets_added": 12,
+  "profiles": [{"name": "Pending Speaker 8", "cluster": "Speaker 8",
+                "speech_sec": 96.4, "existing": false}],
+  "not_collected": [{"speaker": "Test Person One", "reason": "at_snippet_cap"}],
+  "not_learned": [{"cluster": "Speaker 2", "reason": "unverified:impure_group"}],
+  "refused_total": 88,
+  "refused_reasons": {"low_margin": 12, "overlap_label": 76}
+}
+```
+
+- `not_collected` is a decision you made: `at_snippet_cap` means the speaker is
+  at `AUTO_COLLECT_MAX_TOTAL_SEC` (default 1200s) and their profile will not
+  improve until you delete snippets or raise the cap. A voiceprint that stops
+  getting better is otherwise indistinguishable from one that is finished.
+- `not_learned` is a cluster that failed closed — the cohesion check could not
+  prove it was one person, so nothing was learned rather than learning a blend
+  (see `learning.fail_closed`).
+- `refused_reasons` counts spans that carried a name and were not stored.
+  The reason vocabulary is fixed and lives in
+  `asr_mcp/speaker/uncertainty.py` (`REASON_*`, with wording in
+  `LEARNING_REFUSAL_TEXT`):
+
+  | reason | meaning |
+  |---|---|
+  | `no_identity` / `unknown_label` | no speaker was assigned to the span |
+  | `overlap_label` | overlapping speech, no single owner |
+  | `generic_label` | an unnamed cluster (see `profiles` — this is what learning is for) |
+  | `explicitly_uncertain` | the pipeline asserted an identity and then suppressed it |
+  | `low_confidence` | the voiceprint match was too weak |
+  | `low_margin` | two speakers matched almost equally well |
+  | `too_short` | too little audio to judge |
+
+  A span is only counted here when it is a *near-miss*: a generic cluster that
+  was learned is not a refusal, and a span refused for being generic is reported
+  under the gate that actually stopped it. The per-span records (up to 25, with
+  the runner-up candidates and the measured confidence/margin/distance) are in
+  the service result and the server log, not in the SSE event.
+- `low_confidence` does **not** contradict a name in the transcript. Naming and
+  learning read the same match in different units: naming accepts a voiceprint
+  distance up to `matching.accept_threshold` (0.35), learning requires a
+  confidence of at least `uncertainty.min_speaker_confidence` (0.35), and
+  confidence is derived as `1 - distance / confidence_max_distance` (0.5). A
+  match in the 0.325–0.35 distance band is therefore shown under the
+  speaker's name and its audio is refused for learning — the band is kept
+  deliberately, because naming asserts an identity for display while learning
+  decides what becomes a permanent reference, and the second is the more
+  expensive mistake. Both numbers are uncalibrated; see the `_comment` on
+  `uncertainty` in `asr_mcp/config/thresholds.json`.
+- Nothing in this block changes the policy. It is a report: every gate above
+  still refuses, and the transcript keeps the words either way.

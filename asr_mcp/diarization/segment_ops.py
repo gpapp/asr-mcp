@@ -329,11 +329,61 @@ def _find_nearest_temporal(segments: list, target_idx: int, speaker: str) -> Opt
     return None
 
 
+def speaker_summary(segments: list, profiles: dict) -> tuple[set, dict]:
+    """The people the transcript shows, and the profile rows describing them.
+
+    ONE place where the invariant "a profile row exists for every speaker the
+    transcript shows, and for no other" is enforced. Steps 5-12 of the pipeline
+    each rename or suppress segments, and any of them that reassigns a label
+    without touching ``profiles`` leaves a row describing a speaker that owns no
+    audio -- it printed a row in the client's ``SPEAKER VOICE PROFILES`` banner,
+    with its own ``speech=`` seconds, and appeared nowhere in the text (measured
+    on a 70-minute 2-speaker recording: two such rows totalling 513s of speech
+    the transcript never showed). ``merge_profiles`` now drops the source key;
+    this is the gate that makes the guarantee hold for every path, including
+    ones added later.
+
+    ``has_speaker_identity`` excludes UNKNOWN and OVERLAP, which are label
+    classes rather than people: counting OVERLAP reported one speaker more than
+    the transcript ever shows.
+
+    ``profiles`` is mutated in place (the caller owns it) and returned.
+    """
+    speakers = {
+        s["speaker"] for s in segments
+        if has_speaker_identity(s.get("speaker"))
+    }
+    orphaned = sorted(set(profiles) - speakers)
+    if orphaned:
+        logger.info(
+            "Dropping %d profile(s) with no segments: %s",
+            len(orphaned), ", ".join(orphaned),
+        )
+        for name in orphaned:
+            profiles.pop(name, None)
+    return speakers, profiles
+
+
 def merge_profiles(profiles: dict, target: str, source: str):
-    if source not in profiles or target not in profiles:
+    """Fold ``source``'s profile into ``target`` and DROP the source key.
+
+    Every caller has already renamed ``source``'s segments to ``target``, so a
+    surviving ``source`` row describes a speaker that owns no audio at all: it
+    still printed a row in the client's ``SPEAKER VOICE PROFILES`` banner,
+    with its own ``speech=`` seconds, while appearing nowhere in the transcript.
+    Measured on a 70-minute 2-speaker recording: two such rows totalling 513s
+    of speech that the transcript never showed.
+    """
+    if source not in profiles:
+        return
+    s = profiles.pop(source)
+    if target not in profiles:
+        # Nothing to fold into, but the segments now carry ``target``, so this
+        # row IS that speaker's profile -- adopt it under the new name rather
+        # than dropping the seconds on the floor.
+        profiles[target] = s
         return
     t = profiles[target]
-    s = profiles[source]
     t_dur = t.get("total_speech_sec", 0)
     s_dur = s.get("total_speech_sec", 0)
     total = t_dur + s_dur

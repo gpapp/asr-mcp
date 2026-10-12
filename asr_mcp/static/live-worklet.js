@@ -28,6 +28,18 @@
  * embeddings over it -- both of which are level sensitive. Levelling only the
  * frames on the wire would leave the offline pass working on quiet audio.
  *
+ * The gain is updated ONCE PER POSTED BLOCK, on that block's own RMS: 1024
+ * samples at 16 kHz = 64 ms, the same cadence the Windows client gets from its
+ * resampled chunk (`--block-ms 64`). The render quantum is 128 input samples
+ * (2.7 ms at 48 kHz), and driving the gain from THAT is what the loop must not
+ * do: ATTACK 0.5 reaches `desired` within two quanta, so the smoothing is
+ * bypassed entirely and the leveller degenerates into a per-quantum
+ * normaliser that pins every quantum to the target -- room tone included,
+ * because TARGET sits above any realistic room SNR. The speech envelope is
+ * flattened to a constant level, the detector's adaptive noise floor rises with
+ * the noise it is being fed, and Silero then sees a signal with no speech
+ * structure left in it.
+ *
  * The gain loop targets a speech RMS and moves in the log domain, so a quiet
  * microphone is pulled up quickly while a loud one is eased down slowly (a
  * linear ramp makes the gain audibly pump on every syllable). It is gated at
@@ -55,7 +67,10 @@ class LiveCaptureProcessor extends AudioWorkletProcessor {
         const opts = (options && options.processorOptions) || {};
         this.inRate = opts.sampleRate || sampleRate || 48000;
         this.ratio = this.inRate / OUTPUT_RATE;
-        this.out = new Int16Array(BLOCK_SAMPLES);
+        // Resampled float samples of the block currently being filled. The
+        // gain is measured on these, so it has to stay float until the block
+        // is complete -- see _emit().
+        this.out = new Float32Array(BLOCK_SAMPLES);
         this.outFill = 0;
         // Fractional read position within the current input block, and the last
         // input sample of the previous block so interpolation has continuity
@@ -104,6 +119,44 @@ class LiveCaptureProcessor extends AudioWorkletProcessor {
         return this.gain;
     }
 
+    /**
+     * Emit one complete output block: measure it, level it, post it.
+     *
+     * This is the ONLY place the gain is updated, and it runs once per block
+     * (BLOCK_SAMPLES at OUTPUT_RATE = 64 ms) -- the same cadence the Windows
+     * client gets from its resampled chunk (`--block-ms 64`). One gain for the
+     * whole block is also what keeps a word intact: a gain that moves mid-block
+     * mixes two levels into one utterance.
+     */
+    _emit() {
+        let sum = 0;
+        let peak = 0;
+        for (let i = 0; i < BLOCK_SAMPLES; i++) {
+            const v = this.out[i];
+            sum += v * v;
+            const a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+        }
+        const rms = Math.sqrt(sum / BLOCK_SAMPLES);
+        let gain = this.autoLevel ? this._updateGain(rms) : 1;
+        // Peak limiter: a gain that targets RMS will still push isolated peaks
+        // past full scale, and a clipped peak sounds like a click to the model.
+        const scaled = peak * gain;
+        if (scaled > PEAK_CEILING) gain *= PEAK_CEILING / scaled;
+        this.lastGain = gain;
+
+        const pcm = new Int16Array(BLOCK_SAMPLES);
+        for (let i = 0; i < BLOCK_SAMPLES; i++) {
+            pcm[i] = LiveCaptureProcessor.toInt16(this.out[i] * gain);
+        }
+        // One copy, transferred (not cloned) to the main thread.
+        this.port.postMessage(
+            { type: 'block', pcm, gain: this.lastGain },
+            [pcm.buffer]);
+        this.out = new Float32Array(BLOCK_SAMPLES);
+        this.outFill = 0;
+    }
+
     process(inputs) {
         if (this.closed) {
             return false;
@@ -117,24 +170,10 @@ class LiveCaptureProcessor extends AudioWorkletProcessor {
         if (n === 0) {
             return true;
         }
-        // One pass for the block RMS, one for the resample. The block is 128
-        // samples, so this is cheaper than it looks and needs no ring buffer.
-        let sum = 0;
-        let peak = 0;
-        for (let i = 0; i < n; i++) {
-            const v = ch[i];
-            sum += v * v;
-            const a = v < 0 ? -v : v;
-            if (a > peak) peak = a;
-        }
-        const rms = Math.sqrt(sum / n);
-        let gain = this.autoLevel ? this._updateGain(rms) : 1;
-        // Peak limiter: a gain that targets RMS will still push isolated peaks
-        // past full scale, and a clipped peak sounds like a click to the model.
-        const scaled = peak * gain;
-        if (scaled > PEAK_CEILING) gain *= PEAK_CEILING / scaled;
-        this.lastGain = gain;
-
+        // Resample only. No gain is computed here: this quantum is 128 input
+        // samples (~2.7 ms at 48 kHz), a rendering artefact rather than an
+        // audio unit, and a gain update that fast is what flattened the
+        // envelope -- see the module docstring.
         // `pos` is in input-sample units relative to the concatenated stream,
         // so rebase it at the start of every block.
         let pos = this.pos;
@@ -144,16 +183,10 @@ class LiveCaptureProcessor extends AudioWorkletProcessor {
             const a = i === 0 ? this.prev : ch[i - 1];
             const b = ch[i];
             const v = a + (b - a) * frac;
-            this.out[this.outFill++] = LiveCaptureProcessor.toInt16(v * gain);
+            this.out[this.outFill++] = v;
             pos += this.ratio;
             if (this.outFill === BLOCK_SAMPLES) {
-                // One copy, transferred (not cloned) to the main thread.
-                const block = this.out;
-                this.port.postMessage(
-                    { type: 'block', pcm: block, gain: this.lastGain },
-                    [block.buffer]);
-                this.out = new Int16Array(BLOCK_SAMPLES);
-                this.outFill = 0;
+                this._emit();
             }
         }
         this.pos = pos - n;

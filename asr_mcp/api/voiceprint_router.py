@@ -14,7 +14,8 @@ from asr_mcp.api.schemas import (
     RescanResponse,
     PendingProfileConfirm, PendingProfileConfirmResponse,
     PendingCandidate, PendingCandidatesResponse, PendingMergeRequest,
-    PendingMergeResponse,
+    PendingMergeResponse, IntegrityCleanupRequest,
+    FlaggedSnippetInfo, FlaggedSnippetListResponse, FlaggedRemoveRequest,
 )
 from asr_mcp.api.security import get_current_user, validate_upload_filename
 from asr_mcp.config.settings import Settings, get_settings
@@ -171,6 +172,13 @@ async def upload_snippet(
     file: UploadFile = File(...),
     start_sec: float = Query(None),
     end_sec: float = Query(None),
+    replace_source: bool = Query(
+        True,
+        description=(
+            "Replace this speaker's snippets already recorded from this same "
+            "file instead of adding to them (one file, one contribution)."
+        ),
+    ),
     user_id: str = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ):
@@ -206,7 +214,14 @@ async def upload_snippet(
             source_audio=file.filename,
             start_sec=start_sec,
             end_sec=end_sec,
+            replace_source=replace_source,
         )
+        if result.get("replaced_snippets"):
+            # Say it out loud: the response is the only place the caller learns
+            # that audio it asked to keep is gone.
+            logger.info(
+                "%s/%s: replaced %d earlier snippet(s) from %s",
+                user_id, speaker_name, result["replaced_snippets"], file.filename)
         return result
     except Exception as e:
         return {"error": str(e)}
@@ -226,6 +241,54 @@ async def refine_speaker(
 ):
     service = _get_service(settings, ensure_gpu=True)
     return service.refine_speaker(speaker_name, user_id=user_id)
+
+
+@router.get("/integrity")
+async def voiceprint_integrity(
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """The same audit the server logs at startup, for the signed-in user.
+
+    Read-only. The startup log is the same numbers, but this is scoped to one
+    user and returns them as JSON, so the Voiceprints tab can show them without
+    anyone reading a container log.
+    """
+    return _get_service(settings).integrity_report(user_id=user_id)
+
+
+@router.post("/integrity/cleanup")
+async def voiceprint_integrity_cleanup(
+    req: IntegrityCleanupRequest,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Repair the audit findings that have one correct answer.
+
+    Destructive, and explicit twice over: the only automatic repair is the
+    profile rebuild (which only ever drops a DERIVED row), and ``dry_run``
+    defaults to true so the first call here returns the plan and touches
+    nothing. Pass ``{"dry_run": false}`` to act on it.
+
+    ``dead_snippets`` deletes rows whose audio is not on disk -- the wav->flac
+    migration leftovers, all with ``source_audio IS NULL`` and therefore
+    invisible to the "one file, one contribution" replacement. No file that
+    resolves is ever unlinked; a dead row's file is already gone.
+
+    ``ensure_gpu=True`` is load-bearing. Removing snippets leaves the profile
+    describing audio that is gone, so the speakers it touched are re-refined
+    afterwards -- and ``_auto_refine`` returns silently when no embedding
+    session is loaded. Without this a "refined" line in the response could be a
+    lie. Only VAD + embedding load here; the ASR backend stays unloaded.
+    """
+    service = _get_service(settings, ensure_gpu=True)
+    return service.cleanup_integrity(
+        user_id=user_id,
+        duplicates=req.duplicates,
+        dead_snippets=req.dead_snippets,
+        stale_totals=req.stale_totals,
+        dry_run=req.dry_run,
+    )
 
 
 @router.delete("/snippets/{snippet_id}")
@@ -292,17 +355,142 @@ async def _sse_put(queue: asyncio.Queue, evt) -> None:
     await asyncio.sleep(0.01)
 
 
+@router.get("/flagged", response_model=FlaggedSnippetListResponse)
+async def list_flagged_snippets(
+    speaker_name: str = Query(None, description="Restrict to one speaker"),
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Snippets the outlier pass marked for review, worst score first.
+
+    Read-only. A mark is an accusation with evidence attached, never a
+    deletion -- the audio is still there and still part of nothing but the
+    report until POST /flagged/remove is called with dry_run=false.
+    """
+    rows = _get_service(settings).list_flagged_snippets(
+        user_id=user_id, speaker_name=speaker_name)
+    items = [FlaggedSnippetInfo(
+        id=r["id"], speaker_name=r["speaker_name"], file_path=r["file_path"],
+        duration_sec=r.get("duration_sec") or 0.0,
+        source_audio=r.get("source_audio"), start_sec=r.get("start_sec"),
+        end_sec=r.get("end_sec"), review_score=r.get("review_score"),
+        review_reason=r.get("review_reason"),
+    ) for r in rows]
+    return FlaggedSnippetListResponse(snippets=items, count=len(items))
+
+
+@router.post("/flagged/{snippet_id}/keep")
+async def keep_flagged_snippet(
+    snippet_id: int,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Clear one snippet's review mark: this audio IS the speaker.
+
+    The snippet is not deleted and the profile is not touched; re-run
+    consolidation to fold it back into the fitted profile.
+    """
+    return _get_service(settings).keep_flagged_snippet(snippet_id, user_id=user_id)
+
+
+@router.post("/flagged/remove")
+async def remove_flagged_snippets(
+    req: FlaggedRemoveRequest,
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Delete every snippet marked for review, then re-refine each speaker once.
+
+    ``dry_run`` defaults to true, so the first call returns the plan. Pass
+    ``{"dry_run": false, "speaker_name": "..."}`` to act -- optionally for one
+    speaker only.
+    """
+    return _get_service(settings, ensure_gpu=True).remove_flagged_snippets(
+        user_id=user_id, speaker_name=req.speaker_name, dry_run=req.dry_run)
+
+
+@router.post("/consolidate/stream")
+async def consolidate_stream(
+    speaker_name: str = Query(None, description="One speaker; empty = the whole library"),
+    user_id: str = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+):
+    """Recompute profiles from all snippets and flag the outliers.
+
+    A library-wide pass embeds every snippet the user owns, which is minutes of
+    GPU, so it streams progress like the rescan does. Registering the job also
+    keeps the TTL monitor from unloading the embedding session underneath the
+    pass -- an unloaded session makes the refine silently do nothing while the
+    report still claims success.
+    """
+    busy = job_state.get_for_user(user_id)
+    if busy is not None:
+        from fastapi.responses import JSONResponse
+        content = {"detail": "You already have a job running", "job": busy.meta()}
+        return JSONResponse(status_code=409, content=content)
+
+    service = _get_service(settings, ensure_gpu=True)
+    scope = speaker_name or "all speakers"
+    queue: asyncio.Queue = asyncio.Queue()
+    job = job_state.start_job(mode="consolidate", filename=scope, user_id=user_id)
+    loop = asyncio.get_running_loop()
+
+    def _threadsafe_progress(evt: dict):
+        def _do():
+            queue.put_nowait(evt)
+            job_state.publish(evt)
+        loop.call_soon_threadsafe(_do)
+
+    async def run_consolidate():
+        try:
+            if speaker_name:
+                result = service.consolidate_speaker(
+                    speaker_name, user_id=user_id, progress_callback=_threadsafe_progress)
+                result = {"speakers": 1, "flagged_count": result.get("flagged_count", 0),
+                          "results": [result]}
+            else:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: service.consolidate_library(
+                        user_id=user_id, progress_callback=_threadsafe_progress),
+                )
+            await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": result})
+        except Exception as e:
+            logger.error("Consolidation failed: %s", e)
+            await _sse_put(queue, {"stage": "error", "error": str(e)})
+        finally:
+            job_state.ensure_finished(job)
+            await queue.put(None)
+
+    asyncio.create_task(run_consolidate())
+
+    async def event_stream():
+        while True:
+            evt = await queue.get()
+            if evt is None:
+                break
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @router.post("/rescan/stream")
 async def rescan_voices_stream(
     user_id: str = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ):
-    busy = job_state.get_running()
+    busy = job_state.get_for_user(user_id)
     if busy is not None:
         from fastapi.responses import JSONResponse
-        content = {"detail": "Another job is already running"}
-        if busy.user_id == user_id:
-            content["job"] = busy.meta()
+        content = {"detail": "You already have a job running", "job": busy.meta()}
         return JSONResponse(status_code=409, content=content)
 
     service = _get_service(settings, ensure_gpu=True)

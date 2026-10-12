@@ -97,9 +97,9 @@ def test_confirming_a_pending_profile_makes_it_matchable(db, tmp_path):
                total_speech_sec=30, pending=True)
     assert set(vp_db.list_all(user_id="u", include_pending=False)) == set()
 
-    vp_db.rename("Pending 2026-01-01 10:00 (a)", "Ismael", user_id="u")
-    vp_db.set_pending("Ismael", False, user_id="u")
-    assert set(vp_db.list_all(user_id="u", include_pending=False)) == {"Ismael"}
+    vp_db.rename("Pending 2026-01-01 10:00 (a)", "Test Person Three", user_id="u")
+    vp_db.set_pending("Test Person Three", False, user_id="u")
+    assert set(vp_db.list_all(user_id="u", include_pending=False)) == {"Test Person Three"}
 
 
 def test_save_does_not_silently_promote_on_rebuild(db):
@@ -346,16 +346,16 @@ def test_renaming_a_profile_repoints_snippet_paths_at_disk(service, db, tmp_path
         audio_path=_WAV["path"], segments=_segs("Speaker 5"),
         user_id="u", source_id="meeting.wav", learn_new=True)
     name = out["pending_created"][0]["name"]
-    assert service.confirm_pending(name, "Ismael", user_id="u")["ok"] is True
+    assert service.confirm_pending(name, "Test Person Three", user_id="u")["ok"] is True
 
-    snips = service.list_snippets("Ismael", user_id="u")
+    snips = service.list_snippets("Test Person Three", user_id="u")
     assert snips, "confirming a profile lost its snippets"
     for sn in snips:
         assert Path(sn["file_path"]).is_file(), (
             f"snippet row points at a path that does not exist: {sn['file_path']}")
         assert name not in sn["file_path"], (
             "the row still carries the old pending directory")
-        assert sn["speaker_name"] == "Ismael"
+        assert sn["speaker_name"] == "Test Person Three"
 
 
 def test_confirm_pending_renames_and_unlocks(service, db):
@@ -363,9 +363,9 @@ def test_confirm_pending_renames_and_unlocks(service, db):
         audio_path=_WAV["path"], segments=_segs("Speaker 5"),
         user_id="u", source_id="meeting.wav", learn_new=True)
     name = out["pending_created"][0]["name"]
-    assert service.confirm_pending(name, "  Ismael  ", user_id="u")["ok"] is True
+    assert service.confirm_pending(name, "  Test Person Three  ", user_id="u")["ok"] is True
     vp_db = VoiceprintDB(db)
-    assert "Ismael" in vp_db.list_all(user_id="u", include_pending=False)
+    assert "Test Person Three" in vp_db.list_all(user_id="u", include_pending=False)
     assert name not in vp_db.list_all(user_id="u")
     assert service.pending_profiles(user_id="u") == []
 
@@ -446,11 +446,11 @@ def test_candidates_are_empty_without_an_embedding_or_registered_speakers(servic
 def test_merging_a_pending_profile_into_an_existing_speaker(service, db):
     from asr_mcp.db.manager import VoiceprintDB
     vp_db = VoiceprintDB(db)
-    vp_db.save("Ismael", _unit(11), user_id="u", total_speech_sec=30)
+    vp_db.save("Test Person Three", _unit(11), user_id="u", total_speech_sec=30)
     pending = _learn(service, n=3)
-    snips_before = len(service.list_snippets("Ismael", user_id="u"))
+    snips_before = len(service.list_snippets("Test Person Three", user_id="u"))
 
-    out = service.merge_pending_into(pending, "Ismael", user_id="u")
+    out = service.merge_pending_into(pending, "Test Person Three", user_id="u")
     assert out.get("error") is None, out
     assert out["status"] == "merged_into_existing"
     assert out["snippets_moved"] == 3
@@ -459,28 +459,28 @@ def test_merging_a_pending_profile_into_an_existing_speaker(service, db):
     assert pending not in vp_db.list_all(user_id="u", include_pending=True)
     assert all(p["name"] != pending for p in service.pending_profiles(user_id="u"))
     # ...and its snippets now belong to the real speaker, on disk.
-    moved = service.list_snippets("Ismael", user_id="u")
+    moved = service.list_snippets("Test Person Three", user_id="u")
     assert len(moved) == snips_before + 3
     assert all(Path(s["file_path"]).exists() for s in moved)
-    # Ismael is still one ordinary, matchable profile.
-    assert "Ismael" in vp_db.list_all(user_id="u", include_pending=False)
+    # Test Person Three is still one ordinary, matchable profile.
+    assert "Test Person Three" in vp_db.list_all(user_id="u", include_pending=False)
 
 
 def test_merge_refuses_the_awkward_cases(service, db):
     from asr_mcp.db.manager import VoiceprintDB
     vp_db = VoiceprintDB(db)
-    vp_db.save("Ismael", _unit(11), user_id="u", total_speech_sec=30)
+    vp_db.save("Test Person Three", _unit(11), user_id="u", total_speech_sec=30)
     pending = _learn(service)
 
     assert "into itself" in service.merge_pending_into(pending, pending, user_id="u")["error"]
     assert "No speaker named" in service.merge_pending_into(pending, "Nobody", user_id="u")["error"]
-    assert "No pending profile" in service.merge_pending_into("Pending nope", "Ismael",
+    assert "No pending profile" in service.merge_pending_into("Pending nope", "Test Person Three",
                                                               user_id="u")["error"]
     # A NAMED profile is not a pending profile: this must not be able to move
     # a colleague's audio around. Needs a distinct target or the into-itself
     # guard fires first.
     vp_db.save("Bob", _unit(22), user_id="u", total_speech_sec=30)
-    assert "not a pending profile" in service.merge_pending_into("Ismael", "Bob",
+    assert "not a pending profile" in service.merge_pending_into("Test Person Three", "Bob",
                                                                  user_id="u")["error"]
     # Still pending after all those refusals, and still intact.
     assert any(p["name"] == pending for p in service.pending_profiles(user_id="u"))

@@ -1594,19 +1594,25 @@ def run_live(args):
             # only on an empty queue meant the meter never drew while audio
             # was flowing -- which is exactly when it matters.
             levels.tick()
-            # Release any turn whose merge window has elapsed. This is what
-            # keeps the coalescer's added latency bounded: without it a turn
-            # waits for the NEXT turn, so the last sentence of a session (and
-            # the only sentence of a short one) would not be sent at all.
-            for ready in coalescers[CHANNEL_MIC].poll():
-                session.sequence += 1
-                try:
-                    transport.send_turn(CHANNEL_MIC, ready, session.sequence)
-                    session.turns_sent += 1
-                except Exception as e:
-                    send_error = e
-                    print(f"\nSend failed: {e}", file=sys.stderr)
-                    stop.set()
+            # Release any turn whose merge window has elapsed -- on BOTH
+            # channels. This is what keeps the coalescer's added latency
+            # bounded: without it a turn waits for the NEXT turn, so the last
+            # sentence of a session (and the only sentence of a short one)
+            # would not be sent at all. Polling only the microphone left every
+            # speaker-channel turn held for up to merge_gap_sec, or until the
+            # next speaker turn arrived; the browser polls both (live.js).
+            for poll_channel in (CHANNEL_MIC, CHANNEL_SPEAKER):
+                for ready in coalescers[poll_channel].poll():
+                    session.sequence += 1
+                    try:
+                        transport.send_turn(poll_channel, ready, session.sequence)
+                        session.turns_sent += 1
+                    except Exception as e:
+                        send_error = e
+                        print(f"\nSend failed: {e}", file=sys.stderr)
+                        stop.set()
+                        break
+                if send_error:
                     break
             if send_error:
                 break

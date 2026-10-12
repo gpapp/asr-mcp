@@ -192,6 +192,43 @@ def test_visibility_is_toggled_by_class_not_by_inline_style():
     assert "function _show(id, on)" in LIVE_JS.read_text(encoding="utf-8")
 
 
+def test_the_markup_carries_no_hidden_attribute():
+    """Initial visibility is the `.hidden` CLASS, never the `hidden` attribute.
+
+    `show()` only ever toggles the class, and it cannot remove an attribute --
+    so a `hidden` attribute in the markup is permanent: the UA `[hidden] {
+    display: none }` rule keeps beating any class that does not itself set
+    `display`, and the element can never be shown again. That is exactly what
+    happened to `#progressArea`: the file selector vanished the moment a job
+    started, and the progress bar and Cancel button never appeared at all, for
+    jobs started from the UI or attached from another client.
+    """
+    template = _template()
+    body = re.sub(r"<style>.*?</style>", "", template, flags=re.S)
+    body = re.sub(r"<script.*?</script>", "", body, flags=re.S)
+    offenders = re.findall(r"<[a-zA-Z][^<>]*?\shidden[\s>/]", body)
+    assert not offenders, (
+        "markup uses the hidden attribute, which show() cannot clear: "
+        f"{offenders[:5]}"
+    )
+
+
+def test_js_never_writes_the_hidden_property():
+    """`el.hidden = x` is the attribute again, by another name.
+
+    Same failure as the attribute -- it bypasses the class, so an element
+    hidden that way ignores the stylesheet -- and it leaves the two mechanisms
+    free to disagree about the same element.
+    """
+    for path in (TEMPLATE, LIVE_JS, VIEWER_JS):
+        src = path.read_text(encoding="utf-8")
+        offenders = [
+            line.strip() for line in src.splitlines()
+            if re.search(r"\.hidden\s*=\s*(true|false)", line)
+        ]
+        assert not offenders, f"{path.name} writes el.hidden: {offenders}"
+
+
 def test_the_template_carries_no_inline_styles():
     """No `style="..."` in the markup.
 
@@ -306,3 +343,68 @@ def test_the_meter_is_a_grid_with_areas():
     assert '"name label" "bar bar"' in phone, (
         "the phone layout does not reflow the meter row"
     )
+
+
+def test_the_learning_note_composes_the_shared_note_and_outlives_the_job():
+    """The learning summary must not be a private surface, nor a transient one.
+
+    Two rules, both of which this note could plausibly have broken:
+
+    1. It is a `.note` — the shared primitive — with no second styling of its
+       own. A note that declares its own font and padding is the start of the
+       Live tab's private-copy problem (lesson 21).
+    2. It sits OUTSIDE `#progressArea`. That block hides itself a few seconds
+       after a job ends, and a summary that disappears with the progress bar is
+       not a summary: the user reads it *after* the run.
+    """
+    html = _template()
+    assert 'id="learningNote" class="note hidden"' in html, (
+        "the learning note must start hidden and use the shared .note primitive"
+    )
+    m = re.search(r'<div id="learningNote".*?</div>\s*(?=<div class="options">)',
+                  html, re.S)
+    assert m, "learningNote is not a sibling of .options, so it is not outside " \
+              "#progressArea"
+    note_pos = html.index('id="learningNote"')
+    progress_open = html.index('id="progressArea"')
+    # The progress area is closed before the note opens.
+    assert html.index('id="progressArea"') < note_pos
+    assert "</div>" in html[progress_open:note_pos]
+    # No id="learningNote" inside the progress block.
+    assert note_pos > html.index("</div>", html.index('id="cancelJobBtn"'))
+
+    js = html[html.index("<script"):]
+    assert "function renderLearningNote(info)" in js
+    assert "renderLearningNote(data.learning)" in js, (
+        "the diarization_complete handler never renders the summary"
+    )
+    # Cleared on a new job, so the last file's note cannot be read as this
+    # file's.
+    assert re.search(r"enterJobUi[\s\S]{0,900}show\('learningNote', false\)",
+                     js), "a new job leaves the previous run's learning note up"
+    assert not re.search(r"learningNote[^\n]*\.style\.", js), (
+        "the learning note writes an inline style"
+    )
+
+
+def test_every_refusal_reason_the_server_can_send_has_wording():
+    """An unmapped reason must never reach the user as an enum name.
+
+    The wire contract is the stable reason string from
+    `speaker/uncertainty.py`; the note has to be able to say what each one
+    means, or a new gate ships as `low_confidenc` in the middle of a sentence.
+    """
+    from conftest import load_uncertainty
+    u = load_uncertainty()
+    reasons = [v for k, v in vars(u).items() if k.startswith("REASON_")]
+    assert len(reasons) >= 8
+    js = _template()
+    block = re.search(r"function learningReasonText.*?\n        \}", js, re.S)
+    assert block, "app.html has no learningReasonText()"
+    for reason in reasons:
+        assert reason in block.group(0), (
+            f"learningReasonText() has no wording for {reason!r}"
+        )
+    # ...and the server ships the same table, so a non-browser client (the
+    # Windows client prints the same facts) can render it too.
+    assert set(u.LEARNING_REFUSAL_TEXT) >= set(reasons)

@@ -20,13 +20,14 @@ from asr_mcp.api.schemas import (
     LiveSessionSave, TranscribeResponse, TranscribeResult,
 )
 from asr_mcp.api.security import verify_api_key, get_current_user, validate_upload_filename
-from asr_mcp.api.auth import get_session_user
 from asr_mcp.config.settings import Settings, get_settings
 from asr_mcp.core import job_state
 from asr_mcp.speaker.attribution import (
     attribute_items, attribute_span, speaker_for_span,
 )
-from asr_mcp.speaker.uncertainty import SOURCE_UNKNOWN, setting
+from asr_mcp.speaker.uncertainty import (
+    SOURCE_UNKNOWN, setting, LEARNING_REFUSAL_TEXT,
+)
 # NOTE: ``speaker.vad`` is deliberately NOT imported at module level. It pulls in
 # torch, which would make this router unimportable (and therefore untestable)
 # without the ML stack. The boundary engine it used to import from is
@@ -36,6 +37,10 @@ logger = logging.getLogger("asr_mcp.api.asr_router")
 router = APIRouter(prefix="/asr", tags=["ASR"])
 
 MAX_TURN_SEC = 120.0
+
+#: The learning summary is a note, not a report. Bounded here as well as in the
+#: service so a 40-speaker conference cannot turn one SSE frame into a wall.
+LEARNING_SUMMARY_MAX_ITEMS = 8
 PARAGRAPH_PAUSE_SEC = 3.0
 #: Fields a raw backend result may contribute to a TranscribeResult.
 _RESULT_FIELDS = set(TranscribeResult.model_fields)
@@ -818,6 +823,144 @@ async def _auto_collect(vp_service, *, audio_path, segments, user_id, source_id,
     return out
 
 
+def _learning_summary(learned: dict) -> dict:
+    """The small, renderable half of the learning diagnostics.
+
+    ``VoiceprintService.auto_collect_from_diarization`` returns a full audit
+    (per-span refusal records, per-cluster purity, per-speaker outcomes). That
+    is far too much to push down an SSE event the browser has to read aloud in
+    a note, so only the counts and the reasons travel. The detail stays in the
+    log, which is where somebody debugging a specific span should be looking.
+
+    Additive and it branches on nothing: a client that ignores it sees exactly
+    what it saw before.
+    """
+    diag = (learned or {}).get("diagnostics") or {}
+    reasons = dict(diag.get("refused_reasons") or {})
+    # The per-speaker collect outcomes worth naming are the refusals of a
+    # speaker we ALREADY have: at the snippet cap is a decision the user made,
+    # and not being told is how a voiceprint silently stops improving.
+    not_collected = [
+        {"speaker": e.get("speaker"), "reason": e.get("skipped")}
+        for e in (diag.get("collect") or [])
+        if e.get("skipped") and e.get("skipped") != "not_registered"
+    ]
+    learned_profiles = [
+        {"name": p.get("name"), "cluster": p.get("cluster"),
+         "speech_sec": p.get("speech_sec"), "existing": bool(p.get("existing"))}
+        for p in ((learned or {}).get("pending_created") or [])
+        + ((learned or {}).get("pending_extended") or [])
+    ]
+    return {
+        "snippets_added": len((learned or {}).get("collected") or []),
+        "profiles": learned_profiles,
+        "not_learned": [
+            {"cluster": m.get("cluster"), "reason": m.get("reason")}
+            for m in ((learned or {}).get("learn_skipped") or [])
+        ][:LEARNING_SUMMARY_MAX_ITEMS],
+        "not_collected": not_collected[:LEARNING_SUMMARY_MAX_ITEMS],
+        "refused_total": int(diag.get("refused_total") or 0),
+        "refused_reasons": reasons,
+        "refusal_text": dict(LEARNING_REFUSAL_TEXT),
+    }
+
+
+def _display_spans(spans) -> list[dict]:
+    """The client-facing projection of a boundary set (turns or segments).
+
+    Lesson 22: what is displayed is the REFINED boundary set, and an uncertain
+    span is one whose identity is withheld — including a span that never had a
+    name, which the pipeline leaves as ``None``.
+    """
+    return [
+        {
+            "start": s["start"],
+            "end": s["end"],
+            "speaker": s.get("speaker"),
+            "uncertain": bool(s.get("uncertain")) or s.get("speaker") is None,
+            "attribution_reason": s.get("attribution_reason"),
+        }
+        for s in spans
+    ]
+
+
+async def _refine_and_learn(
+    *, settings, audio_path, segments, known_speakers, raw_vad_sections,
+    audio_duration_sec, user_id, source_id, log_prefix="",
+):
+    """Turn preparation + voiceprint learning for a request that decodes no text.
+
+    A diarization-only request used to hand the RAW diarization segments
+    straight to the learner. That is the boundary set the transcription paths
+    deliberately stopped learning from (finding F1): no turn merge, no exact
+    boundary refinement and — because the router passed no ``vad_sections`` —
+    no VAD-section trimming, so a snippet edge could land mid-phoneme. A
+    learned embedding is later preferred as a reference for cutting future
+    boundaries (``_speaker_refs`` / ``pipeline._get_speaker_ref``), so the
+    error compounded run over run, and a request that never decodes text
+    produced worse voiceprints than the same file with transcription.
+
+    Runs the same engine, in the same order, as ``run_transcribe`` and
+    ``_attribute_items_against_audio``: load the audio, prepare the turns from
+    the diarizer's own Silero pass, then learn from the turns.
+
+    Returns ``(spans, learning)``: the boundary set to display (the turns when
+    refinement produced any, else the raw segments) and the learning report
+    (``pending_profiles`` + the bounded ``learning`` summary, or ``{}``).
+    """
+    spans = list(segments or [])
+    audio_np = None
+    sr = 16000
+    if spans:
+        # Imported here, not at module level: the ML stack must stay optional
+        # for this router to be importable (and testable) without it.
+        import numpy as np
+        from asr_mcp.voiceprint.utils import load_audio
+        try:
+            waveform, sr = load_audio(audio_path)
+            audio_np = waveform.numpy().squeeze().astype(np.float32)
+        except Exception as e:
+            logger.warning("Could not load audio for turn refinement: %s", e)
+            audio_np = None
+        try:
+            turns = _prepare_turns(
+                segments,
+                audio_duration_sec=audio_duration_sec or None,
+                audio=audio_np,
+                sample_rate=sr or 16000,
+                known_speakers=known_speakers or None,
+                raw_vad_sections=raw_vad_sections,
+            )
+            spans = turns or list(segments)
+        except Exception as e:
+            logger.warning("Boundary refinement failed: %s", e)
+
+    learning: dict = {}
+    if spans:
+        try:
+            from asr_mcp.db.manager import DatabaseManager
+            from asr_mcp.voiceprint.service import VoiceprintService
+            db = DatabaseManager(settings.db_path)
+            vp_service = VoiceprintService(settings.data_dir, db)
+            vp_service.set_voices_dir(settings.voices_dir)
+            learned = await _auto_collect(
+                vp_service, audio_path=audio_path, segments=spans,
+                user_id=user_id, source_id=source_id, log_prefix=log_prefix,
+                vad_sections=raw_vad_sections,
+            )
+            # Surfaced to the client: a learned speaker stays invisible until it
+            # is named, so the user has to be told or their next run will still
+            # read UNKNOWN for that person.
+            learning = {
+                "pending_profiles": (learned.get("pending_created") or [])
+                + (learned.get("pending_extended") or []),
+                "learning": _learning_summary(learned),
+            }
+        except Exception as e:
+            logger.warning("Auto-collect failed: %s", e)
+    return spans, learning
+
+
 def _load_known_speakers(settings, user_id: str) -> dict:
     """Load all stored voiceprints from DB for speaker matching.
 
@@ -878,35 +1021,34 @@ async def diarize_endpoint(
         return DiarizeResponse(segments=[], total_time_sec=0, error=result["error"])
 
     segments = result.get("segments", [])
-    # Not part of the response; the Silero sections belong to turn refinement.
-    result.pop("raw_vad_sections", None)
+    # The ONE uncollapsed Silero pass over this file. Kept for the boundary
+    # refinement below; popped because it is hundreds of sections, not a
+    # response payload.
+    raw_vad_sections = result.pop("raw_vad_sections", None)
 
-    try:
-        from asr_mcp.db.manager import DatabaseManager
-        from asr_mcp.voiceprint.service import VoiceprintService
-        db = DatabaseManager(settings.db_path)
-        vp_service = VoiceprintService(settings.data_dir, db)
-        vp_service.set_voices_dir(settings.voices_dir)
-        await _auto_collect(vp_service, audio_path=req.wav_path,
-                            segments=segments, user_id=user_id, source_id=None)
-    except Exception as e:
-        logger.warning("Auto-collect failed: %s", e)
+    # A diarization-only request gets the SAME refinement the transcription
+    # paths get: the turns (merged, split, exact VAD+voiceprint boundaries) are
+    # what is displayed, and the voiceprints are learned from those turns
+    # rather than from the raw segments.
+    spans, learning = await _refine_and_learn(
+        settings=settings, audio_path=req.wav_path, segments=segments,
+        known_speakers=known_speakers,
+        raw_vad_sections=raw_vad_sections,
+        audio_duration_sec=result.get("audio_duration_sec", 0.0),
+        user_id=user_id,
+        source_id=req.wav_path,
+        log_prefix="[diarize] ",
+    )
 
+    display_segments = _display_spans(spans)
     return DiarizeResponse(
-        segments=[
-            DiarizeResult(
-                start=s["start"],
-                end=s["end"],
-                speaker=s.get("speaker"),
-                uncertain=bool(s.get("uncertain")) or s.get("speaker") is None,
-                attribution_reason=s.get("attribution_reason"),
-            )
-            for s in segments
-        ],
+        segments=[DiarizeResult(**s) for s in display_segments],
         total_time_sec=result.get("total_time_sec", 0),
         total_speakers=result.get("total_speakers", 0),
         audio_duration_sec=result.get("audio_duration_sec", 0),
-        uncertain_segments=result.get("uncertain_segments", 0),
+        uncertain_segments=sum(1 for s in display_segments if s["uncertain"]),
+        pending_profiles=learning.get("pending_profiles") or [],
+        learning=learning.get("learning"),
     )
 
 
@@ -983,19 +1125,24 @@ async def diarize_upload(
             # Popped before the whole dict is streamed: raw_vad_sections is
             # hundreds of VAD sections and is consumed by turn refinement, not by
             # the client.
-            result.pop("raw_vad_sections", None)
-            try:
-                from asr_mcp.db.manager import DatabaseManager
-                from asr_mcp.voiceprint.service import VoiceprintService
-                db = DatabaseManager(settings.db_path)
-                vp_service = VoiceprintService(settings.data_dir, db)
-                vp_service.set_voices_dir(settings.voices_dir)
-                await _auto_collect(vp_service, audio_path=str(wav_path),
-                                    segments=segments, user_id=user_id,
-                                    source_id=file.filename,
-                                    log_prefix="[%s] " % file.filename)
-            except Exception as e:
-                logger.warning("Auto-collect failed: %s", e)
+            raw_vad_sections = result.pop("raw_vad_sections", None)
+
+            # Same refinement as the transcription paths (see diarize_endpoint):
+            # display the refined turns, learn the voiceprints from them.
+            spans, learning = await _refine_and_learn(
+                settings=settings, audio_path=str(wav_path), segments=segments,
+                known_speakers=known_speakers,
+                raw_vad_sections=raw_vad_sections,
+                audio_duration_sec=result.get("audio_duration_sec", 0.0),
+                user_id=user_id, source_id=file.filename,
+                log_prefix="[%s] " % file.filename,
+            )
+            result["segments"] = _display_spans(spans)
+            result["uncertain_segments"] = sum(
+                1 for s in result["segments"] if s["uncertain"]
+            )
+            result["pending_profiles"] = learning.get("pending_profiles") or []
+            result["learning"] = learning.get("learning")
 
             await _sse_put(queue, {"stage": "done", "progress": 1.0, "result": result})
         except Exception as e:
@@ -1034,7 +1181,7 @@ async def transcribe_endpoint(
     req: DiarizeRequest,
     request: Request,
     settings: Settings = Depends(get_settings),
-    _: str = Depends(verify_api_key),
+    user_id: str = Depends(get_current_user),
 ):
     from asr_mcp.core.model_state import state
     from asr_mcp.core.transcriber import transcribe_audio_sync
@@ -1050,7 +1197,6 @@ async def transcribe_endpoint(
         )
 
     diarizer = Diarizer(state, settings)
-    user_id = get_session_user(request) or "default"
     known_speakers = req.known_speakers or _load_known_speakers(settings, user_id)
     diarization = await diarizer.run(
         audio_path=req.wav_path, num_speakers=req.num_speakers,
@@ -1242,6 +1388,7 @@ async def transcribe_upload(
             # is overwritten with and attribute_items runs on; ``segments`` (set
             # A) is the fallback for when refinement produced nothing.
             pending_profiles = []
+            learning_summary = None
             learn_spans = turns or list(segments)
             if learn_spans:
                 try:
@@ -1264,27 +1411,13 @@ async def transcribe_upload(
                         (learned.get("pending_created") or [])
                         + (learned.get("pending_extended") or [])
                     )
+                    # Why a colleague did or did not become material this run.
+                    # Without it the only visible trace of a capped voiceprint
+                    # or a refused near-miss is a counter in the server log.
+                    learning_summary = _learning_summary(learned)
                 except Exception as e:
                     logger.warning("Auto-collect failed: %s", e)
-            display_segments = [
-                {
-                    "start": t["start"],
-                    "end": t["end"],
-                    "speaker": t["speaker"],
-                    "uncertain": bool(t.get("uncertain")) or t.get("speaker") is None,
-                    "attribution_reason": t.get("attribution_reason"),
-                }
-                for t in turns
-            ] if turns else [
-                {
-                    "start": s["start"],
-                    "end": s["end"],
-                    "speaker": s.get("speaker"),
-                    "uncertain": bool(s.get("uncertain")) or s.get("speaker") is None,
-                    "attribution_reason": s.get("attribution_reason"),
-                }
-                for s in segments
-            ]
+            display_segments = _display_spans(turns or segments)
             diarization["segments"] = display_segments
 
             await _sse_put(queue, {
@@ -1301,6 +1434,9 @@ async def transcribe_upload(
                 # user. They are excluded from matching, so the client must
                 # say so out loud or the next run reads the same as this one.
                 "pending_profiles": pending_profiles,
+                # Counts and reasons only; `pending_profiles` above stays the
+                # client contract and this is additive.
+                "learning": learning_summary,
             })
 
             state.unload_embedding()
@@ -1472,21 +1608,26 @@ async def list_languages(settings: Settings = Depends(get_settings)):
 async def activity_stream(
     request: Request,
     user_id: str = Depends(get_current_user),
-    _: str = Depends(verify_api_key),
 ):
     """Long-lived SSE of job start/finish transitions (replaces polling GET /active).
 
     Emits an immediate snapshot (so a page load during a running job can
     attach right away), then only when a job starts or ends.  Comment
     keep-alives every 20s keep the connection alive through proxies.
+
+    The stream is scoped to THIS user's job.  A job's metadata carries another
+    user's filename, progress and identity, so broadcasting every job to every
+    subscriber would leak them: the snapshot and every event below report only
+    a job this caller owns.
     """
     sub = job_state.subscribe_activity()
 
-    def _with_can_cancel(meta: dict) -> dict:
+    def _own_job(meta: Optional[dict]) -> Optional[dict]:
+        if not meta or meta.get("user_id") != user_id:
+            return None
         meta = dict(meta)
         meta["can_cancel"] = (
-            meta.get("user_id") == user_id
-            and meta.get("mode") == "transcribe"
+            meta.get("mode") == "transcribe"
             and meta.get("status") == "running"
         )
         return meta
@@ -1496,9 +1637,10 @@ async def activity_stream(
             # Subscribe BEFORE the snapshot: a start/finish racing this
             # connection lands in the queue instead of being lost.
             job = job_state.get_running()
+            own = _own_job(job.meta()) if job else None
             snap = {
-                "active": job is not None,
-                "job": _with_can_cancel(job.meta()) if job else None,
+                "active": own is not None,
+                "job": own,
             }
             yield f"data: {json.dumps(_safe_json(snap))}\n\n"
             while True:
@@ -1510,8 +1652,10 @@ async def activity_stream(
                 if evt is None:
                     break
                 if evt.get("active") and isinstance(evt.get("job"), dict):
+                    own = _own_job(evt["job"])
                     evt = dict(evt)
-                    evt["job"] = _with_can_cancel(evt["job"])
+                    evt["job"] = own
+                    evt["active"] = own is not None
                 yield f"data: {json.dumps(_safe_json(evt))}\n\n"
         finally:
             job_state.unsubscribe_activity(sub)
@@ -1531,31 +1675,23 @@ async def activity_stream(
 async def active_job_stream(
     request: Request,
     user_id: str = Depends(get_current_user),
-    _: str = Depends(verify_api_key),
 ):
     job = job_state.get_running()
-    if job is None:
+    if job is None or job.user_id != user_id:
         return JSONResponse(status_code=404, content={"detail": "No active job"})
 
-    owner = job.user_id == user_id
     snap, sub = job_state.attach(job)
-
-    def _scrub(evt):
-        if not owner and isinstance(evt, dict):
-            return {k: v for k, v in evt.items()
-                    if k not in ("result", "partial_text", "new_segments")}
-        return evt
 
     async def event_stream():
         for evt in snap:
-            yield f"data: {json.dumps(_safe_json(_scrub(evt)))}\n\n"
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
         if sub is None:
             return
         while True:
             evt = await sub.get()
             if evt is None:
                 break
-            yield f"data: {json.dumps(_safe_json(_scrub(evt)))}\n\n"
+            yield f"data: {json.dumps(_safe_json(evt))}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -1944,9 +2080,14 @@ async def _websocket_user(websocket: WebSocket, settings) -> Optional[str]:
     WebSockets bypass the HTTP AuthMiddleware, so this is the only gate.
     Precedence mirrors ``security.get_current_user``: session cookie (already
     decoded into ``scope["session"]`` by SessionMiddleware, which does run for
-    websocket scopes), then a DB token, then a static key.
+    websocket scopes), then a DB token, then a static key -- and the key rung
+    is ``security.resolve_api_key_user`` itself, so the two transports cannot
+    disagree about which library a key owns.
     """
-    from asr_mcp.api.security import DEFAULT_USER, is_valid_api_key, lookup_db_token
+    from asr_mcp.api.security import (
+        DEFAULT_USER,
+        resolve_api_key_user,
+    )
 
     session_user = (websocket.scope.get("session") or {}).get("user")
     if session_user:
@@ -1954,10 +2095,5 @@ async def _websocket_user(websocket: WebSocket, settings) -> Optional[str]:
 
     key = websocket.headers.get("x-api-key") or websocket.query_params.get("token")
     if key:
-        token_user = lookup_db_token(key)
-        if token_user:
-            return token_user
-        if is_valid_api_key(key, settings):
-            return DEFAULT_USER
-        return None
+        return resolve_api_key_user(key, settings)
     return DEFAULT_USER if not settings.api_keys else None

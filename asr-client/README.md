@@ -29,7 +29,7 @@ dependencies are required.
 | Drag files onto `transcribe.bat` | Transcribe; writes `<name>.txt` next to each file |
 | `transcribe.bat status` | Check server/token connectivity |
 | `transcribe.bat voiceprints` | List speakers and voiceprints |
-| `transcribe.bat voiceprint-add <name> <file> [start] [end]` | Create/refine a voiceprint from a clip |
+| `transcribe.bat voiceprint-add <name> <file> [start] [end]` | Create/refine a voiceprint from a clip (replaces this speaker's earlier snippets from the same file) |
 | `transcribe.bat voiceprint-refine <name>` | Rebuild a voiceprint from its snippets |
 | `transcribe.bat <file...> [--language <code>] [--json]` | Transcribe (flags override `.env`) |
 

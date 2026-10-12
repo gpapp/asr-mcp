@@ -17,7 +17,7 @@ from asr_mcp.diarization.clustering import (
 from asr_mcp.diarization.overlap import detect_overlaps, build_overlap_segments
 from asr_mcp.diarization.segment_ops import (
     collapse_same_speaker_segments, absorb_islands, absorb_minority_speakers,
-    eliminate_ghost_speakers,
+    eliminate_ghost_speakers, speaker_summary,
 )
 from asr_mcp.speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
 from asr_mcp.speaker.boundary import BoundaryStats, refine_gap
@@ -251,12 +251,12 @@ class Diarizer:
 
         total_time = time.time() - start_time
 
+        speakers_in_segments, profiles = speaker_summary(merged_segments, profiles)
+
         return {
             "segments": merged_segments,
             "profiles": profiles,
-            "total_speakers": len({
-                s.get("speaker") for s in merged_segments if s.get("speaker")
-            }),
+            "total_speakers": len(speakers_in_segments),
             "uncertain_segments": sum(
                 1 for s in merged_segments if s.get("uncertain")
             ),
@@ -651,6 +651,7 @@ class Diarizer:
         # keeps it to one ONNX batch per boundary instead of one per section.
         # Only sections the engine would actually consider are embedded: the
         # whole raw-VAD list of a long recording is much larger.
+        cfg = self._load_cfg()
         br_cfg = (cfg.get("boundary_refine") or {}) if isinstance(cfg, dict) else {}
         lookaround = float(br_cfg.get("lookaround_sec", 0.5))
         min_section = float(br_cfg.get("min_section_sec", 0.3))

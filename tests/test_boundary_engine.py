@@ -24,6 +24,7 @@ change point; the real-recording judgement is the P0 A/B measurement, which has
 not been run.
 """
 
+import asyncio
 import sys
 import types
 
@@ -1077,3 +1078,85 @@ def test_speaker_vad_module_imports_without_torch():
     assert "torch" not in getattr(module, "__dict__", {})
     params = inspect.signature(module.split_at_energy_dips).parameters
     assert "abs_floor_ratio" in params
+
+
+# --------------------------------------------------------------------------- #
+# step 13 actually runs: no undefined names left in the thin caller             #
+# --------------------------------------------------------------------------- #
+
+
+def _diarizer_for_step13(sections, vectors):
+    """A ``Diarizer`` with only what ``_refine_turn_boundaries_exact`` touches.
+
+    Built with ``__new__`` on purpose: ``run()`` needs VAD, embeddings and
+    sklearn, and none of that is what this test is about.
+    """
+    pytest.importorskip("torch", reason="pipeline imports torch at module scope")
+    pytest.importorskip("sklearn", reason="pipeline imports sklearn at module scope")
+    from asr_mcp.diarization.pipeline import Diarizer
+
+    d = Diarizer.__new__(Diarizer)
+    d._state = types.SimpleNamespace(embedding_session=object())
+    d._cfg = None
+    d._raw_vad_sections = list(sections)
+    d._get_speaker_ref = lambda name, *a, **kw: _unit(vectors.get(name, [1.0, 0.0]))
+    d._embed_boundary_sections = lambda secs, *a, **kw: {
+        (s["start"], s["end"]): _unit(vectors.get("section", [0.0, 1.0]))
+        for s in secs
+    }
+    return d
+
+
+def test_step_13_runs_end_to_end_instead_of_swallowing_a_name_error():
+    """``cfg`` was read in ``_refine_turn_boundaries_exact`` without ever being
+    bound -- a leftover of the P1 refactor, which made every call raise
+    ``NameError`` and the caller log "Exact turn boundary refinement failed"
+    while the pipeline quietly carried on with UNREFINED boundaries. A caller
+    that swallows the exception is only safe if something else notices, so this
+    test drives the method itself.
+
+    Needs torch+sklearn at import time (``pipeline``'s module scope), so it is a
+    container-only test; the engine it delegates to is covered above everywhere.
+    """
+    # A speech section, a gap, and a differently-voiced one after it: the raw
+    # VAD that the engine is allowed to consider for the cut.
+    sections = [{"start": 0.0, "end": 2.0}, {"start": 2.6, "end": 6.0}]
+    d = _diarizer_for_step13(
+        sections, {"Speaker 1": [1.0, 0.0], "Speaker 2": [0.0, 1.0]})
+
+    buf = _silence(8.0)
+    _tone(buf, 0.0, 2.0, 300.0, 0.3)
+    _tone(buf, 2.6, 6.0, 900.0, 0.3)
+    segments = [
+        {"speaker": "Speaker 1", "start": 0.0, "end": 2.0},
+        {"speaker": "Speaker 2", "start": 2.6, "end": 6.0},
+    ]
+
+    out = asyncio.run(d._refine_turn_boundaries_exact(
+        segments, buf, SR, profiles={}, known_speakers={}))
+
+    assert len(out) == 2, "a refiner that drops segments is worse than none"
+    assert out[0]["speaker"] == "Speaker 1" and out[1]["speaker"] == "Speaker 2"
+    # Lesson 17: the cut is ONE number both sides move to.
+    assert out[0]["end"] == pytest.approx(out[1]["start"], abs=1e-6)
+    assert 2.0 <= out[0]["end"] <= 2.6
+    assert out[0]["start"] == pytest.approx(0.0, abs=1e-6)
+    assert out[1]["end"] == pytest.approx(6.0, abs=1e-6)
+    # The input is copied, not mutated in place.
+    assert segments[0]["end"] == 2.0
+
+
+def test_step_13_is_a_no_op_without_raw_sections_or_an_embedding_session():
+    """Both early exits, so a caller cannot mistake "nothing to refine" for
+    "refinement ran and decided nothing"."""
+    d = _diarizer_for_step13([], {"Speaker 1": [1.0, 0.0]})
+    segments = [{"speaker": "Speaker 1", "start": 0.0, "end": 2.0},
+                {"speaker": "Speaker 2", "start": 2.6, "end": 6.0}]
+    buf = _silence(8.0)
+    assert asyncio.run(d._refine_turn_boundaries_exact(
+        segments, buf, SR, profiles={}, known_speakers={})) == segments
+
+    d._raw_vad_sections = [{"start": 0.0, "end": 2.0}, {"start": 2.6, "end": 6.0}]
+    d._state = types.SimpleNamespace(embedding_session=None)
+    assert asyncio.run(d._refine_turn_boundaries_exact(
+        segments, buf, SR, profiles={}, known_speakers={})) == segments

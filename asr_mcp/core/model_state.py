@@ -300,15 +300,35 @@ def run_embedding(input_feed: dict) -> list[np.ndarray]:
                                        run_options=GPU_SHRINK_RUN_OPTIONS)
 
 
+#: Substrings that mean "the GPU could not give this run the memory it asked
+#: for". Every backend is gated on this one predicate (lesson 5), so a new
+#: runtime has to be added HERE rather than at each call site.
+_GPU_OOM_MARKERS = (
+    # ONNX Runtime / CUDA allocator
+    "failed to allocate memory",
+    "out of memory",
+    "out_of_memory",
+    "available memory of",
+    "smaller than requested bytes",
+    "cuda_error_out_of_memory",
+    "cudaerr_oom",
+    # The driver's own spelling of the same thing, which CTranslate2 surfaces.
+    "cudaerrormemoryallocation",
+    # cuBLAS, which fails at cublasCreate() -- i.e. before a single weight of
+    # ours is placed -- when the card is too full to hold its own workspace.
+    # Reported as CUBLAS_STATUS_ALLOC_FAILED, which contains none of the
+    # allocator wording above. Matched loosely on purpose: ANY cuBLAS failure
+    # means the GPU path is unusable for this run, and the recovery is the same
+    # (rebuild on CPU), so a broad match costs a slower turn and never a wrong
+    # answer. Being unrecognised here is what turned a recoverable condition
+    # into a dead transcription.
+    "cublas",
+)
+
+
 def is_gpu_oom(err: BaseException) -> bool:
     s = str(err).lower()
-    return (
-        "failed to allocate memory" in s
-        or "out of memory" in s
-        or "out_of_memory" in s
-        or "available memory of" in s
-        or "smaller than requested bytes" in s
-    )
+    return any(marker in s for marker in _GPU_OOM_MARKERS)
 
 
 def log_gpu_memory(tag: str) -> None:

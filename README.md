@@ -11,10 +11,33 @@ GPU-accelerated ASR MCP server with speaker diarization, voiceprint recognition,
 - **Auto Voiceprint Collection**: Snippets auto-collected from diarization for registered speakers.
 - **Form-Based Auth**: Session-based login with htpasswd password files.
 - **API Tokens**: One token per user, generated from the web UI; token-authenticated API access without a session.
+- **Self-Service Registration**: Optional email sign-up with a confirmation link
+  (`TRANSCRIBE_REGISTRATION_ENABLED` + SMTP) and Google sign-in
+  (`TRANSCRIBE_GOOGLE_CLIENT_ID`/`_SECRET`). Both off by default; htpasswd keeps
+  working either way.
+- **Per-User Isolation**: Speakers, voiceprints, snippets, transcripts and jobs are
+  scoped to the signed-in identity. One API key has one voiceprint library on both
+  the HTTP and WebSocket transports, and you can only see and cancel your own jobs.
+- **Admin Accounts**: One deployment-wide administrator (`TRANSCRIBE_ADMIN_USER`)
+  can list accounts, suspend them, delete them (optionally with their data) and
+  stop the server. Empty means nobody.
 - **Windows Client**: Drop-file transcription client (`asr-client/`) with live progress and `<name>.txt` output.
 - **Reverse Proxy Support**: Configurable URL prefix (`TRANSCRIBE_PREFIX`) for nginx/Caddy.
 - **Multi-Format Input**: Accepts mp3, mp4, mkv, flac, ogg, m4a — auto-converts via ffmpeg.
 - **Compressed Snippets**: Voiceprint snippets stored as FLAC for efficient storage.
+  Re-processing a recording REPLACES that recording's snippets for the speaker
+  (matched by the filename hash, so moved spans and a new extension still match),
+  keeping every clip from every other recording — a profile is never fitted to two
+  copies of one take. `?replace_source=false` keeps the older take.
+- **Voiceprint Integrity**: A startup audit checks the snippet store and repairs the
+  findings that have one correct answer — dead snippet rows are deleted and the
+  affected profiles are rebuilt from their surviving audio. Merging similar profiles
+  is left to you (`GET /api/voiceprint/integrity`, `POST .../integrity/cleanup`).
+- **Consolidation & Review**: A per-speaker (or whole-library) pass re-fits each
+  profile from all its snippets, finds the snippets whose voice does not belong
+  (intruders, crossed channels, mis-attributed spans), and marks them for review with
+  the distance that convicted them. Flagged snippets are already excluded from the
+  profile; nothing is deleted until you remove them yourself.
 - **Web Dashboard**: Single-page app at `/gui` with Transcribe, Voiceprints, History and Settings tabs.
 
 ## Quick Start
@@ -55,6 +78,18 @@ All settings use the `TRANSCRIBE_` env prefix. Key variables:
 | `TRANSCRIBE_ASR_MODEL` | `cohere` | ASR backend: `cohere` \| `qwen3-asr` \| `whisper` |
 | `TRANSCRIBE_WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model name/repo |
 | `TRANSCRIBE_WHISPER_COMPUTE_TYPE` | `auto` | CT2 compute type; `auto` = int8_float16 on CUDA / int8 on CPU |
+| `TRANSCRIBE_API_KEYS` | `[]` | JSON list of static API keys; each maps to the synthetic user `user_<sha256(key)[:16]>`, never `default` |
+| `TRANSCRIBE_REGISTRATION_ENABLED` | `false` | Offer email/Google sign-up on the login page; also forces auth (open mode is refused while on) |
+| `TRANSCRIBE_GOOGLE_CLIENT_ID` | `""` | Google OAuth client id (both halves required, or `/api/auth/google/start` 404s) |
+| `TRANSCRIBE_GOOGLE_CLIENT_SECRET` | `""` | Google OAuth client secret |
+| `TRANSCRIBE_EXTERNAL_URL` | `""` | Public base URL for the confirmation mail and Google `redirect_uri`; defaults to the request's own URL. May include the prefix or not — both work |
+| `TRANSCRIBE_SMTP_HOST` | `""` | SMTP host — email sign-up needs this **and** `TRANSCRIBE_SMTP_FROM` |
+| `TRANSCRIBE_SMTP_PORT` | `587` | SMTP port |
+| `TRANSCRIBE_SMTP_USER` | `""` | SMTP user (login is skipped when empty) |
+| `TRANSCRIBE_SMTP_PASSWORD` | `""` | SMTP password |
+| `TRANSCRIBE_SMTP_FROM` | `""` | Envelope sender for the confirmation mail |
+| `TRANSCRIBE_SMTP_STARTTLS` | `true` | Issue STARTTLS before the login |
+| `TRANSCRIBE_ADMIN_USER` | `""` | The one account allowed to reach `/api/admin/*` and `POST /shutdown`; empty means **nobody** |
 
 ## Windows Client (`asr-client/`)
 
@@ -81,7 +116,7 @@ code/dependency cross-links — CI enforces stdlib-only imports.
 | Drag files onto `transcribe.bat` | Transcribe with live progress; writes `<name>.txt` next to each file |
 | `transcribe.bat status` | Check server/token connectivity |
 | `transcribe.bat voiceprints` | List speakers and voiceprints |
-| `transcribe.bat voiceprint-add <name> <file> [start] [end]` | Create/refine a voiceprint from a clip |
+| `transcribe.bat voiceprint-add <name> <file> [start] [end]` | Create/refine a voiceprint from a clip (replaces this speaker's earlier snippets from the same file) |
 | `transcribe.bat voiceprint-refine <name>` | Rebuild a voiceprint from its snippets |
 | `transcribe.bat <file...> [--language <code>]` | Transcribe (language overrides `.env LANGUAGE`) |
 
@@ -116,15 +151,31 @@ by the client ARE kept (they feed refinement).
 | `/api/voiceprint/speakers` | GET | Session | List speakers (web UI) |
 | `/api/voiceprint/snippets/{speaker}` | GET | Session | List snippets |
 | `/api/voiceprint/upload` | POST | Session | Register voiceprint from upload |
-| `/api/voiceprint/speakers/{name}/upload` | POST | Session/API key | Add snippet (optional `?start_sec=&end_sec=`) |
+| `/api/voiceprint/speakers/{name}/upload` | POST | Session/API key | Add snippet from a file (optional `?start_sec=&end_sec=`; `?replace_source=false` keeps earlier snippets from the same file — the default **replaces** them, see below) |
 | `/api/voiceprint/speakers/{name}/refine` | POST | Session/API key | Rebuild a voiceprint from its snippets |
 | `/api/voiceprint/merge` | POST | Session | Merge speakers |
 | `/api/voiceprint/rename` | POST | Session | Rename speaker |
 | `/api/voiceprint/rescan` | POST | Session | Rescan voices directory |
+| `/api/voiceprint/integrity` | GET | Session | Read-only store integrity audit (8 findings) |
+| `/api/voiceprint/integrity/cleanup` | POST | Session | Repair the findings that have one correct answer (`dry_run=True` by default) |
+| `/api/voiceprint/consolidate/stream` | POST | Session | Flag the outlier snippets of one speaker (`?speaker_name=`, omit = whole library) and re-fit from the kept ones (SSE progress) |
+| `/api/voiceprint/flagged` | GET | Session | Snippets flagged for review, ranked by distance (`?speaker_name=`) — read-only |
+| `/api/voiceprint/flagged/{snippet_id}/keep` | POST | Session | Withdraw one flag; re-run consolidation to fold the snippet back in |
+| `/api/voiceprint/flagged/remove` | POST | Session | Delete every flagged snippet in ONE pass, then re-refine each touched speaker once (`dry_run=True` by default) |
 | `/api/token` | GET/POST | Session/API key | Client API token status / generate (one per user) |
-| `/api/auth/login` | POST | No | Login (returns JSON) |
-| `/api/auth/logout` | POST | No | Logout |
+| `/api/auth/methods` | GET | No | Which sign-up methods this deployment offers — `{email, google, password_hint}` |
+| `/api/auth/login` | POST | No | Login (returns JSON; 403 with a reason for an unverified or disabled account) |
+| `/api/auth/login/session` | POST | No | Login from the form (302) |
+| `/api/auth/logout` | POST/GET | No | Logout |
+| `/api/auth/register` | POST | No | Email sign-up — 201 + a confirmation mail; never signs anybody in |
+| `/api/auth/verify` | GET | No | Consume the single-use email link (302; bad/spent/empty all answer alike) |
+| `/api/auth/google/start` | GET | No | Begin Google sign-in (302; 404 when unconfigured) |
+| `/api/auth/google/callback` | GET | No | Finish Google sign-in |
 | `/api/user` | GET | No | Current user info |
+| `/api/admin/users` | GET | Admin | Account table — never a hash or a verification token |
+| `/api/admin/users/{id}/disable` | POST | Admin | Suspend a registrable account |
+| `/api/admin/users/{id}/enable` | POST | Admin | Lift a suspension |
+| `/api/admin/users/{id}` | DELETE | Admin | Delete the account; `?purge=true` also drops its rows and `voices/<id>/` |
 | `/api/mcp/tools` | GET | No | List MCP tools |
 | `/api/mcp/resources` | GET | No | List MCP resources |
 | `/api/mcp/call` | POST | No | Call MCP tool |
@@ -147,16 +198,64 @@ reloads a fresh arena before falling back to CPU.
 
 ### Authentication Flow
 
-1. Browser requests a protected page
-2. Auth middleware checks session cookie
-3. If not authenticated → redirect to `/login`
-4. User submits credentials → `/api/auth/login` verifies against htpasswd file
-5. Session cookie set → redirect to `/gui`
+Every request resolves an identity in a fixed order (`get_current_user`):
 
-API clients (Windows client, scripts) send `X-API-Key: <token>` instead of a
-session. Valid tokens are stored as SHA-256 hashes in the `api_tokens` table
-(one per user, plaintext shown once); token requests return 401 JSON rather
-than a login redirect.
+1. **Session cookie** — written by `/api/auth/login`, which checks the credential
+   store first (as typed *and* lowercased) and the htpasswd file second, so the
+   form and `Authorization: Basic` cannot disagree about who can log in.
+2. **DB token** in the `X-API-Key` header (sha256-hashed in `api_tokens`).
+3. **Static key** from `TRANSCRIBE_API_KEYS` → the synthetic user
+   `user_<sha256(key)[:16]>`. **Never `default`** — that is what keeps a shared
+   key's voiceprints out of the default user's library. The WebSocket endpoint
+   uses the same resolver, so one key has one library on both transports.
+4. **401.** An unresolvable key refuses; it never falls back to a shared identity.
+
+With `TRANSCRIBE_API_KEYS` empty, unauthenticated callers would otherwise all
+become `default` and share one library — so once
+`TRANSCRIBE_REGISTRATION_ENABLED` is on, open mode is refused (401) instead.
+
+Everything downstream — speakers, voiceprints, snippets, transcripts and the
+snippet audio under `voices/<user_id>/` — is scoped to that identity, and
+`/api/asr/activity/stream` only shows *your* running job. Another user's job is
+a 404, and the Cancel button is only offered for a job you own.
+
+### Registration (optional, off by default)
+
+Set `TRANSCRIBE_REGISTRATION_ENABLED=true` plus **either** an SMTP server (email
+sign-up) **or** a Google OAuth pair (Google sign-in); the login page only renders
+the methods that could actually work.
+
+- **Email** (`TRANSCRIBE_SMTP_HOST` + `TRANSCRIBE_SMTP_FROM`): sign-up is
+  throttled per client (10 attempts / 600 s, keyed on the rightmost
+  `X-Forwarded-For` hop), creates an **unverified** account, mails a single-use
+  link, and **never signs anybody in**. Until the link is opened, login answers
+  403 with "this account has not been confirmed yet". A mail that cannot be sent
+  deletes the row (503) — no half-made accounts.
+- **Google**: `/api/auth/google/start` is gated on the client id/secret being
+  configured, *not* on the registration flag, so turning registration off does
+  not sign out existing users. A first sign-up's account is named after the
+  normalised email address Google verified; identity is resolved by Google
+  **subject**, never by address.
+
+There is **no password-reset flow** — an admin re-issues a password or deletes
+the account.
+
+> **If a confirmation link 404s**, the token is almost certainly fine: check
+> `TRANSCRIBE_EXTERNAL_URL`. Set it to the URL you can actually paste into a
+> browser (`https://host/asr-mcp`). Including or omitting `TRANSCRIBE_PREFIX`
+> there both work — the prefix is added only when it is missing — but a base
+> that already has it must not get it twice.
+
+### Admin (optional, off by default)
+
+Set `TRANSCRIBE_ADMIN_USER` to the one account allowed to reach the Settings
+tab's **Accounts** card, `/api/admin/*` and `POST /shutdown`. Empty means
+**nobody**.
+
+A delete **keeps** the user's voiceprints, snippets, transcripts and audio and
+reports the counts; pass `?purge=true` to drop those rows and
+`rmtree voices/<user_id>/` as well. Deleting the account you are signed in as,
+or the configured admin, is refused.
 
 ### Uncertain Speakers
 
@@ -207,7 +306,7 @@ A speaker who has no voiceprint yet is learned automatically — but as a
   profile has no identity, so it can never win a nearest-neighbour vote. That
   person's speech therefore still reads `UNKNOWN` (with the text kept) until
   you name them.
-- Name them in the web UI: **Voiceprints → Unnamed speakers**, type a name and
+- Name them in the web UI: **Voiceprints → Unnamed**, type a name and
   press *Save name*. That is the only action that makes them recognisable, and
   it also moves their snippets into a normal voiceprint.
 - Confirming refuses a name already in use, so it cannot overwrite a real
@@ -226,6 +325,12 @@ A speaker who has no voiceprint yet is learned automatically — but as a
   profile would then be used as a reference for cutting later boundaries.
 - Snippets are cut from the **same turns the transcript is attributed on** and
   trimmed to whole VAD sections, so a boundary can never land mid-word.
+- **Diarizing without transcribing does the same refinement.** The
+  *Diarization only* mode (and `POST /api/asr/diarize[/upload]`) returns those
+  refined turn boundaries, not the raw diarization segments, and learns
+  voiceprints from them — so a file you only diarized improves your voiceprints
+  exactly like a file you transcribed, and reports the pending profiles it
+  created.
 
 #### "Is this someone I already added?"
 
@@ -235,6 +340,18 @@ instead of making you invent a second name for the same person — two profiles
 for one person would split their speech between two names in every transcript.
 Merging moves the snippets into the existing profile and rebuilds it. Nothing
 is ever merged automatically; the flag is a suggestion.
+
+#### "Who is this?" — listen to the unnamed profiles
+
+The Voiceprints pane has two sub-tabs: **Known speakers** and **Unnamed**
+(the second carries a count, because an unnamed profile is otherwise easy to
+overlook). Every unnamed profile folds out into its own snippet list with the
+same play button, filename, source and *Remove* control a named speaker has —
+the audio is the only evidence of who the voice is, so it has to be playable
+**there**, not summarised as a row of counts. Each card also offers *Consolidate*
+(the same outlier pass the known profiles get), *Save name*, *Merge into …* for a
+plausible match, and *Discard*. Naming or merging moves the profile to the Known
+tab, which the UI switches to for you.
 
 ### Diarization Pipeline
 
@@ -292,6 +409,74 @@ turn carries its pause as silence so the declared span equals the audio actually
 sent. All three are reported back to the client. See
 **docs/lessons/live-client-design.md** (lesson 42).
 
+### Voiceprint integrity
+
+The store is audited at every startup (`asr_mcp/voiceprint/audit.py`, read-only, 8
+findings) and logged. Findings that have exactly one correct answer are then
+repaired automatically; anything that would need a human decision is only reported.
+
+**Automatic.** Three findings — `snippets_without_profile`, `profiles_without_snippets`
+and `missing_snippet_files` — queue a from-scratch rebuild
+(`voiceprint/rebuild.py` → `<data_dir>/voiceprint_rebuild_queue.json`). The server's
+idle tick drains the queue when nothing else is running, loading only the VAD and
+embedding models (never the ASR backend), and for each flagged speaker:
+
+1. **purge** snippet rows whose audio no longer exists — rows only, never a file that
+   resolves, and never a file that merely fails to load;
+2. **drop** the derived `voiceprints` row;
+3. **rebuild** the embedding from the surviving FLAC snippets, re-applying the
+   profile's `pending` and `purity` flags.
+
+This cannot lose material: the snippets and their audio are the source of truth and are
+never touched — only a derived row is recomputed. It is also self-healing: an
+interrupted rebuild leaves a speaker with snippets but no profile, which is itself a
+rebuild target. The other five findings (`near_duplicate_profiles`,
+`name_collisions`, `duplicate_snippet_content`, `orphan_snippet_files`,
+`stale_speech_totals`) are left alone, because merging profiles is your call.
+
+**Manual.** `GET /api/voiceprint/integrity` runs the same audit for the signed-in
+user; `POST /api/voiceprint/integrity/cleanup` fixes byte-identical duplicate
+snippets and the audit's dead-row list, then re-refines each affected speaker once.
+It is a **dry run unless you pass `dry_run: false`** — check the plan first.
+
+### Consolidation: finding snippets that are not this speaker
+
+A profile is the weighted average of its snippets' embeddings, and a snippet that
+belongs to somebody else (a bad diarization turn, a crossed channel, a
+mis-attributed span) drags that average toward itself — quietly making the profile
+worse for every later recording. **Consolidation** checks that, per speaker or
+across the whole library, from the Voiceprints tab (*Consolidate* on a speaker card,
+*Consolidate All* in the toolbar).
+
+Each pass embeds every snippet once, scores the snippets against a robust centre of
+the profile, and marks the outliers for review. The report carries the mean
+intra-profile distance **before and after**, so the effect of the re-fit is visible
+rather than asserted. A snippet is only accused when it exceeds *both* a robust
+cut (`median + 6·MAD·1.4826`) **and** an absolute floor of `0.35` — the same
+distance the naming gate uses, because "is this the same person" is the same
+question. The pass is deliberately conservative: at most 20% of a speaker's
+snippets are flagged, a profile of fewer than 3 is never cut, and the two failures
+are asymmetric — under-flagging just means running it again, over-flagging destroys
+good audio on one bad run.
+
+**Flagged snippets are excluded from the profile immediately; nothing is deleted.**
+A flag is an accusation, so it arrives with its evidence: the score, the reason, and
+a play button for the audio. From the **Flagged snippets** card you can
+
+- **Keep** one — the mark is withdrawn; re-run consolidation to fold the audio back
+  into the profile;
+- **Remove** one — a confirm dialog, then the snippet and its audio are gone;
+- **Remove all flagged** — the UI always shows you the dry-run plan (count and
+  seconds) first and asks again before deleting.
+
+Re-running consolidation also clears marks it no longer makes, so a profile that
+has been fixed stops being reported. If everything would be flagged, nothing is
+re-fitted — an unapproved set is worse than the profile you already have.
+
+A whole-library run over many speakers takes real GPU time (roughly 25 min per 219
+snippets on a GTX 1650) and the progress is streamed, so it is safe to start and
+walk away.
+
 ## Project Structure
 
 ```
@@ -307,7 +492,9 @@ asr-mcp/
 │   │   ├── token_router.py    # GET/POST /token — client API token status + generation
 │   │   ├── mcp_router.py      # MCP tools + resources
 │   │   ├── schemas.py         # Pydantic request/response models
-│   │   ├── security.py        # API key + DB token auth + path validation
+│   │   ├── security.py        # API key + DB token auth, admin gate, path validation
+│   │   ├── admin_router.py    # /admin/users list + disable/enable/delete (require_admin)
+│   │   ├── auth_router.py     # login/logout/register/verify + Google sign-in
 │   │   ├── auth.py            # htpasswd + session auth (token header bypass)
 │   │   ├── exceptions.py      # Custom exceptions + handlers
 │   │   └── middleware.py      # Request logging, CORS
@@ -336,6 +523,8 @@ asr-mcp/
 │   │   └── service.py         # SpeakerService (SQLite-backed)
 │   ├── voiceprint/
 │   │   ├── service.py         # VoiceprintService (snippet CRUD, auto-collect, refine)
+│   │   ├── audit.py           # Read-only integrity audit
+│   │   ├── rebuild.py         # Automatic from-scratch profile rebuild + queue
 │   │   └── utils.py           # Audio load/convert (ffmpeg), FLAC snippets
 │   ├── db/
 │   │   ├── models.py          # SQLAlchemy: voiceprints, snippets, sessions, transcripts, api_tokens
@@ -358,6 +547,8 @@ asr-mcp/
 │       ├── login.html          # Login form
 │       └── app.html            # Unified SPA (Transcribe / Voiceprints / History / Settings)
 ├── tests/                    # Pure-python unit tests (pytest, no GPU required)
+│                            # test_voiceprint_consolidation.py = outlier snippets (load by path)
+│                            # test_voiceprint_panes.py = the Voiceprints tab's two sub-tabs
 ├── asr-client/
 │   ├── transcribe_client.py    # Stdlib Windows client: SSE progress, <name>.txt, voiceprints
 │   ├── transcribe.bat          # Drop-target wrapper: bootstraps .env + private .venv

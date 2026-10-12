@@ -50,6 +50,8 @@ USAGE = """Usage:
   status                                    Check server/token connectivity
   voiceprints                               List speakers and voiceprints
   voiceprint-add <name> <file> [start] [end]   Create/refine a voiceprint from audio
+                                             (replaces the speaker's earlier
+                                              snippets from this same file)
   voiceprint-refine <name>                  Rebuild a voiceprint from its snippets
 
 Video containers (.mp4/.mkv/.webm/...) and large files are converted to 16 kHz mono
@@ -797,6 +799,12 @@ def cmd_voiceprint_add(name, file_path: Path, start, end):
     if status != 200 or data.get("error"):
         raise ClientError(f"Snippet upload failed: {data.get('error') or data}")
     print(f"Added snippet: {data.get('duration_sec', '?')}s ({data.get('file_path', '')})")
+    # The server replaces this speaker's earlier snippets from the SAME file
+    # (one file, one contribution) rather than stacking a second copy of one
+    # recording onto the profile. Report it -- the removed audio is gone.
+    if data.get("replaced_snippets"):
+        print(f"Replaced {data['replaced_snippets']} earlier snippet(s) "
+              f"from {file_path.name}")
 
     status, data = request_json(
         "POST", f"{base}/api/voiceprint/speakers/{quoted}/refine",

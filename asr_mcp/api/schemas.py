@@ -31,6 +31,14 @@ class DiarizeResponse(BaseModel):
     audio_duration_sec: float = 0.0
     uncertain_segments: int = 0
     error: Optional[str] = None
+    # Speakers learned from this file but not yet named by the user. They are
+    # excluded from matching, so the client must say so out loud or the next
+    # run reads the same as this one. A diarization-only run learns too: it
+    # refines the turn boundaries and the voiceprints from the same boundary
+    # set the transcription path uses, so it must report it the same way.
+    pending_profiles: list[dict] = []
+    # Counts and reasons only (see asr_router._learning_summary); additive.
+    learning: Optional[dict] = None
 
 
 class TranscribePathsRequest(BaseModel):
@@ -144,6 +152,19 @@ class LiveSessionSave(BaseModel):
     sidecar: Optional[dict] = None
 
 
+class RegisterRequest(BaseModel):
+    """The three fields the email signup form posts.
+
+    Every field defaults to empty rather than being required, so a malformed
+    request reaches ``CredentialStore.create`` and is refused there by the same
+    validators that enforce the policy on every other path. Requiring them
+    here instead would be a second, weaker copy of those rules.
+    """
+    username: str = ""
+    email: str = ""
+    password: str = ""
+
+
 class SpeakerRegisterRequest(BaseModel):
     name: str
     wav_path: Optional[str] = None
@@ -197,6 +218,11 @@ class SpeakerSnippetInfo(BaseModel):
     start_sec: Optional[float] = None
     end_sec: Optional[float] = None
     created_at: Optional[str] = None
+    #: Marked by the outlier pass (consolidation) as probably not this person.
+    #: Nothing is deleted because of it -- see POST /flagged/remove.
+    review_flag: bool = False
+    review_score: Optional[float] = None
+    review_reason: Optional[str] = None
 
 
 class VoiceprintSpeakerInfo(BaseModel):
@@ -280,6 +306,73 @@ class VoiceprintSnippetListResponse(BaseModel):
     speaker_name: str
     snippets: list[SpeakerSnippetInfo]
     count: int
+
+
+class IntegrityCleanupRequest(BaseModel):
+    """Which audit findings to repair, and whether to actually do it.
+
+    ``dry_run`` defaults to True, and so does every other switch here being
+    off by default in spirit: this endpoint deletes audio, so the first call
+    has to be a call that changes nothing.
+
+    Only the findings with one provably correct answer are offered. Profile
+    duplicates and name collisions are NOT selectable -- see
+    ``VoiceprintService.cleanup_integrity`` for why merging them is the user's
+    decision.
+    """
+
+    dry_run: bool = True
+    #: Delete the higher-id copy of every byte-identical snippet pair, then
+    #: re-refine each affected speaker once over what remains.
+    duplicates: bool = True
+    #: Delete the snippet rows whose audio is not on disk, then re-refine each
+    #: affected speaker once over what remains. Rows only -- no file that
+    #: resolves is ever unlinked, because a dead row's file is already gone.
+    dead_snippets: bool = True
+    #: Recompute ``total_speech_sec`` from the snippet durations.
+    stale_totals: bool = True
+
+
+class ConsolidationRequest(BaseModel):
+    """Run the outlier pass over one speaker, or over the whole library.
+
+    ``speaker_name`` empty means every profile the user owns. The pass only
+    MARKS snippets; it never removes audio.
+    """
+
+    speaker_name: Optional[str] = None
+
+
+class FlaggedSnippetInfo(BaseModel):
+    """One snippet marked for review, with the evidence against it."""
+
+    id: int
+    speaker_name: str
+    file_path: str
+    duration_sec: float = 0.0
+    source_audio: Optional[str] = None
+    start_sec: Optional[float] = None
+    end_sec: Optional[float] = None
+    #: Distance to the speaker's centre. Advisory: the cut that produced it is
+    #: in thresholds.json -> learning.consolidation and is not calibrated.
+    review_score: Optional[float] = None
+    review_reason: Optional[str] = None
+
+
+class FlaggedSnippetListResponse(BaseModel):
+    snippets: list[FlaggedSnippetInfo] = []
+    count: int = 0
+
+
+class FlaggedRemoveRequest(BaseModel):
+    """Delete the snippets marked for review.
+
+    ``dry_run`` defaults to True: this endpoint unlinks audio, so the first
+    call has to be a call that changes nothing.
+    """
+
+    dry_run: bool = True
+    speaker_name: Optional[str] = None
 
 
 class RescanResponse(BaseModel):

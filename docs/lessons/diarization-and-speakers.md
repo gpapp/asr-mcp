@@ -447,6 +447,32 @@ Three rules this shape depends on:
   profile could be passed as the source and a colleague's audio moved into
   someone else's profile.
 
+### The user has to be able to LISTEN, not just to count
+
+A pending profile is the one entry whose name means nothing, so the only way to
+resolve it is to hear it. Parked in a card above the known speakers, it offered
+a name and nothing else: no audio, no player, no way to judge whether the
+snippets were even one person before naming them. The Voiceprints pane now has
+**two sub-tabs** — *Known speakers* and *Unnamed* — and an unnamed profile folds
+out into the same snippet list a named one has, with the same
+`/speakers/{name}/snippets` fetch, the same play button and the same remove
+control.
+
+Two rules that came out of it:
+
+- **The count has to be on the tab.** A hidden card with no affordance is how
+  seven profiles sat unnoticed in the live store. The *Unnamed* label carries
+  the number, so the thing that needs a decision advertises itself.
+- **Do not give an unnamed profile a rename box alone.** Naming, merging and
+  discarding are identity decisions, and only an unnamed profile has the "this
+  is ___" input — a named profile's action row has Rename/Consolidate/Delete
+  instead. Both are deliberate; neither is a subset of the other.
+
+The sub-tabs share `.pill-tab` with the header nav rather than getting their
+own pill (lesson 21: a private second copy of a primitive drifts), and naming or
+merging a profile switches to the *Known* tab, because the profile just moved
+there.
+
 ## 40. ONE boundary engine decides every cut
 
 Until now the pipeline placed a boundary in **three different ways** and the
@@ -630,3 +656,291 @@ A deliberate consequence of using turns: a cluster whose segments all fall withi
 `turn_merge_gap_sec` arrives as a single span, so it is reported
 `unverified:too_few_segments` and nothing is learned. Previously it would have
 been learned from many short segments.
+
+## 43. Naming reads a DISTANCE, learning reads a CONFIDENCE
+
+### The gap
+
+Two gates decide the same voiceprint match and they do not read the same
+quantity:
+
+- **Naming** — `diarization/clustering.py` step 9 — accepts when
+  `best_dist <= matching.accept_threshold` (**0.35**), a cosine distance.
+- **Learning** — `speaker/uncertainty.py::learning_refusal_reason` — refuses
+  when `speaker_confidence < uncertainty.min_speaker_confidence` (**0.35**), a
+  confidence.
+
+`speaker/matcher.py` is what makes these two numbers look interchangeable:
+
+```python
+conf_max_dist = norm_cfg.get("confidence_max_distance", 0.5)
+confidence = max(0.0, 1.0 - (total / conf_max_dist)) if conf_max_dist else 0.5
+```
+
+With `confidence_max_distance = 0.5` that is `1 - 2 * distance`, so a match at
+distance 0.33 has confidence 0.34. The same **0.35** appears in both places and
+they are **not** the same gate: naming reaches distance 0.35, learning stops at
+distance 0.325.
+
+### Why it is kept
+
+A match in the 0.325–0.35 band is **named in the transcript and refused for
+learning**. That looks like a contradiction and is not. Naming asserts an
+identity for display, and a transcript that says "Test Person Two" when the
+match is marginal is still more useful than `UNKNOWN` — the user can see the
+name and overrule it. Learning decides what audio becomes a **permanent
+reference** that will cut every later recording's boundaries, and that mistake
+compounds: a bad snippet poisons the boundary decisions of every subsequent run
+(lesson 41). So the more expensive error is the one learning refuses.
+
+This also explains why learning is refused rather than *flagged*: admitting the
+audio "because it was named" would be exactly the coupling lesson 41 warns
+about — the transcript's display decision becoming the profile's evidence.
+
+### What it cost, before it was visible
+
+The band was silently lossy. A span could be named, refused, and never
+mentioned anywhere; the only symptom was a voiceprint that stopped improving
+with no stated reason. It is now reported rather than absorbed:
+
+- `uncertainty.learning_refusal_reason()` returns `REASON_LOW_CONFIDENCE`
+  with the measured `confidence` and `match_dist` on the record;
+- `VoiceprintService.auto_collect_from_diarization` keeps a bounded list of
+  refused spans (`LEARN_DIAG_MAX_REFUSALS = 25`) plus a complete
+  `refused_reasons` histogram;
+- `asr_router._learning_summary` carries the histogram and the counts to the
+  browser, where `renderLearningNote` names the reason in prose.
+
+So a band member now reads as *"Test Person Two — a weak voiceprint match"* in
+the UI instead of silently contributing nothing.
+
+### Do not "fix" it by closing the band
+
+Neither threshold is calibrated, and the band is a **consequence of the pair**,
+not a designed margin. Moving one number moves the other:
+
+- raise `min_speaker_confidence` to close the band → also tightens attribution
+  and the `low_span_turn_overlap` check, which reads the *same* key for a
+  completely unrelated purpose (a share of the span, not a match confidence —
+  see `speaker/attribution.py`);
+- lower `accept_threshold` to close the band → makes the transcript more
+  willing to name the wrong colleague, which is the failure lesson 43's band
+  exists to keep visible.
+
+`tests/test_uncertainty_policy.py::test_naming_accepts_a_wider_band_than_learning_uses`
+recomputes the conversion from `thresholds.json` and fails if the band closes,
+which is the signal to update this section deliberately rather than by accident.
+The same-key reuse in `attribution.py` is the real latent hazard: if these
+numbers ever need separate tuning, they need separate keys first.
+
+## 45. Flagging an outlier snippet is an accusation, not a cleanup
+
+### The problem
+
+A voiceprint is a duration-weighted mean of its snippets' ECAPA embeddings
+(`_weighted_embedding`). Nothing checks that the snippets being averaged are one
+person. A snippet admitted by a bad diarization turn, a crossed microphone or a
+mis-attributed span pulls the centre toward itself, and the profile then matches
+the *wrong* voice in every later recording. The symptom is silent: the profile
+still builds, still reports plausible pitch/energy, and simply gets worse.
+
+### Why flag and not delete
+
+The evidence a user needs to overturn an accusation is the audio plus the
+number. So a run **flags** (durable `snippets.review_flag` + `review_score` +
+`review_reason`) and recomputes the profile from the kept set; removal is a
+separate POST that defaults to `dry_run=True`. A boolean alone would make every
+item unverifiable — the user could not tell a 0.36 from a 0.9, so they would have
+to trust or delete blindly, which is the outcome the flag was supposed to avoid.
+
+Re-running consolidation clears marks it no longer makes, and `keep` clears one.
+A kept snippet must never keep a stale accusation, or a second run would
+silently re-flag it for no stated reason.
+
+### The criterion, and why it is two-sided
+
+`score_outliers(vectors)` accuses a snippet only when its distance to the
+robust centre exceeds **both**:
+
+- `median + outlier_mad_k · MAD · 1.4826` (`outlier_mad_k = 6.0`), which adapts
+  to a genuinely tight profile, and
+- `outlier_floor = 0.35`, an absolute floor.
+
+The floor is `matching.accept_threshold` — the *naming* bar — on purpose. "This
+snippet is not the same person" is exactly the question naming asks, so the
+outlier cut must not be laxer than the gate that would have refused to call the
+speaker that name. It is deliberately **not** the `0.32` that
+`thresholds.json → learning` reuses four times; that number is explicitly
+uncalibrated (lesson 43), and inheriting it silently is how a profile gets
+carved up. Without the floor, a legitimately wide-but-continuous profile (a
+speaker who changes intonation) is chopped into pieces; without the MAD half, a
+wide profile flags nothing.
+
+The centre is recomputed from the **kept** vectors each round
+(`outlier_mad_rounds = 2`). One centre over everything is dragged toward the
+outliers, which is precisely how they hide.
+
+### The budget is a whole-pass budget
+
+`outlier_max_fraction = 0.2` caps the *run*, not the round, and is enforced
+worst-first, flooring at 1 (`floor(0.2 * 5) == 0` would otherwise silence the
+detector on every small profile). `outlier_min_keep = 3` refuses to accuse
+anyone when the profile is smaller than that. A capped or spared accusation still
+records its reason, and a snippet that ends up flagged never keeps a
+"capped"/"min_keep" reason string — the reasons are evidence and must be true.
+
+A detector that flags half a corpus is a bug, not a finding. Under-flagging is
+recoverable (re-run with a looser floor); over-flagging destroys good audio on
+one bad run.
+
+### One embedding pass, two consumers
+
+`consolidate_speaker` needs every snippet's vector to score it, and
+`_auto_refine` needs every snippet's vector to rebuild the profile. Refining
+first and analysing afterwards would embed the corpus **twice** — the measured
+cost of one pass over a 219-snippet profile is ~25 min of GPU (lesson 44), so
+the second pass doubles a cost users notice. Both consume `_embed_snippets()`,
+which re-checks the embedding session before every snippet and drops zero-norm
+vectors: a zero vector means "no usable window", not "maximally far away", and
+`missing` counts it so a run that silently lost half the corpus cannot report
+itself clean.
+
+`_auto_refine` also returns **silently** when the session is absent, and the TTL
+monitor unloads whenever `job_state.get_running() is None` — so a sweep that
+does not register a job can have ECAPA pulled out mid-pass and report success
+having done nothing. `POST /consolidate/stream` registers a `job_state` job for
+exactly this reason, and a vanished session yields `status: "skipped"`.
+
+### Bulk removal, and what it must not call
+
+`remove_flagged_snippets` must not call `delete_snippet`, which re-refines the
+profile on every call: removing 16 flagged snippets would be 16 full re-embeds.
+It collects the doomed ids, deletes via `_delete_snippet_row`, then does ONE
+`_auto_refine` per touched speaker (or drops the profile row when nothing is
+left) — the `cleanup_integrity` pattern.
+
+## 46. A cohesion split that comes out too close is RE-JOINED, not refused
+
+### The problem
+
+A diarization cluster is not a person, so `_split_cluster_by_cohesion` embeds
+each span on its own and re-clusters the cluster at
+`learning.max_intra_cluster_dist` (0.32, average linkage, cosine) before
+learning it. Every group of two or more spans becomes its own pending profile.
+
+That leaves a case the split has to answer: what if the groups it just made sit
+**closer to each other than the bar that made them**? The original answer was
+`return [], "unverified:groups_too_close"` — learn nothing, report
+`fail_closed`. On 2026-10-07_17-00-32.mp4 that is what happened to almost every
+cluster in the file:
+
+```
+Cohesion split of Speaker 10 not trusted: groups only 0.186 apart (min_inter_dist=0.32)
+Cluster Speaker 10: dropped 5 one-span group(s) (5 span(s) total) before learning
+```
+
+Fourteen clusters were refused, at 0.175–0.281 apart, across that run and the
+earlier ones on the same file.
+
+### Why refusing was the wrong answer
+
+Compare that to the two clusters the *same run* accepted as single speakers:
+
+| cluster | outcome | intra-group MEAN |
+|---|---|---|
+| `Speaker 1` | learned, 18 snippets | 0.1792 |
+| `Speaker 9` | learned, 18 snippets | 0.1702 |
+| `Speaker 10` | **refused** | groups 0.186 apart |
+
+The two groups the gate called "too close to be two people" were closer
+**together** than either accepted single speaker is spread **internally**. The
+gate was not detecting a blend; it was refusing normal within-speaker variation.
+And it failed in the worst possible direction, because the clusters with the
+most spans are the ones whose own spread is largest and the ones most likely to
+be refused — so the gate preferentially discarded the richest material, which
+is the opposite of what a filter for untrustworthy clusters should do.
+
+"Too close" is evidence of **one voice**, not of an unknown one. The only
+honest reading of it is a single group, so that is what the function now
+returns: the groups are merged back into one part, flagged `"rejoined": True`.
+The one-span groups dropped earlier come back too — they were dropped because a
+singleton cannot stand alone, an objection that stops applying inside a group.
+
+### Why the merge needs no gate of its own
+
+The obvious worry is that the merge is a claim the mean cannot check.
+`max_profile_intra_dist` compares the **mean** pairwise distance because the
+split is average-linkage, which bounds the mean and nothing else — and a group
+the clustering **separated** and we have just merged back has its mean diluted
+by the within-group pairs. Two internally-perfect voices 0.42 apart over six
+spans (three each) produce 15 pairs: 6 inside a group at distance 0, and 9
+across the voices at 0.42, so the mean is `9 × 0.42 / 15 = 0.252` — inside the
+bar. A maximum gate (`max_profile_intra_max`, 0.40) was added for exactly this
+and was **killed by real data within one run**:
+
+| | spans | mean | max |
+|---|---|---|---|
+| `Speaker 9` — real, already learned by the user | 20 | 0.255 | **0.463** |
+| synthetic blend of two internally-perfect voices | 6 | 0.252 | **0.42** |
+
+The real speaker's maximum is *higher* than the blend's, and the mean does not
+separate them either. No value of the threshold admits one and rejects the
+other; the gate could only choose which real speakers to throw away, and it
+chose the largest — the same failure the mean-only gate was introduced to fix.
+Note also that `Speaker 9`'s maximum rose 0.3631 → 0.463 purely by having 20
+spans instead of 18: the maximum is a statistic over n(n-1)/2 pairs and it drifts
+with the cluster's own size.
+
+The deeper reason it is unnecessary is that **the merge window and the blend
+window are disjoint**. The re-join fires only when every group's nearest
+neighbour is under `min_inter_dist`; ZO249, the real blend that motivated the
+whole function, had its groups **0.368** apart — outside the window — so it
+splits into two profiles and never reaches the merge. Undoing the merge cannot
+smuggle a blend past the split, because a blend far enough apart to matter was
+never merged in the first place. There is nothing left for an extra gate to
+separate.
+
+This is the general trap in this block: a guard justified by a synthetic fixture
+whose "impure" group is *cleaner than reality* measures a threshold that real
+data cannot satisfy. Check a candidate threshold against a real cluster, and
+against the clusters that are currently being learned, before shipping it.
+
+### Why the branch is reachable at all: spread, not two clean voices
+
+Worth stating, because the obvious way to test the re-join cannot reach it.
+`min_inter_dist` and `max_intra_cluster_dist` are **both 0.32**. Average linkage
+splits on the **mean cross-pair** distance; the inter check compares **centroid
+to centroid**. For two *clean* voices the two statistics are the same number, so
+the clusters land 0.32+ apart at exactly the moment linkage stops merging them —
+the merge window is empty and the branch is unreachable without monkeypatching
+`min_inter_dist` to something above the fixture's separation.
+
+A real cluster is never clean, and that is what opens the window: the mean runs
+**ahead** of the centroids, because the halves linkage tears apart both pull back
+toward the shared mean. Measured with the shipped 0.32 and no patching, 34 spans
+of a single voice (`_one_voice(jitter=0.68)`) split 22/5/4/2/1, the groups sit
+**0.2310** apart at the centroids against a **0.297** intra-group mean, and the
+re-join fires.
+
+Two consequences for anyone touching this:
+
+* **A two-voice fixture proves nothing here.** It cannot reach the branch with
+  shipped thresholds, and reaching it by patching the threshold tests the patch.
+  Write the wide-spread single voice instead.
+* **`len(parts) == 1` is not proof the re-join ran** — it is also what an
+  *unsplit* cluster returns. `test_a_split_whose_groups_sit_closer_than_the_bar_
+  is_rejoined_not_refused` therefore asserts the precondition first (the corpus
+  really is split into >1 group, and every group's nearest neighbour really is
+  inside the window), and only then the re-join.
+
+### What it means for the thresholds
+
+`learning.min_inter_dist` is now a **merge trigger, not a refusal bar**: one
+number decides learn-one-or-learn-two. Lowering it merges more aggressively;
+raising it above `max_intra_cluster_dist` mostly disables the re-join. A split
+is only ever refused for `too_few_segments` / `too_few_embeddings` /
+`no_embedding_session` / `no_sklearn` / `clustering_failed`, and those are all
+genuinely fail-closed.
+
+Every group, re-joined or not, is gated on the mean pairwise distance
+(`max_profile_intra_dist`, 0.32) and on nothing else.

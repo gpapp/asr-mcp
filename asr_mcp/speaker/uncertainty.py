@@ -337,25 +337,142 @@ def confidence_source_for(name: Optional[str]) -> str:
     return SOURCE_KNOWN_VOICEPRINT
 
 
+def _field(segment: Any, key: str, default: Any = None) -> Any:
+    """Read *key* off a segment that may be a dict or an object."""
+    if isinstance(segment, dict):
+        return segment.get(key, default)
+    return getattr(segment, key, default)
+
+
+#: Why a span never reached the snippet store.  Stable strings: they are counted
+#: in the API diagnostics and printed in the UI note, so they are part of the
+#: contract, not log prose.  Order of the checks below is the order of the
+#: reasons: the first objection is the one worth reporting.
+REASON_NO_IDENTITY = "no_identity"
+REASON_UNKNOWN = "unknown_label"
+REASON_OVERLAP = "overlap_label"
+REASON_GENERIC = "generic_label"
+REASON_SUPPRESSED = "explicitly_uncertain"
+REASON_LOW_CONFIDENCE = "low_confidence"
+REASON_LOW_MARGIN = "low_margin"
+REASON_TOO_SHORT = "too_short"
+
+#: Wording for each reason, for anything that has to show one to a person.
+#: It lives next to the reasons on purpose: a gate added here without a phrase
+#: here is a gate that reaches the user as an enum name. The browser keeps its
+#: own copy (the UI must not fetch it per render), and
+#: ``tests/test_ui_design_system.py`` fails if the two drift apart.
+LEARNING_REFUSAL_TEXT = {
+    REASON_NO_IDENTITY: "no speaker at all",
+    REASON_UNKNOWN: "no speaker at all",
+    REASON_OVERLAP: "overlapping speech",
+    REASON_GENERIC: "an unnamed cluster",
+    REASON_SUPPRESSED: "the pipeline distrusted the label",
+    REASON_LOW_CONFIDENCE: "a weak voiceprint match",
+    REASON_LOW_MARGIN: "two speakers matched almost equally well",
+    REASON_TOO_SHORT: "too little audio to judge",
+}
+
+
+def auto_collect_refusal_reason(
+    segment: Any, cfg: Optional[dict] = None
+) -> Optional[str]:
+    """Why *segment* may not be collected, or None when it may.
+
+    The single place the auto-collect gate is decided.
+    :func:`eligible_for_auto_collect` is exactly ``reason is None`` -- one
+    implementation, so a caller that wants to explain a refusal cannot drift
+    from the caller that enforced it.
+
+    Two things this deliberately does NOT relax. A ``generic_label`` refusal is
+    not a near-miss for a *known* speaker -- it is the case learning exists to
+    handle, and it is reported as such by the caller. And nothing here consults
+    the caps: a span that passes these gates can still be refused downstream for
+    sitting at the snippet cap, which is a different question (is there room?)
+    than this one (can this identity be trusted?).
+    """
+    c = dict(_cfg())
+    if cfg:
+        c.update(cfg)
+
+    name = _field(segment, "speaker", None)
+    if is_unknown_label(name):
+        return REASON_UNKNOWN
+    if str(name).strip() == OVERLAP_SPEAKER:
+        return REASON_OVERLAP
+    if is_generic_speaker(name):
+        return REASON_GENERIC
+
+    # A disabled policy is the documented rollback (lesson 30): it stops
+    # suppressing identities, and the confidence gate below is then the only
+    # thing left standing.
+    if c.get("enabled", True):
+        if _field(segment, "uncertain", False):
+            return REASON_SUPPRESSED
+        min_conf = float(
+            c.get("min_speaker_confidence", _DEFAULTS["min_speaker_confidence"]))
+        conf = _as_float(_field(segment, "speaker_confidence", None))
+        if conf is not None and conf < min_conf:
+            return REASON_LOW_CONFIDENCE
+        min_margin = float(
+            c.get("min_match_margin", _DEFAULTS["min_match_margin"]))
+        margin = _as_float(_field(segment, "speaker_margin", None))
+        if margin is not None and margin < min_margin:
+            return REASON_LOW_MARGIN
+        start, end = _as_float(_field(segment, "start", 0.0)), _as_float(
+            _field(segment, "end", 0.0))
+        if start is not None and end is not None:
+            min_dur = float(
+                c.get("min_attribution_dur_sec",
+                       _DEFAULTS["min_attribution_dur_sec"]))
+            if 0 < end - start < min_dur:
+                return REASON_TOO_SHORT
+
+    if c.get("auto_collect_requires_confidence", True):
+        conf = _as_float(_field(segment, "speaker_confidence", None))
+        if conf is not None and conf < float(
+                c.get("min_speaker_confidence", 0.35)):
+            return REASON_LOW_CONFIDENCE
+    return None
+
+
+def learning_refusal_reason(segment: Any) -> Optional[str]:
+    """Why *segment* may not be LEARNED as a new speaker, or None when it may.
+
+    The learning gate is :func:`auto_collect_refusal_reason` minus one
+    objection: a generic ``"Speaker N"`` label is accepted, because learning
+    someone who has no name yet is the entire point. Everything that makes a
+    label *unreliable* still rejects it. Reported separately because for a
+    generic label the collect reason ("generic_label") says nothing useful --
+    the interesting question is which of the *other* gates stopped it.
+    """
+    name = _field(segment, "speaker", None)
+    if is_unknown_label(name):
+        return REASON_NO_IDENTITY
+    if str(name).strip() == OVERLAP_SPEAKER:
+        return REASON_OVERLAP
+    if _field(segment, "uncertain", False):
+        return REASON_SUPPRESSED
+    c = _cfg()
+    if c.get("auto_collect_requires_confidence", True):
+        conf = _as_float(_field(segment, "speaker_confidence", None))
+        # A generic cluster label carries no speaker_confidence at all; absence
+        # is not evidence of doubt, so only an explicit low value rejects.
+        if conf is not None and conf < float(
+                c.get("min_speaker_confidence", 0.35)):
+            return REASON_LOW_CONFIDENCE
+    return None
+
+
 def eligible_for_auto_collect(segment: Any) -> bool:
     """Voiceprint auto-collection gate.
 
     Rejects UNKNOWN / OVERLAP / generic "Speaker N" labels, explicitly
     uncertain segments, low-confidence attributions and segments whose label
-    was suppressed downstream.
+    was suppressed downstream. See
+    :func:`auto_collect_refusal_reason` for the reasons themselves.
     """
-    c = _cfg()
-    if is_uncertain_label(segment.get("speaker") if isinstance(segment, dict) else None):
-        return False
-    if not is_confident_attribution(segment, c):
-        return False
-    if c.get("auto_collect_requires_confidence", True):
-        conf = _as_float(
-            segment.get("speaker_confidence") if isinstance(segment, dict) else None
-        )
-        if conf is not None and conf < float(c.get("min_speaker_confidence", 0.35)):
-            return False
-    return True
+    return auto_collect_refusal_reason(segment) is None
 
 
 def eligible_for_learning(segment: Any) -> bool:
@@ -370,23 +487,7 @@ def eligible_for_learning(segment: Any) -> bool:
     Learning from a segment whose speaker identity the pipeline itself
     distrusted would poison the new profile with the same wrong audio.
     """
-    name = segment.get("speaker") if isinstance(segment, dict) else None
-    # NOT is_uncertain_label(): that also rejects generic "Speaker N", which is
-    # the one label class learning exists to handle. Only the labels that carry
-    # no speaker at all are rejected here.
-    if not name or is_unknown_label(name) or str(name).strip() == OVERLAP_SPEAKER:
-        return False
-    if isinstance(segment, dict) and segment.get("uncertain"):
-        return False
-    c = _cfg()
-    if c.get("auto_collect_requires_confidence", True):
-        conf = _as_float(segment.get("speaker_confidence")
-                         if isinstance(segment, dict) else None)
-        # A generic cluster label carries no speaker_confidence at all; absence
-        # is not evidence of doubt, so only an explicit low value rejects.
-        if conf is not None and conf < float(c.get("min_speaker_confidence", 0.35)):
-            return False
-    return True
+    return learning_refusal_reason(segment) is None
 
 
 __all__ = [
@@ -410,5 +511,16 @@ __all__ = [
     "confidence_source_for",
     "eligible_for_auto_collect",
     "eligible_for_learning",
+    "auto_collect_refusal_reason",
+    "learning_refusal_reason",
+    "REASON_NO_IDENTITY",
+    "REASON_UNKNOWN",
+    "REASON_OVERLAP",
+    "REASON_GENERIC",
+    "REASON_SUPPRESSED",
+    "REASON_LOW_CONFIDENCE",
+    "REASON_LOW_MARGIN",
+    "REASON_TOO_SHORT",
+    "LEARNING_REFUSAL_TEXT",
     "naming_blocked_reason",
 ]
