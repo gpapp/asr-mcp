@@ -123,311 +123,221 @@ After completing any code changes:
 - **Live session resolution**: NEVER pin a copy of `state.*_session` into other objects. `VoiceprintService._emb_session()` resolves `state.embedding_session` at call time (`set_embedding_session` has zero callers — pins caused `'NoneType' has no attribute get_inputs` after lazy unload).
 
 ### Transcription Chunking (Long Audio)
+Detail in [docs/processing.md](docs/processing.md#transcription).
 
-**Turn preparation** (`asr_router.py::_prepare_turns`) — every second of the timeline is covered by exactly one turn. Turns feed the timeline/display and post-hoc speaker attribution; they are NOT decode units:
-1. Merge same-speaker diarized segments into turns (gap ≤ `uncertainty.turn_merge_gap_sec`, never merging a `speaker is None` span)
-2. Split turns >120s (`MAX_TURN_SEC`) at their largest internal diarized-segment gap
-3. **Exact boundary refinement** (`_refine_boundaries_with_vad`, a thin caller over `speaker/boundary.py::refine_gap`): the raw uncollapsed VAD sections the **diarizer already computed** (`raw_vad_sections`, threaded through so Silero runs once per file, not twice); each VAD section spanning a gap is embedded and attributed to the better-matching adjacent speaker (known DB voiceprint, else ≤30s of that speaker's own turn audio); `best_split` picks the ownership cut (margin-weighted); both turns move to one shared cut at the exact start of the first section owned by the incoming speaker (or gap end if the gap is entirely the left speaker's)
-4. **Fallback chain for any remaining gap** (`_close_residual_gaps`): spectral change → energy-dip cut (longest dip run) → quietest frame → midpoint. Steps 3 and 4 are the *same* engine (`boundary.cut_between`); the router's own VAD pass is only a fallback for `/attribution`, where no diarizer ran
-5. Edges extended to 0.0 / audio_duration
-6. **Transcription** (`asr_router.py::_transcribe_file`): ONE whole-file `transcribe_audio_sync()` call; the backend decodes in its own windows (Qwen `_transcribe_chunked`, Cohere `_transcribe_windowed`), then `speaker/attribution.py::attribute_items` maps each returned item onto the turns and groups consecutive same-speaker items into `TranscribeResult` runs — audio is never cut at speaker boundaries
-7. **Voiceprint learning** (`_auto_collect`) runs AFTER step 1–5 and is passed the **turns**, not the raw segments, so every learned snippet carries the same boundaries the transcript was attributed on; each is trimmed inward to whole VAD sections (lesson 41)
-
-**Diarization-only requests do the same work** (`asr_router.py::_refine_and_learn`, shared by `/diarize` and `/diarize/upload`): steps 1–5 and 7 run, only step 6 (the decode) is skipped. A run that never decodes text must produce the SAME boundary set as one that does — the snippets a diarize-only run learns are cut on the turns the user is shown, trimmed onto the diarizer's own VAD sections, and keyed on the source id so a reprocess replaces that file's earlier take. Both endpoints display the refined turns (`_display_spans`, the same projection `/transcribe/upload` uses) and report `pending_profiles` + `learning`, because a learned-but-unnamed profile is invisible until the user is told. The helper degrades at every step (no audio → no exact-boundary pass; refinement failure → raw segments; learner failure → `{}`) — a voiceprint problem never fails a diarization.
-
-**Decode windowing** (`transcribers/cohere.py::_transcribe_windowed`) — triggered when mel > 3000 frames (30s) and no KV/prefix bridge:
-- Plans ≤30s windows (`_plan_window_bounds`), each cut snapped to the minimum frame-energy point inside a ±100-frame band (never mid-word); tails <300 frames merge into the previous window
-- Each window decoded separately (`_no_window=True` avoids recursion); segment times offset by window start; texts joined
-- Window errors are ALWAYS surfaced in `result["error"]`, even when earlier windows produced text (otherwise failures look like silent truncation)
-
-**Encoder-level chunking** (`transcribers/cohere.py`) — safety fallback inside a single decode when a window still exceeds the encoder limit:
-- Mel split into overlapping windows (MAX_ENCODER_SEC=30s, 25% overlap), encoded independently, concatenated along sequence dimension
-- Overlap trim must happen in OUTPUT space: `trim = min(round(overlap_frames * out_seq/in_len), out_seq)` (subsample-safe — input-frame counts don't match output-frame counts)
-
-**Decoder interface**: The decoder ONNX model requires `encoder_hidden_states` as a direct input (not just KV caches). `_parse_encoder_outputs()` extracts the hidden states tensor from encoder output and passes it through. Cross-attention KV caches (8 layers × key/value) are initialized as empty (seq_len=0).
+- **ONE whole-file decode.** `run_transcribe` calls `transcribe_audio_sync()` once
+  and the backend windows internally; ASR items are attributed onto the turns
+  afterwards, so audio is never cut at a speaker boundary.
+- **≤30 s decode windows**, cut at the minimum frame-energy point inside a ±100-frame
+  band (never mid-word); tails <300 frames merge backwards.
+- **A window error is ALWAYS surfaced in `result["error"]`**, even when earlier
+  windows produced text — otherwise a failure reads as silent truncation (lesson 16).
+- **Encoder chunking is a safety fallback**, and its overlap trim happens in
+  OUTPUT space: `trim = min(round(overlap_frames * out_seq/in_len), out_seq)`
+  (subsample-safe).
+- **`language` is threaded** router → prompt → decode, never forced (lesson 28).
 
 ### Diarization Pipeline (13 steps)
+Detail in [docs/processing.md](docs/processing.md#diarization-pipeline); numbering
+matches the `# Step N` comments in `diarization/pipeline.py::Diarizer.run`.
 
-Numbering below matches the `# Step N` comments in
-`diarization/pipeline.py::Diarizer.run` — that file is the source of truth.
+1 VAD (raw sections kept for 13) · 1b merge <0.5 s · 2 energy-dip split ·
+3 windows (embeddings only) · 4 ECAPA embedding · 5 clustering (threshold OR
+forced-k) · 5b label short segments · 5c overlap · 6 `Speaker N` + merge ·
+7 cleanup + boundary refine · 8 profiling · 8b relabel by pitch ·
+9 **known-speaker matching** · 10 ghosts · 11 minorities · 12 second pass ·
+13 exact turn-boundary refinement.
 
-```
-1.   VAD (Silero ONNX) → raw uncollapsed sections (kept for step 13)
-1b.  Merge sections <0.5s apart for clustering
-2.   Energy-dip splitting (min_segment_dur=3.0s, dip_ratio=0.35,
-     min_dip_dur=0.5s, min_split_piece=2.0s)
-3.   Sliding windows (2.0s window, 1.2s stride) → fbank features
-4.   ECAPA-TDNN512 embedding per window (192-dim, ONNX CUDA; MD5 LRU cache)
-5.   AgglomerativeClustering (cosine) — threshold path: average linkage at
-     `distance_threshold`; forced-k path (`num_speakers` given):
-     `n_clusters=k` with `forced_k_linkage` (default `complete`) and **no**
-     greedy merge
-5b.  Assign cluster labels to every segment, including short ones
-5c.  Overlap detection (proximity_ratio 0.08, min_distance 0.40)
-6.   Map labels → "Speaker N" and build segments (same-speaker merge,
-     max_speaker_gap 1.0s; `build_overlap_segments`)
-7.   Split single-speaker vs OVERLAP; absorb islands; boundary refinement
-8.   Speaker profiling (pitch, energy, MFCC)
-8b.  Relabel by pitch (highest = Speaker 1); inject cluster centroids
-9.   Known-speaker matching (multi-feature: 60% embedding + 15% pitch +
-     10% spectral + 10% MFCC) — BEFORE ghost elimination so it can populate
-     `alternatives`
-10.  Ghost elimination (<10s total speech → suppressed to UNKNOWN, or to a
-     matched voiceprint alternative; `ghost_max_share` rescues a large share)
-11.  Absorb/suppress minority speakers (max_utterance 5.0s, min_speaker_dur
-     8.0s; matched voiceprints protected)
-12.  Second-pass re-identification of unknown speakers (gated by
-     `second_pass.min_identity_confidence`, one-to-one claim)
-13.  Exact turn-boundary refinement from the raw VAD sections
-```
+- **Step 9 runs BEFORE step 10** — matching must populate `alternatives` before
+  ghosts are suppressed, or a ghost cluster is lost instead of rescued.
+- **`num_speakers` is a different clustering path** (hard k, no greedy merge).
+- **`Diarizer.run` never touches the DB.** `_load_known_speakers(settings, user_id)`
+  in `asr_router` is the single funnel, and it excludes pending profiles there.
+- **Segments are speech-length, not window-length** (lesson 3); **merge VAD
+  regions <0.5 s apart before splitting** (lesson 4).
 
 ### Audio Format Support
-- Input: mp3, mp4, mkv, flac, ogg, m4a, wav, webm, opus
-- Auto-converts to WAV PCM 16kHz mono via ffmpeg before processing
-- Voiceprint snippets stored as **FLAC** (compressed, lossless)
-- **One file, one contribution**: re-processing a recording must REPLACE that
-  recording's take, not stack a second copy of the same room and channel onto a
-  profile (which is how a profile ends up fitted to one recording). A recording
-  is identified by its **filename hash** (`generate_segment_hash`, md5 of the
-  source stem — the same hash snippet filenames are built from), so a reprocess
-  matches across a different directory, extension, upload name and every moved
-  span or duration. `VoiceprintService._source_snippet_rows` selects the rows,
-  `replace_source_contribution` drops them, `_purge_source_rows` handles the file
-  unlink.
-  - **Upload path**: `add_snippet(replace_source=True)` deletes the same speaker's
-    rows from the same source BEFORE writing the new file (required — the filename
-    is derived from stem+span+duration, so a re-run lands on the same path).
-    Exposed as `?replace_source=false` on `POST /speakers/{name}/upload`.
-  - **Reprocess path** (`auto_collect_from_diarization` + `_learn_unknown_speaker`):
-    collect FIRST, then `replace_source_contribution`, then the single
-    `_auto_refine`. Collecting first is what makes it safe — if every span was
-    rejected, the previous take is still there and nothing is lost. The learn
-    path's same-recording idempotence guard (`have`) covers OTHER recordings only,
-    or it would veto the refresh and the purge would delete the only copy. The
-    learn cap and `AUTO_COLLECT_MAX_TOTAL_SEC` are judged on the POST-replacement
-    total, so a profile sitting at the cap because of this recording can refresh it.
-  - Scope: ONE speaker, one user (a file may feed several profiles, and only a
-    profile this run rebuilt is rewritten); rows with `source_audio IS NULL`
-    (rescan-adopted) never match. Clips from other recordings are always kept.
-  - `SnippetDB.find_duplicate` is speaker-scoped: it DELETES what it finds, so an
-    unscoped lookup would let one profile's collection remove another's audio.
-  - Tests: `tests/test_voiceprint_source_replace.py` (unit) and the "reprocessing a
-    recording replaces the spans it cut before" block in
-    `tests/test_learning_boundaries.py` (through `auto_collect_from_diarization`)
+Input: mp3, mp4, mkv, flac, ogg, m4a, wav, webm, opus — auto-converted to WAV PCM
+16 kHz mono via ffmpeg. **Snippets are stored as FLAC** (lossless, compressed).
 
 ### Voiceprint learning: the cohesion split RE-JOINS, it does not refuse
-`voiceprint/service.py::_split_cluster_by_cohesion` embeds each of a cluster's spans
-separately and re-clusters them at `learning.max_intra_cluster_dist` (average linkage,
-cosine) before learning, because a diarization cluster is not a person. If the groups it
-produces sit closer together than `learning.min_inter_dist`, that split is an **artefact
-and the groups are merged back into ONE part**, which also brings the dropped one-span
-groups back. It used to `return [], "unverified:groups_too_close"` and learn nothing,
-which discarded the largest and richest clusters: on `2026-10-07_17-00-32.mp4` fourteen
-clusters were refused at 0.175–0.281 apart while `Speaker 1` and `Speaker 9`, learned
-from the same run, had intra-group MEANS of 0.179 and 0.170 — the refused "groups" were
-closer together than a learned single speaker is spread internally. "Too close" is
-evidence of one voice.
+Detail in [docs/voiceprints.md](docs/voiceprints.md#how-a-profile-is-created).
 
-**There is NO maximum-based purity gate, on any group** — the re-joined one included.
-A maximum over n(n-1)/2 pairs grows with the span count, so it rises with the richness
-of the cluster, which is why gating on it lost every cluster of `2026-09-04 12-08-59.mp4`
-(22 spans, mean 0.21, max 0.379). A re-joined group briefly had one
-(`max_profile_intra_max` 0.40) and real data killed it: `Speaker 9` — a speaker the
-user had ALREADY learned — is 20 spans, mean 0.255, max **0.463** once re-joined, and a
-synthetic two-voice blend is mean 0.252, max **0.42**. Neither statistic separates them,
-so no value of that threshold admitted one and rejected the other; it could only choose
-which real speakers to discard, and it chose the largest. Do not reintroduce it on a
-synthetic fixture — check against a real cluster first.
+`_split_cluster_by_cohesion` embeds each span separately and re-clusters at
+`learning.max_intra_cluster_dist` before learning, because a diarization cluster
+is not a person. If the resulting groups sit closer than `learning.min_inter_dist`
+that split is an **artefact and the groups are merged back into ONE part** — which
+also brings back the dropped one-span groups. Refusing used to discard the
+largest and richest clusters: on `2026-10-07_17-00-32.mp4` fourteen clusters were
+refused at 0.175–0.281 apart while two profiles learned from the same run had
+intra-group means of 0.170 and 0.179. **Too close is evidence of one voice.**
 
-**The merge window and the blend window are disjoint.** The re-join fires only when every
-group's nearest neighbour is under `min_inter_dist`; ZO249 — the real blend this function
-exists for — had its groups 0.368 apart, so it splits into two profiles and never
-merges. That is why undoing the merge cannot smuggle a blend past the split, and why the
-re-joined group needs no gate of its own.
-
-**Only a SPREAD voice reaches the re-join — never two clean ones.** `min_inter_dist` and
-`max_intra_cluster_dist` are both 0.32, and average linkage splits on the **mean
-cross-pair** distance while the check compares **centroid to centroid**. For two clean
-voices those statistics coincide, so the two clusters land 0.32+ apart exactly when
-linkage stops merging them: the window is empty and the branch is unreachable without
-monkeypatching a threshold. A real cluster is never clean — the mean runs ahead of the
-centroids, because the halves linkage tears apart both pull back toward the shared mean.
-Measured: 34 spans of one voice split 22/5/4/2/1 with neighbours 0.2310 apart at the
-centroids against a 0.297 intra-group mean, and re-join under the same shipped 0.32.
-Write a test fixture as a **wide-spread single voice** (`_one_voice(jitter=0.68)` over
-`_fan_spans(34)`); a two-voice fixture proves nothing here. `test_a_split_whose_groups_sit_closer_tha
-n_the_bar_is_rejoined_not_refused` asserts that precondition (the corpus really is split,
-and really is inside the window) before asserting the re-join, because `len(parts) == 1`
-is also what an *unsplit* cluster returns.
-
-Consequence for threshold work: `min_inter_dist` is now a **merge trigger, not a
-refusal bar** — one number decides learn-one-or-learn-two. Lowering it merges more
-aggressively; raising it above `max_intra_cluster_dist` mostly disables the re-join. A
-split is only ever *refused* for `too_few_segments` / `too_few_embeddings` /
-`no_embedding_session` / `no_sklearn` / `clustering_failed`, all fail-closed
-(`learning.fail_closed`). Tests: `test_a_split_whose_groups_sit_closer_than_the_bar_is_
-rejoined_not_refused`, `test_the_merge_window_and_the_blend_window_are_disjoint`,
-`test_a_rejoined_single_voice_cluster_is_learned`, and the pre-existing
-`test_a_blend_is_learned_as_two_profiles_each_with_its_own_purity` which pins the far
-side of the same boundary (all in `test_learning_boundaries.py`).
+- **There is NO maximum-based purity gate, on any group, re-joined or not.** A max
+  over n(n-1)/2 pairs grows with span count, so it rises with the richness of the
+  cluster — which is why gating on it lost every cluster of
+  `2026-09-04 12-08-59.mp4` (22 spans, mean 0.21, max 0.379). A real speaker the
+  user had already learned (`Speaker 9`, 20 spans) scores mean 0.255 / max **0.463**
+  once re-joined; a synthetic blend is mean 0.252 / max 0.42. **Neither statistic
+  separates them**, so any such threshold could only choose which real speakers to
+  discard, and it chose the largest.
+- **The merge window and the blend window are disjoint.** The re-join fires only
+  when every group's nearest neighbour is under `min_inter_dist`; ZO249 — the real
+  blend this exists for — had its groups 0.368 apart, so it splits and never merges.
+  Undoing the merge cannot smuggle a blend past the split.
+- **`min_inter_dist` is now a MERGE TRIGGER, not a refusal bar.** Lowering it
+  merges more aggressively; raising it above `max_intra_cluster_dist` mostly
+  disables the re-join. Lowering merges more; there is no separate refusal.
+- **The only refusals** are `too_few_segments`, `too_few_embeddings`,
+  `no_embedding_session`, `no_sklearn`, `clustering_failed` — all fail-closed via
+  `learning.fail_closed`.
+- **Test fixtures must be a WIDE-SPREAD SINGLE VOICE** (`_one_voice(jitter=0.68)`
+  over `_fan_spans(34)`). A two-voice fixture proves nothing: with both thresholds
+  at 0.32 the merge window is unreachable for two CLEAN voices, because average
+  linkage splits on the MEAN cross-pair distance while the check compares centroids,
+  and for clean voices those coincide.
 
 ### Voiceprint Integrity: audit, automatic rebuild, cleanup
-`voiceprint/audit.py` is read-only and reports 8 findings; `voiceprint/rebuild.py` +
-`cleanup_integrity` are the two halves that act. A finding with **one** correct
-answer is repaired automatically; anything needing a human decision is only
-reported.
+Detail in [docs/voiceprints.md](docs/voiceprints.md#integrity-audit-and-automatic-rebuild).
 
-**Automatic, on audit failure** (the only automatic repair — `server.py` lifespan):
-1. `run_startup_audit` returns `reports`; `vp_rebuild.enqueue_from_reports(<data_dir>/voiceprint_rebuild_queue.json, reports, logger)` writes the queue.
-2. The TTL monitor's 60 s tick drains it, but only when the queue is non-empty AND `job_state.get_running() is None`. It calls `state.ensure_diarize_ready()` (VAD + ECAPA only — **never** the ASR backend) then `run_pending` in `ms.executor`. This is the documented exception to "no model load at startup".
-3. `VoiceprintService.rebuild_profile_from_scratch(speaker, user_id)` — purge dead snippet rows → drop the derived `voiceprints` row → `_auto_refine` → re-apply `pending` and `purity`.
+`voiceprint/audit.py` is read-only and reports 8 findings; `rebuild.py` +
+`cleanup_integrity` are the two halves that act. **A finding with ONE correct answer
+is repaired automatically; anything needing a human decision is only reported.**
 
-- **Why dropping the row is safe**: the snippets and their FLAC audio are the source
-  of truth and are NEVER touched by the rebuild; only the *derived* embedding row is
-  discarded and recomputed. It is idempotent and cannot lose material.
-- `pending` and `purity` are read from the old row BEFORE the delete and re-applied
-  after, because `VoiceprintDB.save(pending=None)` PRESERVES the flag but a
-  deleted row destroys it — without the re-apply a learned-but-unnamed profile would
-  silently become matchable (lesson 39).
-- **Purge first, rebuild second.** `_purge_dead_snippet_rows` deletes ROWS ONLY (no
-  unlink — the audio is already gone; a file that resolves must never be unlinked)
-  for rows whose `audit.resolve_snippet_path(...)` is `None`. Measured on the live
-  store: the first boot of this feature re-embedded 219 snippets (~25 min of GPU)
-  for a `missing_snippet_files` finding and fixed nothing, because 73 rows pointed
-  at `.wav` files left over from a wav→flac migration. Purge needs no GPU, so it
-  runs even when the models are absent (then the entry is `skipped` and kept). A
-  row whose file merely fails to LOAD is not dead and is kept.
-- A crash mid-rebuild leaves a speaker profileless — recoverable and self-healing:
-  the next audit reports `snippets_without_profile`, which IS a rebuild target.
 - `TARGET_FINDINGS = ("snippets_without_profile", "profiles_without_snippets",
   "missing_snippet_files")`. NOT targets: `near_duplicate_profiles`,
   `name_collisions`, `duplicate_snippet_content`, `orphan_snippet_files`,
   `stale_speech_totals` — merging is the user's decision.
-- **Convergence**: `MAX_ATTEMPTS = 3` then the entry is dropped with an ERROR naming
-  `POST /api/voiceprint/integrity/cleanup`; a `skipped` result is NOT an attempt.
-  A `done` fingerprint (user + speaker + sorted reasons) stops a fixable-less finding
-  re-queuing on every boot — but keep the marker for handled entries only as long as
-  the reason set is unchanged, or a changed finding is silently suppressed.
-- Manual: `GET /api/voiceprint/integrity` (read-only) and
-  `POST /api/voiceprint/integrity/cleanup` (`IntegrityCleanupRequest{dry_run=True,
-  dead_snippets=True, ...}` → `cleanup_integrity`, which deletes duplicate-content
-  rows and the audit's `missing_snippet_files`, then re-refines each affected
-  speaker ONCE).
-- Tests: `tests/test_voiceprint_rebuild.py` (32), `tests/test_voiceprint_audit.py`,
-  `tests/test_voiceprint_integrity_cleanup.py`. Load `rebuild.py`/`service.py` **by
-  path** — importing `asr_mcp.voiceprint` puts the real package in `sys.modules` and
-  breaks the stubbed loaders in other test modules.
+- **Purge first, rebuild second.** `_purge_dead_snippet_rows` deletes ROWS ONLY (no
+  unlink — the audio is already gone; a file that resolves must never be unlinked).
+  The first boot of this feature re-embedded 219 snippets (~25 min of GPU) for a
+  `missing_snippet_files` finding and fixed nothing, because 73 rows pointed at
+  `.wav` files left over from a wav→flac migration.
+- **Why dropping the derived row is safe**: the snippets and their FLAC audio are
+  the source of truth and are NEVER touched; only the embedding row is recomputed.
+- **`pending` and `purity` are read BEFORE the delete and re-applied after**,
+  because a `deleted row` destroys them and `VoiceprintDB.save(pending=None)`
+  preserves the flag — without the re-apply a learned-but-unnamed profile would
+  silently become matchable (lesson 39).
+- **Convergence**: `MAX_ATTEMPTS = 3`, then the entry is dropped with an ERROR
+  naming `POST /api/voiceprint/integrity/cleanup`; a `skipped` result is NOT an
+  attempt.
+- The TTL monitor's 60 s tick drains the queue only when it is non-empty AND
+  `job_state.get_running() is None`, calling `ensure_diarize_ready()` (VAD +
+  ECAPA, **never** the ASR backend) — the documented exception to "no model load
+  at startup".
 
 ### Voiceprint Consolidation: outlier snippets and manual review
-`voiceprint/service.py::consolidate_speaker` answers "is every snippet of this profile
-actually the same person?". It **flags** the outliers and recomputes the profile from
-the **kept** snippets only; it deletes nothing. Removal is a separate, explicit,
-dry-run-by-default step (`remove_flagged_snippets`), because a flag is an accusation
-the user has to be able to check.
+Detail in [docs/voiceprints.md](docs/voiceprints.md#consolidation-finding-snippets-that-are-not-this-speaker).
 
-**One embedding pass, shared with refine.** `_embed_snippets(speaker, user_id, ...)`
-loads and embeds every usable snippet once and returns
-`{"rows","vectors","durations","waveforms","missing"}`; `_auto_refine` and the
-consolidation pass BOTH consume it, and `_weighted_embedding(vectors, durations)`
-holds the duration weighting + `max_refine_weight_ratio` cap. Do not reintroduce a
-direct `extract_embedding(` call in either — two implementations would drift, and each
-re-embed of a 219-snippet profile is ~25 min of GPU (the lesson-44 audit figure).
+`consolidate_speaker` answers "is every snippet of this profile actually the same
+person?". It **flags** the outliers and recomputes from the **kept** snippets only;
+**it deletes nothing.** Removal is a separate, dry-run-by-default step.
 
-**The detector is a PURE module-level function** `score_outliers(vectors, cfg=None)`
-→ `{distances, kept_indices, flagged_indices, kept_vectors, reasons, rounds}`:
-- Iterative reweighting (`outlier_mad_rounds`, default 2): each round recomputes the
-  centre from the **kept** vectors only. One centre over everything is dragged toward
-  the outliers and hides them.
-- A snippet is accused only when its distance to the centre exceeds BOTH
-  `median + k·MAD·1.4826` (`outlier_mad_k`) AND an absolute floor
-  (`outlier_floor` = **0.35, the naming bar `matching.accept_threshold`**). The
-  statistical half adapts to a tight profile; the floor is what stops a legitimately
-  wide-but-continuous profile from being carved up. It is deliberately NOT the 0.32
-  that `thresholds.json → learning` reuses four times uncalibrated (lesson 43).
-- Guardrails: `n < outlier_min_keep` (3) accuses nobody; `outlier_max_fraction` (0.2)
-  is a **whole-pass** budget enforced worst-first, and floors at 1 (so a 5-snippet
-  profile is not silenced by `floor(0.2*5) == 0`); a capped or spared snippet still
-  gets a reason string, and a snippet that ends up flagged never keeps a
-  "capped"/"min_keep" reason. `outlier_mad_rounds: 0` = report-only (everyone scored,
-  nobody accused).
-- **Why not reuse `_split_cluster_by_cohesion`** (the P2 cohesion split): it flags a
-  whole GROUP, which is right when learning a diarization cluster and wrong for
-  review, and it has hard `unverified:*` exits that would abort a library sweep.
-
-**Marks are durable evidence, not a boolean.** `snippets.review_flag` /
-`review_score` / `review_reason` (additive migration in `db/models.py::init_db`,
-mirroring `file_mtime`/`file_size`) + `SnippetDB.set_review` / `clear_review` /
-`list_flagged` (user-scoped, ranked by descending score). A bare flag would make every
-item an unverifiable accusation. Re-running consolidation **clears** marks it no longer
-makes, and `keep_flagged_snippet` clears one — a kept snippet must not keep a stale
-accusation. Flow: flag → `GET /flagged` (read-only) → per-item keep/remove →
-`POST /flagged/remove` (ONE destructive call, `dry_run=True` by default).
-
-**Removal never calls `delete_snippet`** (it re-refines on every call → N flagged
-snippets = N full re-embeds). `remove_flagged_snippets` collects `doomed` ids first,
-deletes via `_delete_snippet_row`, then does ONE `_auto_refine` per touched speaker (or
-drops the profile row when nothing is left) — the `cleanup_integrity` pattern.
-
-**Hazards designed around**
-- `_auto_refine` returns SILENTLY when `self._emb_session() is None`, and the TTL
-  monitor unloads the embedding session whenever `job_state.get_running() is None`. A
-  sweep that does not register a job can have ECAPA pulled out mid-pass and report
-  success having done nothing. `POST /consolidate/stream` therefore registers a
-  `job_state` job, and `_embed_snippets` re-checks the session **before every embed**,
-  bailing out with empty vectors (→ `status: "skipped"`, not a false `clean`).
-- A zero-norm embedding means "no usable window", not "maximally far away". It is
-  dropped and counted in `missing` → `unusable_snippets`, so a run that silently lost
-  half the corpus cannot read as clean.
-- A single-speaker run is served by the same SSE endpoint and the same result shape
-  (`{speakers, flagged_count, results}`) so the UI has one code path.
-- If EVERY snippet is flagged, nothing is saved — fitting an unapproved set is worse
-  than leaving the old profile.
-
-Tests: `tests/test_voiceprint_consolidation.py` (46) — pure `score_outliers` vectors
-plus service tests on a real temp SQLite DB, with `service.py` loaded **BY PATH** (the
-same reason as above) and each snippet's voice keyed by a **marker written into the
-fake audio**, so a fixture states what a snippet says instead of relying on call order.
+- **One embedding pass, shared with refine.** `_embed_snippets(...)` loads and
+  embeds every usable snippet once; `_auto_refine` and consolidation both consume
+  it. Do not reintroduce a direct `extract_embedding()` call in either — a
+  219-snippet re-embed is ~25 min of GPU.
+- **The detector is a PURE module-level function** `score_outliers(vectors, cfg=None)`,
+  iterated MAD reweighting: each round recomputes the centre from the **kept**
+  vectors only (one centre over everything is dragged toward the outliers).
+- **Accusation requires BOTH** `median + k·MAD·1.4826` (`outlier_mad_k`) **and** an
+  absolute floor (`outlier_floor` = **0.35**, the naming bar). The floor is
+  deliberately NOT the 0.32 that `learning` reuses (lesson 43).
+- **Guardrails**: `outlier_min_keep` (3) accuses nobody below it;
+  `outlier_max_fraction` (0.2) is a **whole-pass** budget enforced worst-first and
+  floors at 1; `outlier_mad_rounds: 0` = report-only.
+- **Marks are durable evidence, not a boolean** (`snippets.review_flag` /
+  `review_score` / `review_reason`). Re-running clears marks it no longer makes.
+- **Removal never calls `delete_snippet`** (it re-refines per call → N flagged
+  snippets = N full re-embeds). `remove_flagged_snippets` deletes via
+  `_delete_snippet_row`, then does ONE `_auto_refine` per touched speaker.
+- **`POST /consolidate/stream` registers a `job_state` job** — `_auto_refine`
+  returns SILENTLY when the embedding session is gone, and the TTL monitor unloads
+  it whenever no job is running; a sweep that does not register can have ECAPA
+  pulled mid-pass and report success having done nothing.
 
 ### Browser Live Tab (`static/live.js`)
-A third live client alongside `asr-client/live_client.py`, for `/live` in the SPA. It re-implements the wire protocol and the endpointing in JS, so both are drift-guarded by `tests/test_live_js_protocol.py` (constants vs. `protocol.py`, `DETECTOR_DEFAULTS` vs. `turn_detector.config()`, packed frames vs. `unpack_turn`, node-vs-server detector boundary equality, and `buildTranscript` vs. `transcribe_client.build_transcript`).
+Detail in [docs/ui.md](docs/ui.md#live-tab).
 
-- **Capture** — `getUserMedia` (mono, AEC/NS) → `AudioWorkletNode` (`live-worklet.js`) that resamples to 16 kHz, **levels the input** (auto-gain, see below) and posts 1024-sample int16 blocks. Channel 1 is `getDisplayMedia({audio, video: true})` tab/system audio — Chrome only returns tab audio when video is requested, and a failed display-media call degrades to mic-only with a visible note.
-- **Input levelling** — both live clients apply the same boost-only AGC in the capture chain, before the int16 conversion, so the frames on the wire AND the WAV re-uploaded for re-attribution carry the same level: `TARGET_RMS 0.125`, `MIN_ENV 0.0008`, `MAX_GAIN 16.0`, log-domain attack/release, per-block peak ceiling. `desired = TARGET_RMS / rms` — dividing by the *already-gained* level settles at `sqrt(TARGET/rms)`, which looks like convergence and is not. Constants, mechanism and the `--no-agc` flag: lesson 37.
-- **Endpointing in JS** — `TurnDetector`/`TurnCoalescer` ports; the server runs neither on LVT1 frames (`handler.py:101` builds the `Turn` straight from the frame). One coalescer per channel, `poll()` every iteration.
-- **Auth** — the browser WS cannot set headers, so the session cookie is used; `?token=` is the fallback (from the Settings "Windows Client Token" card).
-- **Stop** — `MSG_FLUSH`, then wait for the server's `stats` frame (the drain signal) before building the transcript. A failed drain must not strand the tab: the transport buttons are restored in a `finally`, and a socket that dropped *after* transcripts arrived still gets downloads and the History save. Re-attribution via `/api/asr/attribution/upload` (no re-decode), optional `POST /api/asr/live/save` to History (text only — audio goes through the upload route, which is the capped one). Downloads are generated client-side: `.txt`, `.asr.json`, and per-channel `.wav`.
-- **Per-channel turn split** (`Session.turnSplit()`, in the end-of-session note, the sidecar and the `.txt` header) is the one number that explains a bad transcript. `mic 0, speaker 12` means the mic recording has no speech for the re-attribution to diarize, so every item collapses onto one speakerless turn and the whole session comes back UNKNOWN with no reason shown.
-- Live transcript items arrive in **decode-completion order** — sort by `start` before rendering or re-attributing.
+- `getUserMedia` (mono, AEC/NS) → `AudioWorkletNode` (`live-worklet.js`) that
+  resamples to 16 kHz, **levels the input** (auto-gain, see lesson 37) and posts
+  1024-sample int16 blocks.
+- **Channel 1 is `getDisplayMedia({audio, video: true})`** tab/system audio — Chrome
+  only returns tab audio when video is requested; a failed display-media call
+  degrades to mic-only with a visible note.
+- The server runs **neither** detector on LVT1 frames (`handler.py:101` builds the
+  `Turn` straight from the frame). One coalescer per channel; `poll()` each iteration.
+- **Stop**: `MSG_FLUSH`, then wait for the server's `stats` frame (the drain signal)
+  before building the transcript. A failed drain must not strand the tab — restore
+  the transport buttons in a `finally`; a socket that dropped after transcripts
+  arrived still gets downloads and the History save.
+- Downloads are client-side: `.txt`, `.asr.json`, per-channel `.wav`.
+- **`Session.turnSplit()`** is the one number that explains a bad transcript:
+  `mic 0, speaker 12` means the mic recording has no speech for the
+  re-attribution to diarize, so the whole session comes back UNKNOWN.
+- Transcript items arrive in **decode-completion order** — sort by `start` before
+  rendering or re-attributing.
 
 ### Frontend: one stylesheet, one design system
-- All CSS is inline in `templates/app.html` (`<style>`, comments stripped by the tests before matching). No CSS file, no build step.
-- **A pane composes shared classes; it does not declare its own.** The Live tab shipped with `.live-status` / `.live-meters` / `.live-meter-*` / `.live-text` / `.live-note` / `.live-downloads` — a private second copy of the pill, the level meter and the transcript surface. The primitives are `.pill`, `.note`, `.mini-bar` + `.meter-row`, `.text-pane` + `.pane-short|tall|live`, `.btn` + `.row`/`.row-spread`, `.badge`, `.toast`, `.hidden` + `show(id, on)`. Status colours are `:root` tokens (`--ok-ink --bad-ink --warn-ink --*-soft --pane-h`) and must not be re-hardcoded.
-- **Two max-width breakpoints only: 860px and 560px.** Base rules are the desktop layout, so a `min-width` query is a rule violation. The 560px block is the phone layout (scrollable tab strip, 16px input floor for iOS, 44px tap targets, stacked controls, safe-area insets, `prefers-reduced-motion`); `<meta name="viewport">` carries `viewport-fit=cover` or the safe-area padding is inert.
-- **No inline styles.** Visibility is the `.hidden` class plus `show()`; no `style.display` writes and no `style="..."` in markup.
-- **A name in an `onclick` is `jsStr(name)`, never `escHtml(name)`.** `escHtml` escapes `& < >` and deliberately leaves quotes alone, and the browser HTML-decodes the attribute *before* the JS is parsed, so `onclick="f('${escHtml(name)}')"` is a `SyntaxError` on an apostrophe and the button silently does nothing. A learned profile takes its name from a source **filename**, so the apostrophe arrives without anybody typing it. `jsStr` is `JSON.stringify` with `"` → `&quot;`; `tests/test_voiceprint_panes.py` fails on any remaining `'${` in an `onclick`.
-- `tests/test_ui_design_system.py` pins all of the above in both directions (no orphan class either way, no private primitive, no inline style, token-only colours, exactly two breakpoints).
+Detail in [docs/ui.md](docs/ui.md#design-system).
+
+- All CSS is inline in `templates/app.html` (`<style>`, comments stripped by the
+  tests before matching). No CSS file, no build step.
+- **A pane composes shared classes; it does not declare its own.** The primitives
+  are `.pill`, `.note`, `.mini-bar` + `.meter-row`, `.text-pane` +
+  `.pane-short|tall|live`, `.btn` + `.row`/`.row-spread`, `.badge`, `.toast`,
+  `.hidden` + `show(id, on)`. Status colours are `:root` tokens and must not be
+  re-hardcoded.
+- **Two max-width breakpoints only: 860px and 560px.** Base rules are the desktop
+  layout, so a `min-width` query is a rule violation. The 560px block is the phone
+  layout; `<meta name="viewport">` carries `viewport-fit=cover` or the safe-area
+  padding is inert.
+- **No inline styles.** Visibility is `.hidden` plus `show()`; no `style.display`
+  writes and no `style="..."` in markup.
+- `tests/test_ui_design_system.py` pins all of this in both directions (no orphan
+  class either way, no private primitive, no inline style, token-only colours,
+  exactly two breakpoints).
 
 ### Voiceprints tab: two sub-tabs
-The Voiceprints pane is split by `.pill-tab` buttons into **Known speakers** and **Unnamed** (`showVoiceprintSubtab`, state in `vpSubtab`). They were one list, with the unnamed ones in a card above the known speakers — which made the named list unreadable and asked the user to identify a voice from a row of counts.
+Detail in [docs/ui.md](docs/ui.md#voiceprints-tab).
 
-- `.pill-tab` is ONE primitive for both strips: the header nav (`_nav.html` anchors) and the in-pane sub-tabs (buttons). The old `.tabs a` rule was replaced, and the test asserts it is gone — an anchor-scoped rule is what a button sub-tab would silently miss.
-- An unnamed profile is a fold (`togglePending` → `loadSnippetBody` → `snippetListHtml`) exactly like a named one: same endpoint, same player, same remove button. Its audio is the only evidence of who the voice is, so it must be playable **in place**. The action row differs on purpose — naming, merging and discarding are identity decisions, and only an unnamed profile has a "this is ___" input.
-- `snippetListHtml` + `loadSnippetBody` are the single renderer/loader pair; the test pins one definition, one call in the loader, and one call from each fold.
-- Naming or merging a profile switches to the Known tab, because the profile just moved there.
-- `refreshPending` writes the count into the tab label — a hidden card with no affordance is how the profiles went unnoticed.
-- **Every list is sorted by name** (`byName`, `numeric: true` so "Speaker 2" precedes "Speaker 10" — these labels are generated, and a lexicographic order puts 10 between 1 and 2). Applies to the known list, the unnamed list and the flagged card's speaker groups, which is why `byName` accepts a string as well as a row.
-- **A redraw must not close what the user opened.** `refresh()` replaces both lists' `innerHTML`, so it captures the open fold ids (`captureOpenFolds` — `body-<name>` / `pbody-<name>`) and reopens them with their content afterwards (`restoreOpenFolds`, reusing `loadSnippetBody` + `knownActionsHtml`). Reviewing means open a profile, remove three snippets, look again; collapsing on every removal made that impossible. `showVoiceprintSubtab` therefore only toggles visibility and NEVER re-renders, for the same reason.
-- **A job in another pane must not hijack the tab.** `/api/asr/activity/stream` is global, so a `consolidate` or `rescan` job reaches the Transcribe pane's `attachActiveJob`, which called `activateTab('transcribe')` and entered a transcription job UI — pressing "Consolidate All" jumped the user out of the Voiceprints pane. The mode is now checked against `TRANSCRIPTION_MODES = ['transcribe', 'diarize']` **before** the tab switch. (The job still has to be registered server-side; that is what stops the TTL monitor unloading ECAPA mid-pass.)
+- `.pill-tab` is ONE primitive for both strips: the header nav (`_nav.html`
+  anchors) and the in-pane sub-tabs (buttons). The old `.tabs a` rule was replaced,
+  and the test asserts it is gone — an anchor-scoped rule is what a button sub-tab
+  would silently miss.
+- **An unnamed profile is a fold** exactly like a named one: same endpoint, same
+  player, same remove button. Its audio is the only evidence of who the voice is,
+  so it must be playable **in place**. The action row differs on purpose — naming,
+  merging and discarding are identity decisions, and only an unnamed profile has a
+  "this is ___" input.
+- **`snippetListHtml` + `loadSnippetBody` are the single renderer/loader pair**;
+  the test pins one definition, one call in the loader, and one call from each fold.
+- **Every list is sorted by name** (`byName`, `numeric: true`) so `Speaker 2`
+  precedes `Speaker 10`. This applies to the known list, the unnamed list and the
+  flagged card's speaker groups.
+- **A redraw must not close what the user opened.** `refresh()` captures the open
+  fold ids (`captureOpenFolds`) and reopens them afterwards (`restoreOpenFolds`).
+  Reviewing means open a profile, remove three snippets, look again.
+- **A job in another pane must not hijack the tab.** `/activity/stream` is global,
+  so a `consolidate` or `rescan` job reaches the Transcribe pane's
+  `attachActiveJob`; the mode is checked against `TRANSCRIPTION_MODES` **before**
+  any tab switch. `showVoiceprintSubtab` only toggles visibility and NEVER
+  re-renders, for the same reason as the folds.
 
 ### Markup inside a JS template literal is not validated by anything
-An `onclick="f(${jsStr(n)})""` — a doubled closing quote, which is what a careless search-and-replace of `'${escHtml(x)}'` into `${jsStr(x)}` produces — silently kills the button. `node --check` parses past it (the markup is inside a template literal), and the design-system tests did not catch it either. `test_no_html_attribute_is_closed_twice` scans for `""` and `">>` outside `<style>`/`<script>`/line comments.
+An `onclick="f(${jsStr(n)})""` — a doubled closing quote, which is what a careless
+search-and-replace of `'${escHtml(x)}'` into `${jsStr(x)}` produces — silently
+kills the button. `node --check` parses past it (the markup is inside a template
+literal), and the design-system tests did not catch it either.
+`test_no_html_attribute_is_closed_twice` scans for `""` and `">>` outside
+`<style>`/`<script>`/line comments. See [docs/ui.md](docs/ui.md#known-traps).
 
 ## Project Structure
 
 ```
 asr-mcp/
 ├── asr_mcp/
-│   ├── server.py              # FastAPI app + lifespan + auth routes
+│   ├── server.py              # FastAPI app + lifespan + POST /shutdown (require_admin)
 │   ├── api/
 │   │   ├── router.py          # Combines sub-routers under /api
 │   │   ├── asr_router.py      # POST /asr/diarize, /transcribe, /transcribe/upload (SSE), /live/save, WS /ws/stream
@@ -499,7 +409,7 @@ asr-mcp/
 │   │   └── live-worklet.js    # AudioWorkletProcessor: getUserMedia/getDisplayMedia -> 16 kHz mono int16 blocks + input auto-gain
 │   └── templates/
 │       ├── _nav.html          # SPA tab bar snippet (__NAV__ + __ACT_*__ markers)
-│       ├── login.html         # Dark-themed login form
+│       ├── login.html         # Login + registration form + Google button
 │       └── app.html           # Unified SPA: Transcribe / Live / Voiceprints / History / Settings tabs
 ├── tests/                    # Pure-python unit tests (pytest, no GPU needed)
 │                            # test_ui_design_system.py = the CSS design system
@@ -527,12 +437,18 @@ asr-mcp/
 ├── .env
 ├── .env.example
 ├── .gitignore
+├── INSTALLATION.md           # install, reverse proxy, every server setting, auth setup
 ├── AGENTS.md
 ├── docs/
+│   ├── api.md                  # Every route + its auth + cross-cutting conventions
+│   ├── processing.md           # Diarization, turns, boundaries, ASR, live streaming
+│   ├── voiceprints.md          # Profile creation, pending, integrity, consolidation
+│   ├── ui.md                   # The SPA, its design system, its known traps
 │   ├── uncertain-speakers.md   # User-facing policy reference (JSON shape, reasons, gates)
-│   ├── lessons/                # Per-subsystem evidence behind each numbered rule
-│   └── plans/                  # Improvement plans (boundary + voice quality)
-├── README.md
+│   ├── boundary-measurements.md # The boundary A/B measurement + what is uncalibrated
+│   └── lessons/                # Per-subsystem evidence behind each numbered rule
+├── README.md                   # Overview + pointers to every doc above
+├── INSTALLATION.md             # Install, reverse proxy, every server setting, auth setup
 ```
 
 ## SQLite Schema
@@ -549,78 +465,24 @@ asr-mcp/
 
 ## API Endpoints
 
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | No | Health check + model status |
-| `/gui` | GET | Session | SPA — Transcribe tab (also serves /live, /voices, /transcriptions, /settings with different active tab) |
-| `/live` | GET | Session | SPA — Live tab (browser real-time transcription, `static/live.js`) |
-| `/voices` | GET | Session | SPA — Voiceprints tab |
-| `/transcriptions` | GET | Session | SPA — History tab |
-| `/settings` | GET | Session | SPA — Settings tab (status, client token, session, admin accounts card) |
-| `/login` | GET | No | Login page |
-| `/api/asr/diarize` | POST | API key | Diarize audio by file path |
-| `/api/asr/diarize/upload` | POST | Session | Diarize uploaded audio (`?num_speakers=` is a query param, not form) |
-| `/api/asr/transcribe` | POST | API key | Transcribe by file path (`"language"` in the body, ISO 639-1 or `auto`, default `auto`) |
-| `/api/asr/transcribe/upload` | POST | Session/API key | Transcribe uploaded audio (`?save=false` skips server-side transcript save; `?language=hu` ISO 639-1 or `auto`, default `auto`) |
-| `/api/asr/languages` | GET | Session/API key | Static language list of the configured backend (no model load) — `{backend, supports_auto, languages:[{code,name}]}` |
-| `/api/asr/activity/stream` | GET | Session/API key | SSE push of job start/finish (snapshot on connect + keep-alive pings; replaces polling `/active`) |
-| `/api/asr/active/stream` | GET | Session/API key | SSE replay+follow of the current job; another user's job is a 404 |
-| `/api/asr/active/cancel` | POST | Session/API key | Cancel your own active transcription job |
-| `/api/asr/ws/stream` | WS | Session/API key | Real-time streaming transcription (auth: session, `X-API-Key` header or `?token=`; closes 1008 *before* `accept()`) |
-| `/api/asr/stream` | POST | No | Always 501 — a stub that points at the WebSocket endpoint |
-| `/api/asr/attribution` | POST | Session/API key | Re-attribute cached ASR items to speakers from a server-side `wav_path` — **no ASR** (`items` is a list of `{start, end, text, confidence}`) |
-| `/api/asr/attribution/upload` | POST | Session/API key | Same, for a client-recorded upload: `file` + `items` (JSON array form field) |
-| `/api/asr/live/save` | POST | Session/API key | Persist a browser Live-tab session to History: JSON `{audio_filename, result, stats?, sidecar?}` — text only, no audio field; stores `metadata.asr_source="live_stream"` |
-| `/api/speaker/register` | POST | API key | Register voiceprint |
-| `/api/speaker/register/upload` | POST | API key | Register voiceprint from upload |
-| `/api/speaker/identify` | POST | API key | Identify speaker from audio |
-| `/api/speaker/list` | GET | API key | List all voiceprints |
-| `/api/speaker/{name}` | DELETE | API key | Delete voiceprint |
-| `/api/voiceprint/speakers` | GET | Session | List speakers (web UI); each entry carries `pending` |
-| `/api/voiceprint/speakers/{speaker_name}/snippets` | GET | Session | List snippets for a speaker |
-| `/api/voiceprint/speakers/{speaker_name}/rename` | POST | Session | Rename speaker |
-| `/api/voiceprint/speakers/merge` | POST | Session | Merge speakers |
-| `/api/voiceprint/upload` | POST | Session | Register voiceprint from upload |
-| `/api/voiceprint/rescan` | POST | Session | Rescan voices directory |
-| `/api/voiceprint/rescan/stream` | POST | Session | Rescan as an SSE stream |
-| `/api/voiceprint/pending` | GET | Session | Learned-but-unnamed speakers awaiting a name |
-| `/api/voiceprint/pending/{speaker_name}/confirm` | POST | Session | Give a pending profile a real name — the only route that makes it matchable |
-| `/api/voiceprint/pending/{speaker_name}/candidates` | GET | Session | Registered speakers this pending profile resembles, ranked, each with `likely` |
-| `/api/voiceprint/pending/{speaker_name}/merge` | POST | Session | Fold a pending profile into an existing speaker (`{"into": "<name>"}`) |
-| `/api/voiceprint/snippets/{snippet_id}` | DELETE | Session | Delete one snippet |
-| `/api/voiceprint/snippets/{snippet_id}/audio` | GET | Session | Stream snippet audio (FLAC) |
-| `/api/voiceprint/speakers/{speaker_name}` | DELETE | Session | Delete a voiceprint |
-| `/api/voiceprint/speakers/{name}/upload` | POST | Session/API key | Add snippet from a file (optional `?start_sec=&end_sec=`; `?replace_source=false` keeps earlier snippets from the same file — the default **replaces** them, see below) |
-| `/api/voiceprint/speakers/{name}/refine` | POST | Session/API key | Rebuild voiceprint from snippets |
-| `/api/voiceprint/integrity` | GET | Session | Read-only store audit (8 findings) |
-| `/api/voiceprint/integrity/cleanup` | POST | Session | Repair the findings that have one correct answer (`IntegrityCleanupRequest{dry_run=True, dead_snippets=True, ...}`) |
-| `/api/voiceprint/consolidate/stream` | POST | Session | Flag the outlier snippets of one speaker (`?speaker_name=`, omit = whole library) and re-fit from the kept ones, as an SSE stream |
-| `/api/voiceprint/flagged` | GET | Session | Snippets flagged for review, ranked by distance (`?speaker_name=`) — read-only |
-| `/api/voiceprint/flagged/{snippet_id}/keep` | POST | Session | Withdraw the flag; re-run consolidation to fold the snippet back into the profile |
-| `/api/voiceprint/flagged/remove` | POST | Session | Delete every flagged snippet in ONE pass, then re-refine each touched speaker once (`FlaggedRemoveRequest{dry_run=True, speaker_name?}`) |
-| `/api/token` | GET/POST | Session/API key | Client API token status / generate (one per user) |
-| `/api/transcripts` | GET | Session | List all transcriptions for user |
-| `/api/transcripts/{id}` | GET | Session | Get transcription by ID |
-| `/api/transcripts/{id}/download` | GET | Session | Download as plain text |
-| `/api/transcripts/{id}` | DELETE | Session | Delete transcription |
-| `/api/auth/methods` | GET | No | Which sign-up methods this deployment offers — `{email, google, password_hint}` |
-| `/api/auth/login` | POST | No | Login — 401 wrong password, 403 with a reason (unverified/disabled) |
-| `/api/auth/login/session` | POST | No | Login from the form (302) |
-| `/api/auth/logout` | POST/GET | No | Logout |
-| `/api/auth/register` | POST | No | Email sign-up — 201 + a confirmation mail; never signs anybody in |
-| `/api/auth/verify` | GET | No | Consume the single-use email link (302; bad/spent/empty all answer alike) |
-| `/api/auth/google/start` | GET | No | Begin Google sign-in (302; 404 when unconfigured) |
-| `/api/auth/google/callback` | GET | No | Finish it — 302 to the SPA, or to `{prefix}/login?google=state\|declined\|failed\|closed` |
-| `/api/user` | GET | No | Current user info (session only) |
-| `/api/admin/users` | GET | Admin | Account table — never a hash or a verification token |
-| `/api/admin/users/{id}/disable` | POST | Admin | Suspend a registrable account |
-| `/api/admin/users/{id}/enable` | POST | Admin | Lift a suspension |
-| `/api/admin/users/{id}` | DELETE | Admin | Delete the account; `?purge=true` also drops its rows and `voices/<id>/` |
-| `/shutdown` | POST | Admin | Stop the server (was ungated; it cancels other users' jobs) |
-| `/api/mcp/tools` | GET | No | List MCP tools |
-| `/api/mcp/resources` | GET | No | List MCP resources |
-| `/api/mcp/call` | POST | No | Call MCP tool |
-| `/api/mcp/resource/{uri}` | GET | No | Read one MCP resource |
+**The full route table — every endpoint, its auth and its conventions — is in
+[docs/api.md](docs/api.md).** It is maintained there and is not duplicated here.
+
+The rules that govern all of them:
+
+- **Identity is a STRING resolved per request** (`get_current_user`, see Auth
+  Flow above). Every DB accessor defaults to `DEFAULT_USER`, so a call site that
+  forgets `user_id=` silently reads another identity's rows instead of failing.
+- **Per-user scoping.** speakers, voiceprints, snippets, transcripts and the
+  audio under `voices/<user_id>/` all belong to the resolved identity.
+  `/api/asr/active/stream` is a 404 for another user's job; `/activity/stream`
+  reports only your own; `/active/cancel` only cancels your own.
+- **Admin routes** (`/api/admin/*`) and `POST /shutdown` require `require_admin`,
+  which is a plain equality against `TRANSCRIBE_ADMIN_USER`. Empty means **nobody**.
+- **SSE routes** yield and run heavy work off-loop (lesson 19), and `stage: "done"`
+  finishes the job, so a progress event must never use it (lesson 25).
+- **Long uploads return `text/event-stream`**, never JSON.
+
 
 ## Environment Variables
 
@@ -778,21 +640,33 @@ anything the rule covers.
 | 42 | A live boundary is the client's CLAIM and the server's DECISION: Silero trims the edges, a timeline guard refuses a `start_sample` that goes backwards, and a merged turn carries its gap as silence so the declared span equals the audio sent | [live design](docs/lessons/live-client-design.md) |
 
 ### Reference documents
-- [docs/uncertain-speakers.md](docs/uncertain-speakers.md) — user-facing description of the
-  uncertainty policy: JSON shape, every `attribution_reason`, both naming gates, and the
-  known limitation on short recordings.
+
+**Topic documentation** — what a subsystem does, written for a reader:
+
+| Document | Covers |
+|---|---|
+| [docs/api.md](docs/api.md) | Every route, its authentication, and the conventions that hold across all of them |
+| [docs/processing.md](docs/processing.md) | The request shape, the 13-step pipeline, turn preparation, the boundary engine, the three ASR backends, live streaming, progress events |
+| [docs/voiceprints.md](docs/voiceprints.md) | Profile creation, pending profiles, one-file-one-contribution, the integrity audit and rebuild, outlier consolidation, naming-vs-learning |
+| [docs/ui.md](docs/ui.md) | The five tabs, the design system, and the traps (`jsStr` in `onclick`, template-literal markup, redraws that close folds) |
+| [docs/uncertain-speakers.md](docs/uncertain-speakers.md) | User-facing description of the uncertainty policy: JSON shape, every `attribution_reason`, both naming gates, and the known limitation on short recordings |
+| [INSTALLATION.md](INSTALLATION.md) | Install, reverse proxy, every server setting and what it does, and how to configure each authentication method |
+| [README.md](README.md) | Overview and pointers; nothing is documented there that is not documented better elsewhere |
+
+**Evidence and history** — why each rule above exists:
+
 - [docs/lessons/](docs/lessons/) — one file per subsystem with the full evidence behind
   each rule above.
 - [docs/lessons/live-client-design.md](docs/lessons/live-client-design.md) — why the
   live client's final text comes from the live ASR cache rather than a re-transcription,
   the two rejected alternatives, and the trigger for revisiting the decision.
-- [docs/plans/boundary-and-voice-quality-plan.md](docs/plans/boundary-and-voice-quality-plan.md)
-  — the P0–P4 boundary/learning plan, its findings, the **measured** A/B behind
-  lesson 40, and the honest list of what is still uncalibrated.
 - [docs/lessons/identity-registration-admin.md](docs/lessons/identity-registration-admin.md)
   — the auth/registration port: what the per-user separation actually fixed,
   the credential store, email sign-up, Google sign-in and the admin, with the
   port-parity decisions and the call-site traps each phase surfaced.
+- [docs/boundary-measurements.md](docs/boundary-measurements.md) — the **measured**
+  A/B behind lesson 40, the two results that do not flatter it, the corrections
+  to the original plan, and the honest list of what is still uncalibrated.
 
 ## Historical notes (no longer true — kept so they are not re-introduced)
 
