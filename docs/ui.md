@@ -125,6 +125,17 @@ Known tab, because the profile just moved there.
 
 The backend for all of this is in [voiceprints.md](voiceprints.md).
 
+**`Clean Up Snippets` is the one library-wide button that deletes audio**, so it
+is the only red one on this pane: every other destructive button here is scoped
+to a single profile and shows which snippet it drops. It runs
+`/integrity/cleanup` **twice** — `dry_run: true` first, `confirm` with the counts
+the plan returned, then `dry_run: false` — and leaves the three steps with a
+wrong answer off (`duplicates`, `dead_snippets`, `stale_totals`): a button
+labelled "clean up snippets" must not be the thing that merges two colleague
+profiles, purges rows, or rewrites a number. It is a JSON round trip rather than
+an SSE job, so the status line's stage text is the only progress; the embedding
+model has to come up (`ensure_gpu`) before any of it happens.
+
 ## History tab
 
 Saved transcripts, scoped to the signed-in user. `?save=false` on an upload skips

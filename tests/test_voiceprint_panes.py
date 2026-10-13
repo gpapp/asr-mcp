@@ -252,6 +252,63 @@ def test_every_speaker_list_is_sorted_by_name():
     assert "Object.keys(bySpeaker).sort(byName)" in _fn("renderFlagged")
 
 
+# ── the snippet cleanup button plans before it deletes ──────────────────────
+
+def test_the_snippet_cleanup_button_plans_before_it_deletes():
+    """A destructive button that applies on the first click is a bug.
+
+    `dry_run: true` has to be in the FIRST request the handler sends, and
+    `dry_run: false` must be reachable only after a `confirm`. The order is
+    what makes the first click safe, and the confirm is where the user sees
+    what it would actually remove.
+    """
+    fn = _fn("trimSnippets")
+    assert fn, "app.html has no trimSnippets() handler"
+    # The flag is threaded through one helper, so it is the CALL ORDER that
+    # matters: plan, then confirm, then apply.
+    assert "dry_run: dryRun" in fn
+    plan = fn.index("await POST(true)")
+    confirm_at = fn.index("confirm(")
+    apply = fn.index("await POST(false)")
+    assert plan < confirm_at < apply, (
+        "the destructive request is not gated on a confirm, or it is not "
+        "planned first"
+    )
+    assert apply < fn.index("trimInFlight = false")
+
+
+def test_the_snippet_cleanup_button_runs_only_the_policy_step():
+    """The three user-judgement steps must stay off.
+
+    Duplicate merging, dead-row purging and total recomputation are decisions
+    with a wrong answer that a user has to make. A button labelled "Clean Up
+    Snippets" that silently merges a user's two colleague profiles because
+    their audio was byte-identical is that button making a decision it cannot
+    undo.
+    """
+    fn = _fn("trimSnippets")
+    body = fn[fn.index("body: JSON.stringify({"):fn.index("await POST(true)")]
+    assert "trim_snippets: true" in body
+    for off in ("duplicates", "dead_snippets", "stale_totals"):
+        assert f"{off}: false" in body, f"the button leaves {off} on"
+
+
+def test_the_snippet_cleanup_button_reports_what_it_removed_and_refreshed():
+    """Zero-removal is a result, not a silent no-op.
+
+    A dry-run that finds nothing has to say so, and an applied run has to
+    redraw both lists: trimming changes snippet counts, which are drawn into
+    the speaker headers, and pending profiles can lose clips like any other.
+    """
+    fn = _fn("trimSnippets")
+    assert "within its snippet budget" in fn, "an empty plan does not tell the user"
+    assert "await refresh();" in fn, "the trim does not redraw the lists"
+    assert "res.refined" in fn, "the toast does not count the re-embedded profiles"
+    assert "statusEl.classList.remove('visible')" in fn.split("finally {")[-1], (
+        "the status line stays up, or the in-flight flag is never cleared"
+    )
+
+
 def test_no_html_attribute_is_closed_twice():
     """`onclick="f(${jsStr(n)})""` renders an attribute plus a stray quote.
 

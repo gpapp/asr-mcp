@@ -668,6 +668,11 @@
                     <button class="btn btn-primary" onclick="refresh()">Refresh</button>
                     <button class="btn btn-ghost" onclick="openMergeDialog()">Merge Speakers</button>
                     <button class="btn btn-ghost" onclick="consolidateLibrary()">Consolidate All</button>
+                    <!-- The one library-wide action that deletes audio, so it is
+                         the one red button: every other destructive button on this
+                         pane is scoped to a single profile, and the user can see
+                         exactly which snippet it would drop. -->
+                    <button class="btn btn-danger" onclick="trimSnippets()">Clean Up Snippets</button>
                 </div>
 
                 <div id="rescanStatus" class="status-row">
@@ -679,6 +684,12 @@
                 <div id="consolidateStatus" class="status-row">
                     <div class="spinner"></div>
                     <span class="status-stage">Consolidating...</span>
+                    <span class="status-count"></span>
+                </div>
+
+                <div id="trimStatus" class="status-row">
+                    <div class="spinner"></div>
+                    <span class="status-stage">Working...</span>
                     <span class="status-count"></span>
                 </div>
 
@@ -2717,6 +2728,93 @@
             } finally {
                 rescanInFlight = false;
                 statusEl.classList.remove('visible');
+            }
+        }
+
+        // --- The snippet policy, applied backwards ---
+        //
+        // Collect already enforces the per-file budget, so a reprocess adopts it
+        // for the one file it re-runs while every other recording keeps the
+        // thirty clips it was once allowed. This is the button that runs it over
+        // the whole library. It is a JSON round trip, not an SSE job: the work is
+        // a handful of queries plus one re-embed per touched profile, so the
+        // stage line is the only progress there is to show.
+
+        let trimInFlight = false;
+
+        async function trimSnippets() {
+            if (trimInFlight) return;
+            trimInFlight = true;
+            const statusEl = document.getElementById('trimStatus');
+            const stageEl = statusEl.querySelector('.status-stage');
+            const countEl = statusEl.querySelector('.status-count');
+            statusEl.classList.add('visible');
+            const POST = (dryRun) => apiFetch('/integrity/cleanup', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                // Only the policy step. This button makes no judgement that
+                // belongs to the user: no duplicate merge, no dead-row purge, no
+                // recomputed totals.
+                body: JSON.stringify({
+                    dry_run: dryRun,
+                    duplicates: false,
+                    dead_snippets: false,
+                    stale_totals: false,
+                    trim_snippets: true,
+                }),
+            });
+            try {
+                // The dry-run IS the plan and the confirmation counts. Nothing has
+                // been touched at this point, so every number below is what would
+                // go, not what went.
+                stageEl.textContent = 'Checking the snippet budget...';
+                countEl.textContent = '';
+                const dry = await POST(true);
+                const groups = dry.trimmed_snippets || [];
+                const doomed = groups.reduce(
+                    (n, g) => n + (g.removed_ids || []).length, 0);
+                if (!doomed) {
+                    toast('Every recording is within its snippet budget');
+                    return;
+                }
+                const byReason = (reason) => groups.reduce(
+                    (n, g) => n + Object.values(g.reasons || {})
+                        .filter(r => r === reason).length, 0);
+                const over = byReason('over_per_file_cap');
+                const short = byReason('too_short');
+                const secs = groups.reduce((s, g) => s + (g.seconds || 0), 0);
+                const profiles = Array.from(new Set(groups.map(g => g.speaker)));
+                const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+                const who = profiles.slice(0, 4).join(', ')
+                    + (profiles.length > 4 ? ', +' + (profiles.length - 4) + ' more' : '');
+                if (!confirm(
+                    'Remove ' + plural(doomed, 'snippet', 'snippets') + ' from '
+                    + plural(profiles.length, 'profile', 'profiles') + ' across '
+                    + plural(groups.length, 'recording', 'recordings') + ' ('
+                    + formatDuration(secs) + ')?\n\n'
+                    + plural(over, 'snippet', 'snippets') + ' over the ten-per-file budget, '
+                    + plural(short, 'snippet', 'snippets') + ' under 5s.\n\n'
+                    + 'Each profile is re-embedded from the snippets that stay, and the '
+                    + 'audio files are deleted.\nThis cannot be undone.\n\n'
+                    + 'Profiles: ' + who)) return;
+
+                stageEl.textContent = 'Trimming and re-embedding...';
+                // One round trip, and the slow part is the embedding model coming
+                // up (ensure_gpu), so the request can look stuck for a few seconds
+                // before anything happens. The stage text is what covers that.
+                const res = await POST(false);
+                const removed = (res.trimmed_snippets || []).reduce(
+                    (n, g) => n + (g.removed || 0), 0);
+                const refined = (res.refined || []).length;
+                toast('Removed ' + plural(removed, 'snippet', 'snippets') + ' across '
+                    + plural(refined, 'profile', 'profiles') + ' re-embedded');
+                await refresh();
+            } catch (e) {
+                toast('Snippet cleanup failed: ' + e.message, true);
+            } finally {
+                statusEl.classList.remove('visible');
+                trimInFlight = false;
             }
         }
 
