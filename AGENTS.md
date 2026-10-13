@@ -226,7 +226,40 @@ is repaired automatically; anything needing a human decision is only reported.**
   ECAPA, **never** the ASR backend) — the documented exception to "no model load
   at startup".
 
-### Voiceprint Consolidation: outlier snippets and manual review
+### Voiceprint snippets: ten per file, five seconds minimum
+Detail in [docs/voiceprints.md](docs/voiceprints.md#the-per-file-snippet-budget).
+
+- **Per FILE, per profile.** `AUTO_COLLECT_MAX_PER_SOURCE = 10`,
+  `AUTO_COLLECT_MIN_DURATION = 5.0`. The per-file cap is what stops one long
+  recording from BECOMING a profile: a 50-minute meeting attributed to one
+  colleague for 40 of those minutes yields forty clips from one room. Neither
+  `AUTO_COLLECT_MAX_TOTAL_SEC` (1200s, cumulative) nor the
+  one-file-one-contribution rule covers that case, and the cap is independent of
+  the cumulative one in both directions.
+- **Best fit first.** `span_fit_key(seg)` ranks by `speaker_confidence` with
+  duration as the tiebreak — free, no embedding pass. A span with NO recorded
+  verdict (a generic `Speaker N`) is **1.0, not 0.0**: it is an unranked cluster
+  rather than a confident mismatch, and 0.0 would starve the learn path of the
+  budget it has to spend. Stored rows keep no confidence, so the cleanup ranks
+  by duration (longest, then earliest, then lowest id).
+- **The 5s floor is measured on the STORED clip, AFTER the VAD trim.** A 5.2s
+  turn with a silent head is a 4.6s snippet. A trailing sliver left under
+  `AUTO_COLLECT_MAX_SEGMENT_SEC` (300s) or `learning.max_snippet_sec` is dropped
+  rather than extended into the next chunk — extending would break the
+  per-snippet cap.
+- **The live save path shares the floor.** `/live/save` and the upload routes all
+  funnel through `asr_router.py::_auto_collect` (946, 1400, 1840), so a sub-5s live
+  turn feeds no snippet on any transport. This is a deliberate decision, not an
+  oversight: a turn too short to embed is too short to name, whether it arrived
+  over the WebSocket or in a file.
+- **`trim_snippets` in `cleanup_integrity` applies the budget backwards.** Without
+  it the policy only ever reaches the file you re-process next. It runs BEFORE
+  the totals are recomputed so its doomed ids feed `_surviving_speech_seconds`,
+  and it NEVER touches a row with no recorded `source_audio` — that row belongs
+  to no file, so no per-file budget can be counted against it, and deleting
+  audio that cannot be attributed is the judgement the cleanup refuses to make.
+
+## Voiceprint Consolidation: outlier snippets and manual review
 Detail in [docs/voiceprints.md](docs/voiceprints.md#consolidation-finding-snippets-that-are-not-this-speaker).
 
 `consolidate_speaker` answers "is every snippet of this profile actually the same

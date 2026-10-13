@@ -331,6 +331,15 @@ class IntegrityCleanupRequest(BaseModel):
     dead_snippets: bool = True
     #: Recompute ``total_speech_sec`` from the snippet durations.
     stale_totals: bool = True
+    #: Enforce the snippet policy over the whole store: at most
+    #: ``AUTO_COLLECT_MAX_PER_SOURCE`` snippets per file per profile and none
+    #: shorter than ``AUTO_COLLECT_MIN_DURATION``. A reprocess already applies
+    #: this to the file it re-runs; this is what applies it to every other
+    #: recording. Ranks by stored duration, because a snippet row keeps no
+    #: attribution confidence to rank on, and never touches a row with no
+    #: recorded ``source_audio`` -- it belongs to no file, so no per-file
+    #: budget can be counted against it.
+    trim_snippets: bool = True
 
 
 class ConsolidationRequest(BaseModel):

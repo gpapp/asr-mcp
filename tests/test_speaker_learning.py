@@ -692,6 +692,8 @@ def test_one_load_audio_per_request(service, db, tmp_path, monkeypatch):
         return real_load(path, target_sr=target_sr)
 
     monkeypatch.setattr(vutils, "load_audio", counting_load)
+    # 12 spans, capped at 10 by the per-file snippet budget
+    # (AUTO_COLLECT_MAX_PER_SOURCE). The cap bounds collection, not decoding.
     spans = [(float(i * 20), float(i * 20 + 18)) for i in range(12)]
     out = service.auto_collect_from_diarization(
         audio_path=str(tmp_path / "meeting.wav"),
@@ -700,7 +702,7 @@ def test_one_load_audio_per_request(service, db, tmp_path, monkeypatch):
     )
     assert len(out["pending_created"]) == 1
     name = out["pending_created"][0]["name"]
-    assert service._snippets.count(name, user_id="u") == 12
+    assert service._snippets.count(name, user_id="u") == 10
     assert len(calls) == 1, calls
     assert out["audio_loads"] == 1
 

@@ -511,6 +511,9 @@ def test_snippet_audio_is_exactly_the_recorded_span(make_service):
 
 def test_one_load_audio_per_request_not_one_per_segment(make_service):
     s = make_service(_one_voice(), duration=300.0)
+    # 12 spans, capped at 10 by the per-file snippet budget
+    # (AUTO_COLLECT_MAX_PER_SOURCE). Twelve is still the fixture that proves the
+    # point: the cap stops COLLECTION, it does not make the loader run per span.
     spans = [(float(i * 20), float(i * 20 + 18)) for i in range(12)]
     assert spans[-1][1] < 300.0
     out = s.auto_collect_from_diarization(
@@ -518,7 +521,7 @@ def test_one_load_audio_per_request_not_one_per_segment(make_service):
         user_id="u", source_id="meeting.wav", learn_new=True,
     )
     name = out["pending_created"][0]["name"]
-    assert s._snippets.count(name, user_id="u") == 12
+    assert s._snippets.count(name, user_id="u") == 10
     # Every snippet was cut, from ONE decode: the learner, the cohesion pass and
     # the segment loader all share the request's AudioSegmentSource.
     assert len(s.decodes) == 1, s.decodes
@@ -757,7 +760,7 @@ def test_a_speaker_who_is_no_longer_recognised_keeps_the_old_take(make_service):
     )
     name = out["pending_created"][0]["name"]
 
-    # Every span is too short to collect (AUTO_COLLECT_MIN_DURATION = 3.0s).
+    # Every span is too short to collect (AUTO_COLLECT_MIN_DURATION = 5.0s).
     s.auto_collect_from_diarization(
         audio_path="meeting.wav",
         segments=_segments("Speaker 5", [(0.0, 1.0), (2.0, 3.0), (4.0, 5.0)]),

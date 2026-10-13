@@ -275,6 +275,13 @@ async def voiceprint_integrity_cleanup(
     invisible to the "one file, one contribution" replacement. No file that
     resolves is ever unlinked; a dead row's file is already gone.
 
+    ``trim_snippets`` is the one step that is not an audit finding: it enforces
+    the snippet policy (top ``AUTO_COLLECT_MAX_PER_SOURCE`` per file, none under
+    ``AUTO_COLLECT_MIN_DURATION``) over the whole library, which a reprocess
+    only ever applies to the file it re-runs. Ranked by stored duration because
+    a row keeps no attribution confidence, and rows with no recorded source are
+    left alone.
+
     ``ensure_gpu=True`` is load-bearing. Removing snippets leaves the profile
     describing audio that is gone, so the speakers it touched are re-refined
     afterwards -- and ``_auto_refine`` returns silently when no embedding
@@ -287,6 +294,7 @@ async def voiceprint_integrity_cleanup(
         duplicates=req.duplicates,
         dead_snippets=req.dead_snippets,
         stale_totals=req.stale_totals,
+        trim_snippets=req.trim_snippets,
         dry_run=req.dry_run,
     )
 

@@ -7,6 +7,7 @@ reference is in [api.md](api.md#voiceprints-apivoiceprint); settings are in
 - [How a profile is created](#how-a-profile-is-created)
 - [Pending profiles](#pending-profiles)
 - [One file, one contribution](#one-file-one-contribution)
+- [The per-file snippet budget](#the-per-file-snippet-budget)
 - [Integrity audit and rebuild](#integrity-audit-and-automatic-rebuild)
 - [Consolidation](#consolidation-finding-snippets-that-are-not-this-speaker)
 - [Matching: distance vs confidence](#matching-a-distance-reads-differently-than-a-confidence)
@@ -154,6 +155,80 @@ Opt out per-request with `?replace_source=false` on
 
 ---
 
+## The per-file snippet budget
+
+One recording may contribute **at most `AUTO_COLLECT_MAX_PER_SOURCE` (10)
+snippets to one profile**, and **every snippet is at least
+`AUTO_COLLECT_MIN_DURATION` (5s)** long. Both rules apply to every profile —
+registered and pending alike, because an unnamed profile is a profile the user
+will eventually name.
+
+### Why a per-file cap at all
+
+The failure this prevents is not a reprocess; the one-file-one-contribution rule
+already handles that. It is a single **long** recording: a fifty-minute meeting
+attributed to one colleague for forty of those minutes yields forty clips from
+one file, and the profile then describes that room, that microphone and that
+afternoon rather than the person. The cumulative `AUTO_COLLECT_MAX_TOTAL_SEC`
+does not stop it, because it counts seconds across all files and the profile
+never reaches the cap from one recording of ordinary length.
+
+It is independent of the cumulative cap: a speaker heard on ten recordings may
+hold ten full per-file budgets, and one long recording may not eat the whole
+1200s.
+
+### How the ten are chosen
+
+**Best fit first.** Candidate spans are ranked by the attribution's own verdict —
+`speaker_confidence`, with duration as the tiebreak — and the budget is spent in
+that order. This is free: it reads fields the turn already carries, and costs no
+embedding pass. A confident 12s turn is collected before a marginal 40s one
+that would otherwise consume half the ceiling.
+
+A generic `Speaker N` cluster carries no confidence at all
+(`learning_refusal_reason` does not require one). Those rank at **1.0**, not
+0.0 — ranking them at the bottom would starve the learn path of the budget it
+has to spend. With no verdict recorded the ranking falls back to duration, which
+is the same thing the cleanup ranks on.
+
+**The floor is measured on the stored clip, after the VAD trim.** A 5.2s turn
+whose head is silence is a 4.6s snippet once its edges are snapped onto speech
+sections, and it spends a slot for audio that is mostly silence. The trim happens
+after the eligibility check, so a span can clear the floor as a turn and fail it
+as a clip.
+
+A **trailing sliver** left behind by `AUTO_COLLECT_MAX_SEGMENT_SEC` (300s) or by
+`learning.max_snippet_sec` is dropped rather than stored: extending the chunk
+would break the per-snippet cap.
+
+When spans beyond the budget are dropped, the run's diagnostics say so
+(`over_per_file_cap`, `too_short_after_trim`), so "3 of 27 spans" is
+distinguishable from "there was almost no speech".
+
+### Cleaning up an existing library
+
+A reprocess applies the budget to the file it re-runs — which means the policy
+only ever reached the recording you happened to re-process next. The `trim_snippets`
+step of `POST /api/voiceprint/integrity/cleanup` applies it backwards over the
+whole library:
+
+| Rule | Detail |
+|---|---|
+| **≤ 10 snippets per file** | Ranked by stored duration, longest first, then earliest start, then lowest id — total and deterministic, so a re-run makes the same decisions. |
+| **≥ 5s per snippet** | Decided **first and independently of rank**: a sub-floor snippet never earns a slot, so it cannot crowd out a good clip by taking one. |
+| **Same file across names** | One recording, identified by the filename hash — a different directory, extension or upload name is still one file and one budget. |
+| **No recorded source ⇒ exempt** | A `NULL` `source_audio` (rescan-adopted audio) belongs to no file, so no per-file budget can be counted against it. Deleting audio that cannot be attributed is the judgement this cleanup refuses to make. |
+
+It is **dry-run by default**, like the rest of that endpoint, and it re-refines
+each touched speaker **once** over the final set — not once per removed row.
+
+Note what the ranking is **not**: "newest wins" would mean ranking on the row id,
+which records when a row was written rather than how much of the speaker it
+holds. A re-processed file never reaches the trim anyway, because its previous
+take was already replaced.
+
+---
+
 ## Integrity audit and automatic rebuild
 
 `asr_mcp/voiceprint/audit.py` is **read-only** and reports 8 findings.
@@ -215,8 +290,8 @@ A crash mid-rebuild is self-healing: the next audit reports
 
 `GET /api/voiceprint/integrity` — read-only report.
 `POST /api/voiceprint/integrity/cleanup` — fixes duplicate-content rows and dead
-rows, then re-refines each affected speaker **once**. **Dry run unless
-`dry_run: false`.**
+rows, enforces the per-file snippet budget, then re-refines each affected speaker
+**once**. **Dry run unless `dry_run: false`.**
 
 ---
 

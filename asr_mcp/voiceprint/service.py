@@ -3,12 +3,13 @@ import datetime
 import functools
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import soundfile as sf
@@ -30,7 +31,21 @@ from asr_mcp.voiceprint.utils import (
 logger = logging.getLogger("asr_mcp.voiceprint.service")
 
 SAMPLE_RATE = 16000
-AUTO_COLLECT_MIN_DURATION = 3.0
+#: A snippet shorter than this is not worth a slot in the per-file budget: one
+#: few-second clip carries a noisy embedding and almost none of the speaker's
+#: range, so it costs a kept-cluster place while adding little but noise to the
+#: fitted profile. Measured on the STORED clip, i.e. after the VAD trim has
+#: pulled its edges inward -- a 6s turn whose edges are silence is a 5.8s clip,
+#: and a 5.2s turn can trim below the floor.
+AUTO_COLLECT_MIN_DURATION = 5.0
+#: At most this many snippets ONE recording may contribute to ONE profile. Past
+#: it the file stops being one contribution among several and becomes the
+#: profile's entire basis -- the overfitting shape the one-file-one-contribution
+#: rule exists to prevent, reached by a single long file instead of by a reprocess.
+AUTO_COLLECT_MAX_PER_SOURCE = 10
+#: Cumulative cap across ALL files for one speaker (lesson 29). Independent of
+#: the per-file budget: a speaker heard on ten recordings may hold ten full
+#: per-file budgets, and one long recording may not eat the whole 1200s.
 AUTO_COLLECT_MAX_TOTAL_SEC = 1200.0
 AUTO_COLLECT_MAX_SEGMENT_SEC = 300.0
 AUTO_COLLECT_MIN_SPEAKER_SEGMENTS = 2
@@ -111,6 +126,166 @@ def _consolidation_cfg() -> dict:
             if value is not None:
                 defaults[key] = value
     return defaults
+
+
+def span_fit_key(seg: Any) -> tuple:
+    """Rank a candidate span by how well it fits the speaker it was labelled with.
+
+    Returns ``(confidence, speech_sec)`` and is meant to be used with
+    ``reverse=True``: best-fitting first, longest duration as the tiebreak. Pure
+    and free -- it reads fields the turn already carries, so ranking the
+    candidates costs no embedding pass.
+
+    ``speaker_confidence`` is the attribution's own verdict on this span, the
+    same number the uncertainty policy gates collection on. A turn with no
+    confidence recorded at all is a *generic* cluster label (the learn path),
+    where ``learning_refusal_reason`` does not require one; those sort at
+    ``1.0`` rather than at ``0.0`` so an unlabelled cluster is not ranked below
+    every matched one and starved by the per-file budget.
+
+    Ranking is deliberately NOT an embedding distance to the profile centroid.
+    That would be the more accurate measure and it would cost one GPU embedding
+    pass per candidate on every collect -- the same trade lesson 45 made for
+    consolidation, where the ranking that mattered was computed over snippets
+    the run had already embedded.
+    """
+    raw = seg.get("speaker_confidence") if isinstance(seg, dict) \
+        else getattr(seg, "speaker_confidence", None)
+    if raw is None or isinstance(raw, bool):
+        # No verdict recorded: a generic cluster, not a confident mismatch.
+        confidence = 1.0
+    else:
+        try:
+            confidence = float(raw)
+        except (TypeError, ValueError):
+            confidence = 1.0
+    if not math.isfinite(confidence):
+        confidence = 1.0
+    try:
+        speech = max(0.0, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)))
+    except (TypeError, ValueError):
+        speech = 0.0
+    return (confidence, speech)
+
+
+def rank_snippet_rows(rows: list) -> list:
+    """Order one speaker's stored snippets best-first for the per-file budget.
+
+    Longest duration first, then earliest start, then lowest id, so the order is
+    total and a re-run of the trim makes the same decisions. A stored row carries
+    no ``speaker_confidence`` -- the confidence that picked a span at collect
+    time was never persisted -- so duration is the only evidence left about how
+    much of the speaker a clip holds. That is also the fallback
+    :func:`span_fit_key` uses for a span with no verdict recorded, so both
+    directions of the rule rank the same way.
+    """
+
+    def _key(row):
+        try:
+            dur = float(row.get("duration_sec") or 0.0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        try:
+            start = float(row.get("start_sec") or 0.0)
+        except (TypeError, ValueError):
+            start = 0.0
+        try:
+            row_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+        return (dur, -start, -row_id)
+
+    return sorted(rows, key=_key, reverse=True)
+
+
+def plan_source_trim(rows: list, max_per_source: int | None = None,
+                     min_duration: float | None = None) -> dict:
+    """Which snippet rows a per-file budget spends, grouped by source file.
+
+    Pure -- no DB, no session, no audio stack -- so the cleanup's policy is
+    unit-testable on plain rows. ``rows`` is ONE speaker's snippets.
+
+    Returns ``{"groups": [...], "unsourced": [ids]}``. One group per source
+    file, each ``{"source", "kept", "dropped", "reasons", "seconds"}``, where
+    ``reasons`` maps a dropped id to ``"too_short"`` or ``"over_per_file_cap"``
+    and ``seconds`` is the audio the drops account for.
+
+    The two rules are the collection policy, applied backwards to a library
+    that was built before it:
+
+    * **at most ``max_per_source``** (``AUTO_COLLECT_MAX_PER_SOURCE``) snippets
+      per file. A file that contributed thirty clips is the profile's basis,
+      not one contribution among several -- the overfitting shape the
+      one-file-one-contribution rule exists to prevent, reached by one long
+      recording instead of by a re-process.
+    * **nothing below ``min_duration``** (``AUTO_COLLECT_MIN_DURATION``), which
+      is decided FIRST and independently of rank: a sub-floor snippet never
+      earns a slot, so it does not crowd out a good clip by taking one.
+
+    Rows with no recorded ``source_audio`` are returned under ``unsourced`` and
+    are never dropped. They belong to no file (rescan-adopted audio), so no
+    per-file budget can be counted against them, and deleting audio that cannot
+    be attributed to anything is precisely the judgement this cleanup refuses to
+    make. Such a row is reported by the audit instead.
+
+    A file is identified by the FILENAME HASH, exactly as
+    ``_source_snippet_rows`` matches it: the same recording arrives under a
+    different directory, a different extension and a different upload name, and
+    it is still one file. Grouping on the stored string instead would give the
+    same recording three budgets and trim none of them.
+    """
+    limit = AUTO_COLLECT_MAX_PER_SOURCE if max_per_source is None \
+        else int(max_per_source)
+    floor = AUTO_COLLECT_MIN_DURATION if min_duration is None \
+        else float(min_duration)
+
+    grouped: dict[str, list] = {}
+    #: The source string reported per group. Several spellings of one recording
+    #: hash to the same file, and the report needs a name a reader recognises.
+    labels: dict[str, str] = {}
+    unsourced: list = []
+    for row in rows or []:
+        source = row.get("source_audio")
+        if not source:
+            # Belongs to no file: exempt from the per-file budget by definition.
+            if row.get("id") is not None:
+                unsourced.append(row["id"])
+            continue
+        ident = generate_segment_hash(source)
+        grouped.setdefault(ident, []).append(row)
+        labels.setdefault(ident, str(source))
+
+    groups: list[dict] = []
+    # Sorted by the reported source, so a re-run reports in the same order.
+    for ident in sorted(grouped, key=lambda k: labels[k]):
+        rows_for_file = rank_snippet_rows(grouped[ident])
+        kept: list = []
+        dropped: list = []
+        reasons: dict = {}
+        seconds = 0.0
+        for row in rows_for_file:
+            try:
+                dur = float(row.get("duration_sec") or 0.0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            if dur < floor:
+                reason = "too_short"
+            elif len(kept) >= limit:
+                reason = "over_per_file_cap"
+            else:
+                kept.append(row["id"])
+                continue
+            dropped.append(row["id"])
+            reasons[row["id"]] = reason
+            seconds += dur
+        groups.append({
+            "source": labels[ident],
+            "kept": len(kept),
+            "dropped": dropped,
+            "reasons": reasons,
+            "seconds": round(seconds, 1),
+        })
+    return {"groups": [g for g in groups if g["dropped"]], "unsourced": unsourced}
 
 
 def score_outliers(vectors, cfg: dict = None) -> dict:
@@ -1517,7 +1692,8 @@ class VoiceprintService:
 
         collect_diag: list[dict] = []
         for speaker_name, segs in by_speaker.items():
-            def _diag(skipped=None, snippets=0, secs=0.0):
+            def _diag(skipped=None, snippets=0, secs=0.0, over_cap=0,
+                      short_trimmed=0):
                 collect_diag.append({
                     "speaker": speaker_name,
                     "spans": len(segs),
@@ -1525,6 +1701,11 @@ class VoiceprintService:
                     "snippets": snippets,
                     "added_sec": round(float(secs), 1),
                     "skipped": skipped,
+                    # Both zero for every speaker that collected: the keys are
+                    # additive and nothing branches on them, so a reader of a
+                    # future run can tell "spent the budget" from "too short".
+                    "over_per_file_cap": over_cap,
+                    "too_short_after_trim": short_trimmed,
                 })
             # ONLY auto-collect for genuinely registered known speakers (e.g. "Gergely Papp", "Ismael Capel")
             # NEVER create auto-collected voiceprints for generic/unregistered "Speaker N" or timestamped clusters.
@@ -1557,19 +1738,57 @@ class VoiceprintService:
 
             added_secs: list[float] = []
             fresh: list[dict] = []
+            #: Spans that were candidates and were dropped only because THIS
+            #: file had already spent its per-file budget. Reported rather than
+            #: logged-only: "3 of 27 spans" is otherwise indistinguishable from
+            #: "there was almost no speech".
+            over_cap = 0
+            #: Turns that cleared the eligibility floor as a whole but whose
+            #: VAD-trimmed edges left a clip below it.
+            short_trimmed = 0
 
-            for seg in segs:
+            # Best-fitting span first. The per-file budget makes the ORDER a
+            # selection: a confident 12s turn has to be collected before a
+            # marginal 40s one that would otherwise eat the whole ceiling.
+            ranked = sorted(segs, key=span_fit_key, reverse=True)
+            for position, seg in enumerate(ranked):
+                if len(fresh) >= AUTO_COLLECT_MAX_PER_SOURCE:
+                    # Every later span is ranked lower, so the budget is spent
+                    # for this file no matter what else is offered. What is
+                    # counted is everything LEFT, not the first casualty: "1
+                    # span over the cap" understates a file that offered 15.
+                    over_cap += len(ranked) - position
+                    break
                 seg_start, seg_end = self._snippet_span(
                     seg, vad_sections,
                 )
+                if seg_end - seg_start < AUTO_COLLECT_MIN_DURATION:
+                    # The floor is measured on the STORED clip, after the trim
+                    # pulled its edges onto VAD section boundaries: a 5.2s turn
+                    # with a silent head is a 4.6s snippet, and a sub-floor
+                    # snippet spends a slot in the per-file budget for audio
+                    # that is mostly silence.
+                    short_trimmed += 1
+                    continue
 
                 # Per-chunk length is capped by chunk_end below (MAX_SEGMENT_SEC);
                 # current_total is the speaker's CUMULATIVE total, so it must only
                 # be gated by MAX_TOTAL_SEC — gating it on MAX_SEGMENT_SEC made
                 # every speaker with >=300s of snippets silently un-collectable.
-                while seg_start < seg_end and current_total < AUTO_COLLECT_MAX_TOTAL_SEC:
+                # MAX_PER_SOURCE is the per-FILE budget and is counted in
+                # SNIPPETS: one long file may not become the profile's basis.
+                while (seg_start < seg_end
+                       and current_total < AUTO_COLLECT_MAX_TOTAL_SEC
+                       and len(fresh) < AUTO_COLLECT_MAX_PER_SOURCE):
                     chunk_end = min(seg_start + AUTO_COLLECT_MAX_SEGMENT_SEC, seg_end)
                     dur = chunk_end - seg_start
+
+                    if dur < AUTO_COLLECT_MIN_DURATION:
+                        # Trailing sliver left after a 300s chunk. EXTENDING the
+                        # chunk would break MAX_SEGMENT_SEC, so the sliver is
+                        # dropped rather than stored as a sub-floor snippet.
+                        short_trimmed += 1
+                        break
 
                     # Speaker-scoped: a row belonging to ANOTHER profile must not
                     # suppress (or be deleted by) this one's collection.
@@ -1605,7 +1824,14 @@ class VoiceprintService:
 
                     seg_start = chunk_end
 
-            _diag(snippets=len(added_secs), secs=sum(added_secs))
+            _diag(snippets=len(added_secs), secs=sum(added_secs),
+                  over_cap=over_cap, short_trimmed=short_trimmed)
+            if over_cap:
+                logger.info(
+                    "Auto-collect: %s -- %d span(s) beyond this file's %d-snippet "
+                    "budget for one profile (user=%s)",
+                    speaker_name, over_cap, AUTO_COLLECT_MAX_PER_SOURCE, user_id,
+                )
             # Only now, with the fresh spans on disk: the previous take of THIS
             # file goes, whatever span it was cut at, and the profile is fitted
             # once over the final set. Collecting first is what makes this safe --
@@ -2159,19 +2385,42 @@ class VoiceprintService:
                 "Pending profile %r is at its learn cap (%.0fs >= %.0fs)",
                 target, current_total, max_total,
             )
-        for seg in sorted(segs, key=lambda x: x["start"]):
+        # Best-fitting span first, and the per-file budget makes the order a
+        # selection: one confident 8s turn is a better part than twenty marginal
+        # ones. A generic cluster usually carries no speaker_confidence, so
+        # span_fit_key ranks those by duration -- which is the same thing the
+        # ranking below means when no verdict is recorded.
+        for seg in sorted(segs, key=span_fit_key, reverse=True):
             seg_start, seg_end = self._snippet_span(seg, vad_sections)
+            if seg_end - seg_start < AUTO_COLLECT_MIN_DURATION:
+                # The floor is on the STORED clip, after the VAD trim has pulled
+                # its edges inward. Measured on the untrimmed turn it admits
+                # snippets that are mostly silence.
+                continue
+            if len(added) >= AUTO_COLLECT_MAX_PER_SOURCE:
+                # Every span here comes from THIS file, so `added` is exactly
+                # this file's contribution: the per-file budget is spent. The
+                # spans after it are ranked lower, so stopping here loses the
+                # least fitting material rather than the best.
+                break
             # Mirror add_snippet()'s filename exactly (minus the duration part):
             # the hash is of the source audio and the time part of the start.
             key = f"{src_hash}_{format_time_short(seg['start'])}"
             if any(n.startswith(key + "_") for n in have):
                 continue
-            while seg_start < seg_end and not (max_total and current_total >= max_total):
+            while (seg_start < seg_end
+                   and len(added) < AUTO_COLLECT_MAX_PER_SOURCE
+                   and not (max_total and current_total >= max_total)):
                 chunk_end = seg_end if not max_snippet else min(
                     seg_start + max_snippet, seg_end,
                 )
                 if max_total:
                     chunk_end = min(chunk_end, seg_start + (max_total - current_total))
+                if chunk_end - seg_start < AUTO_COLLECT_MIN_DURATION:
+                    # A sliver left by the learn caps (`max_snippet_sec` or
+                    # `max_profile_total_sec`). Storing it spends one of this
+                    # file's few slots on audio too short to embed well.
+                    break
                 have.add(key)
                 r = self.add_snippet_from_segment(
                     speaker_name=target, wav_path=audio_path,
@@ -2274,11 +2523,13 @@ class VoiceprintService:
                           duplicates: bool = True,
                           stale_totals: bool = True,
                           dead_snippets: bool = True,
+                          trim_snippets: bool = True,
                           dry_run: bool = True) -> dict:
         """Repair the findings that have one obvious correct answer.
 
         Deliberately narrow. Three of the audit's eight findings are safe to fix
-        here and five are not:
+        here, one policy step acts on the whole store, and five findings are
+        not:
 
         - ``duplicate_snippet_content``: the two files are byte-identical, so
           one of them carries no information the other lacks. Deleting the
@@ -2308,6 +2559,20 @@ class VoiceprintService:
           (re-register? re-learn? which file is the real one?). NOT fixable
           here -- the first two are what ``voiceprint/rebuild.py`` acts on.
 
+        ``trim_snippets`` is the one step that is NOT an audit finding. It
+        enforces the current snippet policy backwards over a library built
+        before it: at most ``AUTO_COLLECT_MAX_PER_SOURCE`` snippets per file
+        per profile, none shorter than ``AUTO_COLLECT_MIN_DURATION``
+        (``plan_source_trim`` for the ranking). Without it, a reprocess of one
+        file would adopt the new cap while every other recording kept the
+        thirty clips it had already been allowed, so the policy would only ever
+        apply to the file the user happens to re-run next.
+
+        Runs BEFORE the totals are recomputed, and its doomed ids feed
+        ``_surviving_speech_seconds``: the audit snapshot counted the rows this
+        step is about to remove, and writing that figure would leave the number
+        stale by exactly the audio that went.
+
         ``dry_run=True`` is the default and returns the plan without touching
         anything, so the first call is always safe.
         """
@@ -2319,6 +2584,7 @@ class VoiceprintService:
             "user_id": user_id,
             "duplicate_snippets": [],
             "dead_snippets": [],
+            "trimmed_snippets": [],
             "stale_totals": [],
             "refined": [],
             "unfixed": {
@@ -2395,6 +2661,39 @@ class VoiceprintService:
                         doomed_ids[name].discard(snippet_id)
                     result["dead_snippets"].append(entry)
 
+        if trim_snippets:
+            # The policy step. Before the totals are recomputed, so its doomed
+            # ids are visible to _surviving_speech_seconds, and AFTER the dead
+            # rows are gone, so a row whose audio has already vanished is not
+            # reported as "trimmed" -- it was never audio to begin with.
+            for finding in self._plan_source_trim(user_id):
+                name = finding["speaker"]
+                doomed_ids.setdefault(name, set()).update(finding["removed_ids"])
+                removed = 0
+                if not dry_run:
+                    for snippet_id in finding["removed_ids"]:
+                        if self._delete_snippet_row(snippet_id, name, user_id):
+                            removed += 1
+                        else:
+                            # The row survived, so its seconds still count
+                            # towards the total: forgetting it under-reports.
+                            doomed_ids[name].discard(snippet_id)
+                    if removed:
+                        speakers_to_refine.add(name)
+                result["trimmed_snippets"].append({
+                    "speaker": name,
+                    "source": finding["source"],
+                    "kept": finding["kept"],
+                    # dry_run must report what it WOULD remove, so the plan is
+                    # readable; an applied run reports what actually went.
+                    "removed": removed if not dry_run else len(finding["removed_ids"]),
+                    "removed_ids": finding["removed_ids"],
+                    "reasons": finding["reasons"],
+                    "seconds": finding["seconds"],
+                    # Rows of this speaker with no recorded source, left alone.
+                    "unsourced_exempt": finding.get("unsourced_exempt") or 0,
+                })
+
         if stale_totals:
             for finding in report.get("stale_speech_totals") or []:
                 name = finding.get("speaker")
@@ -2431,6 +2730,41 @@ class VoiceprintService:
 
         result["ok"] = True
         return result
+
+    def _plan_source_trim(self, user_id: str) -> list[dict]:
+        """Every snippet the per-file budget would spend, over the whole store.
+
+        Read-only: it decides and reports, and the caller is the only thing that
+        deletes. Reading is one ``list_by_speaker`` per speaker, so a library
+        with a hundred profiles is a hundred queries and no GPU work.
+
+        Scoped to one user, and pending profiles are included: an unnamed
+        profile is still a profile the user will eventually name, and it is the
+        one most likely to have been over-collected.
+
+        Unlike ``DEAD_SNIPPET_CAP``, the drop list is NOT capped: every row it
+        names is dropped by the caller, and capping it would make the policy
+        silently incomplete on the largest library -- which is the library the
+        cap is for. The bound is arithmetic (total snippets minus ten per file),
+        not whatever the report happens to hold.
+        """
+        findings: list[dict] = []
+        for name in sorted(self._snippets.all_speakers(user_id=user_id)):
+            rows = self._snippets.list_by_speaker(name, user_id=user_id)
+            if not rows:
+                continue
+            plan = plan_source_trim(rows)
+            for group in plan["groups"]:
+                findings.append({
+                    "speaker": name,
+                    "source": group["source"],
+                    "kept": group["kept"],
+                    "removed_ids": group["dropped"],
+                    "reasons": group["reasons"],
+                    "seconds": group["seconds"],
+                    "unsourced_exempt": len(plan["unsourced"]),
+                })
+        return findings
 
     def _surviving_speech_seconds(self, speaker_name: str, user_id: str,
                                   excluded_ids) -> float:

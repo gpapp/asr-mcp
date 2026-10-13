@@ -214,7 +214,7 @@ you name it. These are the only routes that make one matchable.
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/api/voiceprint/integrity` | GET | Session | Read-only store audit (8 findings) |
-| `/api/voiceprint/integrity/cleanup` | POST | Session | Repair the findings that have one correct answer (`IntegrityCleanupRequest{dry_run=True, dead_snippets=True, ...}`) |
+| `/api/voiceprint/integrity/cleanup` | POST | Session | Repair the findings that have one correct answer, and enforce the snippet budget (`IntegrityCleanupRequest{dry_run=True, duplicates=True, dead_snippets=True, stale_totals=True, trim_snippets=True}`) |
 | `/api/voiceprint/consolidate/stream` | POST | Session | Flag the outlier snippets of one speaker (`?speaker_name=`, omit = whole library) and re-fit from the kept ones, as SSE |
 | `/api/voiceprint/flagged` | GET | Session | Snippets flagged for review, ranked by distance (`?speaker_name=`) — read-only |
 | `/api/voiceprint/flagged/{snippet_id}/keep` | POST | Session | Withdraw the flag; re-run consolidation to fold the snippet back into the profile |
@@ -223,8 +223,13 @@ you name it. These are the only routes that make one matchable.
 `integrity/cleanup` and `flagged/remove` are **dry runs by default**. Pass
 `dry_run: false` to actually delete.
 
-See [docs/voiceprints.md](voiceprints.md) for what consolidation flags and what
-the audit repairs.
+`trim_snippets` is the one step that is not an audit finding: it applies the
+snippet budget (top `AUTO_COLLECT_MAX_PER_SOURCE` per file per profile, none
+under `AUTO_COLLECT_MIN_DURATION`) to the whole library, which a reprocess only
+ever applies to the file it re-runs.
+
+See [docs/voiceprints.md](voiceprints.md) for what consolidation flags, what the
+audit repairs, and how the per-file snippet budget is spent.
 
 ---
 

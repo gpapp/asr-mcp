@@ -235,10 +235,15 @@ def test_the_request_schema_defaults_to_a_dry_run():
 
     A handler that defaults the flag itself can be defeated by a caller that
     passes the other two switches; the model is the one place both meet.
+
+    ``trim_snippets`` defaults to True for the same reason the others do: an
+    endpoint that only enforces the snippet budget when somebody remembers to
+    ask is an endpoint that never enforces it.
     """
     assert IntegrityCleanupRequest().dry_run is True
     assert IntegrityCleanupRequest().duplicates is True
     assert IntegrityCleanupRequest().stale_totals is True
+    assert IntegrityCleanupRequest().trim_snippets is True
 
 
 # ── applying ───────────────────────────────────────────────────────────────
