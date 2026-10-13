@@ -255,9 +255,12 @@ Detail in [docs/voiceprints.md](docs/voiceprints.md#the-per-file-snippet-budget)
 - **`trim_snippets` in `cleanup_integrity` applies the budget backwards.** Without
   it the policy only ever reaches the file you re-process next. It runs BEFORE
   the totals are recomputed so its doomed ids feed `_surviving_speech_seconds`,
-  and it NEVER touches a row with no recorded `source_audio` — that row belongs
-  to no file, so no per-file budget can be counted against it, and deleting
-  audio that cannot be attributed is the judgement the cleanup refuses to make.
+  and the only rows it NEVER touches are the ones that name no recording at
+  all — no stored `source_audio` **and** a filename with no hash in it. A row
+  that lost its `source_audio` is still trimmed: `snippet_source_identity`
+  recovers the hash `add_snippet` wrote into the filename, so it groups with the
+  rows that kept their path, and a reprocess replaces it too. `<hash>_manual.flac`
+  hashes the AUDIO, not a recording, so it is not an identity.
 
 ## Voiceprint Consolidation: outlier snippets and manual review
 Detail in [docs/voiceprints.md](docs/voiceprints.md#consolidation-finding-snippets-that-are-not-this-speaker).

@@ -130,10 +130,10 @@ def make_service(lb, svc, tmp_path):
 # helpers
 # --------------------------------------------------------------------------
 
-def _row(snippet_id, duration, source="meeting.wav", start=0.0):
+def _row(snippet_id, duration, source="meeting.wav", start=0.0, path=None):
     return {
         "id": snippet_id, "speaker_name": "Ana",
-        "file_path": f"/voices/u/Ana/{snippet_id}.flac",
+        "file_path": path or f"/voices/u/Ana/{snippet_id}.flac",
         "duration_sec": float(duration), "source_audio": source,
         "start_sec": float(start), "end_sec": float(start + duration),
     }
@@ -221,6 +221,82 @@ def test_a_snippet_with_no_recorded_source_is_never_trimmed(svc):
 
     assert plan["groups"] == []
     assert plan["unsourced"] == list(range(1, 31))
+
+
+# --------------------------------------------------------------------------
+# a row that lost its source_audio still knows which file it came from
+# --------------------------------------------------------------------------
+
+def test_a_row_with_no_source_is_trimmed_by_the_hash_in_its_filename(svc):
+    """The wav->flac migration left rows with no source, and their audio is still
+    this recording's audio. The filename is ``add_snippet``'s own naming --
+    ``<generate_segment_hash(source)>_<MM-SS>_<nn>.flac`` -- so the identity is
+    recoverable, not guessed. Twelve recovered rows and two stored rows from the
+    same file must be ONE group capped at ten, not an exempt pile beside it.
+    """
+    h = svc.generate_segment_hash("meeting.wav")
+    rows = [_row(i + 1, 6.0, source=None,
+                 path=f"/voices/u/Ana/{h}_{i:02d}-00_06.flac")
+            for i in range(12)]
+    rows += [_row(101, 6.0, source="meeting.wav", start=120.0),
+             _row(102, 6.0, source="/data/2026/meeting.mp4", start=130.0)]
+
+    plan = svc.plan_source_trim(rows)
+
+    assert len(plan["groups"]) == 1
+    g = plan["groups"][0]
+    assert g["kept"] == 10
+    assert len(g["dropped"]) == 4
+    assert plan["unsourced"] == []
+    # The report says how many identities were recovered rather than stored: a
+    # reader deciding whether to trust this trim is entitled to that.
+    assert g["derived_from_filename"] == 12
+
+
+def test_the_recovered_hash_ranks_in_the_same_group_as_the_stored_rows(svc):
+    """A recovered identity is the SAME identity ``generate_segment_hash``
+    returns, so the rows it recovers are ranked with the rows that kept their
+    path and can lose their slot to one. Giving the recovered row the shortest
+    clip and the latest start puts it last under the ranking key, so on a
+    13-row group it is one of the drops -- which is only true if it was in the
+    group at all. An exempt row would survive.
+    """
+    h = svc.generate_segment_hash("meeting.wav")
+    rows = [_row(i + 1, 6.0, source="meeting.wav", start=float(i * 10))
+            for i in range(12)]
+    rows.append(_row(100, 5.5, source=None, start=500.0,
+                     path=f"/voices/u/Ana/{h}_50-00_06.flac"))
+
+    plan = svc.plan_source_trim(rows)
+
+    assert plan["unsourced"] == []
+    assert len(plan["groups"]) == 1
+    g = plan["groups"][0]
+    assert g["kept"] == 10
+    assert 100 in g["dropped"]
+    assert g["derived_from_filename"] == 1
+
+
+def test_a_manual_upload_names_no_recording(svc):
+    """``<hash>_manual.flac`` hashes the AUDIO BYTES, not a file, so that number
+    identifies no recording. Treating it as one would silently make a manual
+    clip the entire "budget" of a recording it was never cut from.
+    """
+    rows = [_row(1, 6.0, source=None, path="/voices/u/Ana/9F2A1B_manual.flac")]
+    plan = svc.plan_source_trim(rows)
+    assert plan["groups"] == []
+    assert plan["unsourced"] == [1]
+
+
+def test_a_filename_without_a_hash_token_is_still_exempt(svc):
+    """``Speaker_1.wav`` was typed by an operator. It carries no evidence of a
+    recording, so it stays exempt for the same reason the NULL source did.
+    """
+    rows = [_row(1, 6.0, source=None, path="/voices/u/Ana/Speaker_1.wav")]
+    plan = svc.plan_source_trim(rows)
+    assert plan["groups"] == []
+    assert plan["unsourced"] == [1]
+    assert svc.snippet_source_identity(rows[0]) == ("", True)
 
 
 def test_the_ranking_is_longest_first_then_earliest_then_lowest_id(svc):
@@ -361,6 +437,38 @@ def test_reprocessing_a_file_replaces_its_whole_take(make_service, lb):
     assert len(rows) == 10
     assert {round(r["start_sec"], 3) for r in rows} == {
         float(i * 10 + 1) for i in range(10)}
+
+
+def test_a_reprocess_also_replaces_the_rows_that_lost_their_source(make_service, lb, svc):
+    """A row whose ``source_audio`` is NULL still belongs to this recording: the
+    hash in its filename says so. Matching only stored paths is what let a
+    migration-era row survive a reprocess of the file it was cut from, so the
+    "remove ALL old snippets" promise quietly did not cover the rows that had
+    already lost the field -- which are exactly the ones an old library has.
+    """
+    s = make_service(lb._one_voice(), register={
+        "Ana": lb._voice(1.0, 0.0, seed=3, jitter=0.01)})
+    h = svc.generate_segment_hash("meeting.wav")
+    # Left behind by the wav->flac migration: audio present, path rewritten,
+    # source never carried over.
+    s._snippets.add(
+        speaker_name="Ana", file_path=f"/voices/u/Ana/{h}_00-00_06.flac",
+        duration_sec=6.0, user_id="u", source_audio=None,
+        start_sec=0.0, end_sec=6.0,
+    )
+    assert len(s._snippets.list_by_speaker("Ana", user_id="u")) == 1
+
+    s.auto_collect_from_diarization(
+        audio_path="meeting.wav",
+        segments=lb._segments("Ana", [(float(i * 10), float(i * 10 + 6.0))
+                                      for i in range(15)]),
+        user_id="u", source_id="meeting.wav",
+    )
+
+    rows = s._snippets.list_by_speaker("Ana", user_id="u")
+    assert len(rows) == 10
+    assert all(r["source_audio"] for r in rows)
+    assert all(r["id"] != 1 for r in rows), "the migration-era row survived"
 
 
 # --------------------------------------------------------------------------

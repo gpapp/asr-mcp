@@ -141,8 +141,10 @@ moved span or duration.
   `_auto_refine`. Collecting first is what makes it safe: if every span was
   rejected, the previous take is still there.
 - **Scope** — one speaker, one user. A file may feed several profiles, and only a
-  profile this run rebuilt is rewritten. Rows with `source_audio IS NULL`
-  (rescan-adopted) never match. Clips from other recordings are always kept.
+  profile this run rebuilt is rewritten. A row with `source_audio IS NULL` is
+  replaced too when its filename carries the recording hash
+  (`snippet_source_identity`); only a filename naming no hash is left alone.
+  Clips from other recordings are always kept.
 - `SnippetDB.find_duplicate` is **speaker-scoped** and *deletes* what it finds, so
   an unscoped lookup would let one profile's collection remove another's audio.
 
@@ -217,7 +219,7 @@ whole library:
 | **≤ 10 snippets per file** | Ranked by stored duration, longest first, then earliest start, then lowest id — total and deterministic, so a re-run makes the same decisions. |
 | **≥ 5s per snippet** | Decided **first and independently of rank**: a sub-floor snippet never earns a slot, so it cannot crowd out a good clip by taking one. |
 | **Same file across names** | One recording, identified by the filename hash — a different directory, extension or upload name is still one file and one budget. |
-| **No recorded source ⇒ exempt** | A `NULL` `source_audio` (rescan-adopted audio) belongs to no file, so no per-file budget can be counted against it. Deleting audio that cannot be attributed is the judgement this cleanup refuses to make. |
+| **No recorded source ⇒ read the filename** | A `NULL` `source_audio` is no longer automatic grounds for exemption: `snippet_source_identity` recovers the hash `add_snippet` wrote into the filename, so the row is grouped with the rows that kept their path and trimmed with them. Only a row that names **no recording at all** — no stored source *and* no hash in the filename (`Speaker_1.wav` dropped in by an operator) — is exempt, because no per-file budget can be counted against a file nobody can name. `<hash>_manual.flac` hashes the audio, not a recording, so it is not an identity either. |
 
 It is **dry-run by default**, like the rest of that endpoint, and it re-refines
 each touched speaker **once** over the final set — not once per removed row.

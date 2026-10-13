@@ -2807,8 +2807,14 @@
                 const removed = (res.trimmed_snippets || []).reduce(
                     (n, g) => n + (g.removed || 0), 0);
                 const refined = (res.refined || []).length;
+                // Rows recovered from a filename are reported by the plan: say so,
+                // because the user is entitled to know that some of the audio being
+                // removed belonged to a recording only the filename remembered.
+                const fromName = (res.trimmed_snippets || []).reduce(
+                    (n, g) => n + (g.derived_from_filename || 0), 0);
                 toast('Removed ' + plural(removed, 'snippet', 'snippets') + ' across '
-                    + plural(refined, 'profile', 'profiles') + ' re-embedded');
+                    + plural(refined, 'profile', 'profiles') + ' re-embedded'
+                    + (fromName ? ', ' + fromName + ' recovered from a filename' : ''));
                 await refresh();
             } catch (e) {
                 toast('Snippet cleanup failed: ' + e.message, true);

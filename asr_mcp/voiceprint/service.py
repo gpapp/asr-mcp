@@ -128,6 +128,68 @@ def _consolidation_cfg() -> dict:
     return defaults
 
 
+#: ``add_snippet`` names a span's file ``<hash>_<MM-SS>_<nn>.flac``, where
+#: ``<hash>`` is ``generate_segment_hash`` of the source stem: six characters drawn
+#: from this alphabet. A filename with no such token was typed by an operator,
+#: and an operator's name is not evidence of a recording.
+_SNIPPET_HASH_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+
+def snippet_file_hash(file_path: Any) -> str:
+    """The recording hash a snippet's FILENAME still remembers, or ``''``.
+
+    The row's ``source_audio`` is the only reliable record of which recording a
+    snippet was cut from, and it is nullable: the wav->flac migration left
+    seventy-odd rows with none, and a rescan adopts files by path alone. That
+    audio still belongs to a recording, and the file was named after it. Reading
+    the hash back is therefore not a guess -- it is the same string
+    ``generate_segment_hash`` produced when the file was written, so a snippet
+    recovered this way groups with the rows that still carry their source.
+
+    ``<hash>_manual.flac`` is the exception and returns ``''``: there the hash is
+    of the AUDIO BYTES, not of a recording, so it names no file.
+
+    A hand-dropped ``Speaker_1.wav`` matches nothing and is left to the audit,
+    which is what already reports those rows.
+    """
+    try:
+        name = os.path.basename(str(file_path))
+    except (TypeError, ValueError):
+        return ""
+    if not name or "." not in name:
+        return ""
+    head, _, rest = name.partition("_")
+    if rest.rsplit(".", 1)[0] == "manual":
+        return ""
+    if len(head) != 6 or (set(head) - _SNIPPET_HASH_CHARS):
+        return ""
+    return head
+
+
+def snippet_source_identity(row: Any) -> tuple:
+    """``(file_hash, derived_from_filename)`` for one snippet row.
+
+    The identity is the same six-character code either way: ``source_audio``'s
+    hash, or the hash the filename carries when the row lost its source. The
+    flag tells a caller which one it read, so a report can say so -- an identity
+    recovered from a filename is weaker evidence than a stored path, and a
+    reader deciding whether to trust a trim plan is entitled to know.
+
+    ``('', False)`` means the row names no recording at all: no source, and a
+    filename that carries no hash. Those rows belong to no per-file budget, so
+    no budget may be counted against them.
+    """
+    source = row.get("source_audio") if isinstance(row, dict) \
+        else getattr(row, "source_audio", None)
+    if source:
+        return generate_segment_hash(source), False
+    path = row.get("file_path") if isinstance(row, dict) \
+        else getattr(row, "file_path", None)
+    if not path:
+        return "", False
+    return snippet_file_hash(path), True
+
+
 def span_fit_key(seg: Any) -> tuple:
     """Rank a candidate span by how well it fits the speaker it was labelled with.
 
@@ -206,9 +268,10 @@ def plan_source_trim(rows: list, max_per_source: int | None = None,
     unit-testable on plain rows. ``rows`` is ONE speaker's snippets.
 
     Returns ``{"groups": [...], "unsourced": [ids]}``. One group per source
-    file, each ``{"source", "kept", "dropped", "reasons", "seconds"}``, where
-    ``reasons`` maps a dropped id to ``"too_short"`` or ``"over_per_file_cap"``
-    and ``seconds`` is the audio the drops account for.
+    file, each ``{"source", "kept", "dropped", "reasons", "seconds",
+    "derived_from_filename"}``, where ``reasons`` maps a dropped id to
+    ``"too_short"`` or ``"over_per_file_cap"`` and ``seconds`` is the audio the
+    drops account for.
 
     The two rules are the collection policy, applied backwards to a library
     that was built before it:
@@ -222,11 +285,15 @@ def plan_source_trim(rows: list, max_per_source: int | None = None,
       is decided FIRST and independently of rank: a sub-floor snippet never
       earns a slot, so it does not crowd out a good clip by taking one.
 
-    Rows with no recorded ``source_audio`` are returned under ``unsourced`` and
-    are never dropped. They belong to no file (rescan-adopted audio), so no
-    per-file budget can be counted against them, and deleting audio that cannot
-    be attributed to anything is precisely the judgement this cleanup refuses to
-    make. Such a row is reported by the audit instead.
+    Rows with no recorded ``source_audio`` are grouped by the hash their
+    FILENAME carries (``snippet_source_identity``) and are trimmed like any
+    other -- that is the whole point of reading the filename: the wav->flac
+    migration left seventy-odd rows with no source, and their audio belongs to a
+    recording just as much as the rows that kept theirs. A row whose filename
+    names no hash (``Speaker_1.wav`` dropped in by an operator, a manual
+    upload) is returned under ``unsourced`` and never dropped, because it
+    belongs to no file a budget could be counted against. Those rows are
+    reported by the audit instead.
 
     A file is identified by the FILENAME HASH, exactly as
     ``_source_snippet_rows`` matches it: the same recording arrives under a
@@ -243,17 +310,26 @@ def plan_source_trim(rows: list, max_per_source: int | None = None,
     #: The source string reported per group. Several spellings of one recording
     #: hash to the same file, and the report needs a name a reader recognises.
     labels: dict[str, str] = {}
+    #: How many rows of each group had their identity read off the filename
+    #: rather than from a stored ``source_audio``. Reported, because it is the
+    #: weaker of the two evidences and a reader of the plan is entitled to it.
+    derived: dict[str, int] = {}
     unsourced: list = []
     for row in rows or []:
-        source = row.get("source_audio")
-        if not source:
+        ident, from_name = snippet_source_identity(row)
+        if not ident:
             # Belongs to no file: exempt from the per-file budget by definition.
             if row.get("id") is not None:
                 unsourced.append(row["id"])
             continue
-        ident = generate_segment_hash(source)
         grouped.setdefault(ident, []).append(row)
-        labels.setdefault(ident, str(source))
+        if from_name:
+            derived[ident] = derived.get(ident, 0) + 1
+        # A stored path reads better than a filename; the first row with one
+        # wins, which is the strongest evidence the group has to offer.
+        labels.setdefault(ident, str(
+            row.get("source_audio") or os.path.basename(
+                str(row.get("file_path") or ident))))
 
     groups: list[dict] = []
     # Sorted by the reported source, so a re-run reports in the same order.
@@ -284,6 +360,9 @@ def plan_source_trim(rows: list, max_per_source: int | None = None,
             "dropped": dropped,
             "reasons": reasons,
             "seconds": round(seconds, 1),
+            # Identities read off the filename rather than from a stored
+            # source_audio. Honest labelling of the weaker evidence.
+            "derived_from_filename": derived.get(ident, 0),
         })
     return {"groups": [g for g in groups if g["dropped"]], "unsourced": unsourced}
 
@@ -744,11 +823,17 @@ class VoiceprintService:
         if not source:
             return []
         wanted = generate_segment_hash(source)
-        return [
-            row for row in self._snippets.list_by_speaker(speaker_name, user_id=user_id)
-            if row.get("source_audio")
-            and generate_segment_hash(row["source_audio"]) == wanted
-        ]
+        rows = []
+        for row in self._snippets.list_by_speaker(speaker_name, user_id=user_id):
+            # A row that lost its ``source_audio`` still carries the same hash in
+            # its filename, so it is this file's leftover too. Excluding those is
+            # what let a migration-era row survive a reprocess of the recording
+            # it came from -- the "remove ALL old snippets for that file"
+            # requirement, missed for the rows that had already lost the field.
+            ident, _ = snippet_source_identity(row)
+            if ident and ident == wanted:
+                rows.append(row)
+        return rows
 
     def _purge_source_rows(self, rows: list[dict], speaker_name: str,
                            user_id: str, keep_paths: set[str] | None = None) -> dict:
@@ -2568,6 +2653,14 @@ class VoiceprintService:
         thirty clips it had already been allowed, so the policy would only ever
         apply to the file the user happens to re-run next.
 
+        Every row is in scope, including the ones whose ``source_audio`` was
+        lost: ``snippet_source_identity`` recovers the recording hash the
+        filename still carries, so a migration-era row is grouped with the rows
+        that kept their source and trimmed with them. Only a row that names no
+        recording at all -- no stored path, and a filename with no hash in it --
+        is let alone, because no per-file budget can be counted against a file
+        nobody can name.
+
         Runs BEFORE the totals are recomputed, and its doomed ids feed
         ``_surviving_speech_seconds``: the audit snapshot counted the rows this
         step is about to remove, and writing that figure would leave the number
@@ -2690,7 +2783,12 @@ class VoiceprintService:
                     "removed_ids": finding["removed_ids"],
                     "reasons": finding["reasons"],
                     "seconds": finding["seconds"],
-                    # Rows of this speaker with no recorded source, left alone.
+                    # Rows of this speaker whose identity came off the filename
+                    # (their ``source_audio`` was lost) rather than from a
+                    # stored path. Weaker evidence, so it is reported.
+                    "derived_from_filename": finding.get("derived_from_filename") or 0,
+                    # Rows of this speaker with no recorded source and no hash
+                    # in the filename. Left alone: they belong to no file.
                     "unsourced_exempt": finding.get("unsourced_exempt") or 0,
                 })
 
@@ -2762,6 +2860,7 @@ class VoiceprintService:
                     "removed_ids": group["dropped"],
                     "reasons": group["reasons"],
                     "seconds": group["seconds"],
+                    "derived_from_filename": group.get("derived_from_filename") or 0,
                     "unsourced_exempt": len(plan["unsourced"]),
                 })
         return findings

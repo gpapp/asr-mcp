@@ -279,8 +279,9 @@ async def voiceprint_integrity_cleanup(
     the snippet policy (top ``AUTO_COLLECT_MAX_PER_SOURCE`` per file, none under
     ``AUTO_COLLECT_MIN_DURATION``) over the whole library, which a reprocess
     only ever applies to the file it re-runs. Ranked by stored duration because
-    a row keeps no attribution confidence, and rows with no recorded source are
-    left alone.
+    a row keeps no attribution confidence. A row that lost its ``source_audio``
+    is still trimmed -- the hash in its filename says which recording it came
+    from -- and only a row naming no recording at all is left alone.
 
     ``ensure_gpu=True`` is load-bearing. Removing snippets leaves the profile
     describing audio that is gone, so the speakers it touched are re-refined
