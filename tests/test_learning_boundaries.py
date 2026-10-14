@@ -1335,6 +1335,75 @@ def test_the_pending_profile_event_still_carries_the_learned_names():
     assert '"pending_profiles": pending_profiles' in src
 
 
+def test_the_asr_model_load_is_announced_before_it_runs():
+    """The stage must not go silent between the two phases.
+
+    ``unload_embedding`` + ``ensure_backend_ready`` sit between
+    ``diarization_complete`` and the first transcription event, and the ASR
+    backend loads LAZILY -- when it is not already resident those two calls
+    build a multi-gigabyte CUDA session. The user sees a completed diarization
+    bar doing nothing for exactly as long as that takes.
+
+    The event announcing the handoff has to be emitted BETWEEN the backend load
+    and the first transcription event, not after the load: announcing afterwards
+    would flash for a frame. Ordering is the whole assertion here, so it is a
+    source-order guard -- the same shape as the other ``run_transcribe`` checks,
+    which also cannot call a closure without an upload.
+    """
+    src = _router_source()
+    body = _body(src, "    async def run_transcribe():",
+                 "    async def event_stream():")
+    i_diar_done = body.index('"stage": "diarization_complete"')
+    i_load = body.index("state.ensure_backend_ready()")
+    i_announce = body.index('"stage": "Loading speech recognition model"')
+    i_transcribe = body.index('"stage": "Transcribing audio"')
+    assert i_diar_done < i_load < i_announce < i_transcribe, (
+        "the model load is not announced before the transcription starts; "
+        "the stage text goes stale for the whole load"
+    )
+    # The announcement belongs to the diarization phase so the bar keeps the
+    # 100% it just earned, rather than resetting to a transcription zero.
+    assert '"phase": "diarization"' in body[
+        i_announce:i_transcribe]
+
+
+def test_the_diarization_bar_names_every_expensive_step():
+    """A bar that holds one label while three big steps run reads as frozen.
+
+    Clustering, boundary refinement and known-speaker matching are each a
+    visible stall, and the stage was announcing the same word until the NEXT
+    coarse event. This is a source-order guard on the progress fractions: they
+    must be strictly increasing, because the UI bar is a width and a bar that
+    jumps backwards looks like a regression to the user even when the work is
+    still going.
+
+    The fractions stay inside the 0.6-1.0 band the coarse stages already
+    occupied, so nothing renumbers and the finished event is still 1.0.
+    """
+    src = (REPO_ROOT / "asr_mcp" / "diarization" / "pipeline.py").read_text()
+    body = _body(src, "    async def run(", "        total_time =")
+    # Nested and multi-line callables are the same shape; ``\\s*`` spans the
+    # newline so one pattern catches both. DO NOT add a second pattern for the
+    # multi-line form: it double-counts and the monotonicity check then reads
+    # the duplicate tail as progress going backwards.
+    fracs = [float(m) for m in re.findall(
+        r'await progress_callback\(\s*\{"stage": "[^"]+", "progress": ([\d.]+)\}',
+        body)]
+    assert len(fracs) >= 14, f"expected the granular stages, got {fracs}"
+    assert fracs == sorted(fracs), f"progress went backwards: {fracs}"
+    assert all(0.0 < f <= 1.0 for f in fracs), fracs
+    assert fracs[-1] == 1.0, "diarization_finished must stay the terminal event"
+    # The granular stages fill the 0.6-1.0 band the coarse ones left empty; they
+    # must not escape it, or the diarization bar would claim transcription work.
+    # 6 new + "Building speaker segments" (0.7) and "Profiling speakers" (0.8).
+    granular = [f for f in fracs if f > 0.6 and f < 1.0]
+    assert len(granular) >= 8, f"expected the granular stages, got {granular}"
+    assert all(0.6 < f < 1.0 for f in granular), granular
+    for stage in ("Grouping similar voices", "Trimming turn boundaries",
+                  "Matching known speakers", "Consolidating unknown speakers"):
+        assert f'"{stage}"' in body, f"{stage} is not announced"
+
+
 def test_one_span_groups_are_dropped_before_learning(make_service, svc):
     """A singleton cannot become a profile, so it must not cost an attempt.
 

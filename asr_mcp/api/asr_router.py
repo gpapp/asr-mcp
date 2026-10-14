@@ -1444,6 +1444,21 @@ async def transcribe_upload(
             if job.cancel_requested:
                 raise JobCancelled()
 
+            # The ASR backend is loaded LAZILY, so this gap is not always a load:
+            # when the model is already resident the two calls above return at
+            # once and the transcript appears immediately. When it is not, they
+            # download nothing but do build a multi-gigabyte CUDA session, and
+            # the user watches a finished diarization bar do nothing for as long
+            # as that takes. Announce the handoff BEFORE it, so the stage names
+            # the wait instead of leaving the previous stage on screen looking
+            # stuck. No progress fraction is attached: there is nothing honest
+            # to report while a session is being constructed.
+            await _sse_put(queue, {
+                "stage": "Loading speech recognition model",
+                "progress": 1.0,
+                "phase": "diarization",
+            })
+
             if not segments:
                 await _sse_put(queue, {"stage": "Transcribing audio", "progress": 0.0, "phase": "transcription"})
                 result = transcribe_audio_sync(audio=audio_np, language=language)

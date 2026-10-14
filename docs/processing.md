@@ -257,6 +257,26 @@ characters (lesson 24).
 `/api/asr/active/stream`, and the Cancel button is only offered for a job you
 own.
 
+### The gap after diarization
+
+The ASR backend is **lazily** loaded. After `diarization_complete` the router calls
+`unload_embedding()` then `ensure_backend_ready()`, and when the model is not
+already resident the second call builds a multi-gigabyte CUDA session — a
+stretch with no events in it, during which the user watches a completed
+diarization bar do nothing. So the router emits a `Loading speech recognition
+model` event **before** those calls, in the **diarization** phase so the bar
+holds the 100% it just earned instead of collapsing back to a transcription
+zero. No progress fraction rides along: there is nothing honest to report while
+a session is being constructed, and a fake ramp would be worse than the label.
+
+The diarization pipeline's back half had the same problem one level down. Clustering,
+overlap detection, boundary trimming, known-speaker matching and unknown-speaker
+consolidation each ran behind a single earlier label, so a bar could sit on
+`Clustering speakers` for several minutes with nothing to say. Those steps now
+emit their own events inside the 0.6–1.0 band the coarse stages already
+occupied, strictly increasing, with `diarization_finished` still the terminal
+event at 1.0.
+
 ---
 
 ## Background

@@ -120,10 +120,25 @@ class Diarizer:
         if progress_callback:
             await progress_callback({"stage": "Clustering speakers", "progress": 0.6})
 
+        # Clustering is the longest single call in the diarizer on a file with
+        # many speakers -- agglomerative linkage over every window's embedding --
+        # and the bar sat at 60% showing "Clustering speakers" for all of it
+        # whether the work was starting or finishing. The stage now announces
+        # the sub-steps that follow it, so the label names what is happening
+        # instead of what happened a minute ago. Every fraction stays inside the
+        # 0.6-1.0 band the coarse stages already occupy, so nothing renumbers.
+        if progress_callback:
+            await progress_callback(
+                {"stage": "Grouping similar voices", "progress": 0.62})
+
         # Step 5: Clustering
         long_labels, cluster_centroids = self._cluster_embeddings(
             raw_embeddings, num_speakers, threshold, cfg
         )
+
+        if progress_callback:
+            await progress_callback(
+                {"stage": "Detecting overlapping speech", "progress": 0.68})
 
         # Step 5b: Assign cluster labels to all segments (including short ones)
         self._assign_labels_to_segments(all_segments_meta, embeddable_indices, long_labels)
@@ -154,6 +169,10 @@ class Diarizer:
 
         non_ov = absorb_islands(non_ov)
 
+        if progress_callback:
+            await progress_callback(
+                {"stage": "Trimming turn boundaries", "progress": 0.74})
+
         non_ov = self._refine_boundaries(
             non_ov, all_segments_meta, embeddable_indices,
             raw_embeddings, waveform, sample_rate
@@ -167,6 +186,10 @@ class Diarizer:
 
         # Step 8b: Relabel by pitch
         non_ov, profiles, pitch_remap = relabel_by_pitch(non_ov, profiles)
+
+        if progress_callback:
+            await progress_callback(
+                {"stage": "Matching known speakers", "progress": 0.84})
 
         # Inject cluster centroid embeddings into every speaker's profile
         centroid_emb_map = {}
@@ -204,6 +227,10 @@ class Diarizer:
         # Step 10: Ghost elimination (uses seg["alternatives"] if populated by matching)
         non_ov = eliminate_ghost_speakers(non_ov, profiles=profiles, ghost_threshold_sec=10.0)
 
+        if progress_callback:
+            await progress_callback(
+                {"stage": "Consolidating unknown speakers", "progress": 0.9})
+
         # Step 11: Absorb minority speakers (safeguards matched known voiceprints)
         known_names = set(known_speakers.keys()) if known_speakers else set()
         non_ov = absorb_minority_speakers(
@@ -227,6 +254,9 @@ class Diarizer:
 
         # Step 13: Exact turn boundary refinement using raw VAD sections
         if self._raw_vad_sections:
+            if progress_callback:
+                await progress_callback(
+                    {"stage": "Refining turn boundaries", "progress": 0.95})
             try:
                 non_ov = await self._refine_turn_boundaries_exact(
                     non_ov, waveform_np, sample_rate, profiles, known_speakers or {}
