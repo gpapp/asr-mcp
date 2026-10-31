@@ -173,6 +173,12 @@ class ModelState:
             logger.info("Unloading models (idle %.0fs): %s", self.idle_seconds(), ", ".join(loaded))
             self._last_used = 0.0
         gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         log_gpu_memory("models unloaded")
         logger.info("Models unloaded")
 
@@ -188,6 +194,12 @@ class ModelState:
             logger.info("Unloading embedding session (VRAM)")
             self.embedding_session = None
         gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         log_gpu_memory("embedding unloaded")
 
 
