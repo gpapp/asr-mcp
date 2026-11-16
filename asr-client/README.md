@@ -76,24 +76,20 @@ established; the text was kept). Re-run if you need clean labels.
 
 ## Notes
 
-### Upload size and the proxy
+### Conversion and upload
 
-The server accepts audio up to **200 MB**, and the reverse proxy in front of it
-enforces the same limit. The proxy refuses an oversized body **before the
-application ever sees it**, so a too-large upload produces an nginx HTML error
-page rather than a JSON message from the server. The client recognises that
-specifically and says so instead of printing markup.
+Every inbound file is **converted locally to 16 kHz mono FLAC** before upload
+and **streamed** to the server. This produces a compact, processable audio file
+regardless of the original container or size, and the temporary converted file
+is removed afterwards — no `.flac` artifacts are left behind next to your
+sources. Conversion requires `ffmpeg` on `PATH`, beside the script, or in
+`C:\Program Files\ffmpeg\bin`.
 
-To keep large files off the wire, the client **transcodes before uploading**:
-any video container (`.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.m4v`), and any
-file over 24 MB, is converted to 16 kHz mono FLAC — exactly what the server
-would extract anyway, so nothing is lost — and the result is saved next to the
-original as `<name>.16k.flac` so you can see what was sent. This needs
-`ffmpeg` on `PATH`, beside the script, or in `C:\Program Files\ffmpeg\bin`.
-
-Audio that already fits the limit is uploaded untouched, even when it is large.
-Use `--no-convert` to disable all conversion; a file still over the limit then
-fails immediately with its actual size instead of at the proxy.
+The server and reverse proxy may still enforce a maximum request size. Because
+all uploads are converted to 16 kHz mono FLAC first, most recordings fit well
+within typical limits; if a proxy refuses a very long upload before the
+application sees it, the client reports that clearly instead of printing the
+proxy's HTML error page.
 
 ### One transcription at a time
 

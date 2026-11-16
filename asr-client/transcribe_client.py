@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import os
 import shutil
@@ -17,20 +18,12 @@ ENV_PATH = SCRIPT_DIR / ".env"
 
 SUPPORTED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm", ".opus", ".mkv", ".mp4"}
 
-#: Containers that usually carry a video track. Only the audio is transcribed,
-#: so these are converted locally before upload (see prepare_upload()).
-VIDEO_CONTAINERS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
-
-#: The reverse proxy rejects bodies larger than this with an HTML 413 page
-#: before the request reaches the server, so the client can never see the
-#: server's own (identical) JSON limit.  Matches nginx `client_max_body_size`
-#: in nginx_snippet.conf.
-PROXY_MAX_UPLOAD_BYTES = 200 * 1024 * 1024
-
-#: Above this, transcode to 16 kHz mono FLAC even when the source is already
-#: audio-only — that is what the server converts to anyway, and it usually
-#: shrinks a file several-fold. Below it, upload the original untouched.
-TRANSCODE_ABOVE_BYTES = 24 * 1024 * 1024
+#: All inbound files are converted to 16 kHz mono FLAC before upload so the
+#: server receives a compact, processable format regardless of the original
+#: size or container. The converted file is temporary and is never left behind.
+CONVERT_SAMPLE_RATE = "16000"
+CONVERT_CHANNELS = "1"
+CONVERT_CODEC = "flac"
 
 #: How long to wait for a running job to finish before giving up, and how often
 #: to re-check. The server runs one transcription at a time.
@@ -45,7 +38,6 @@ USAGE = """Usage:
   transcribe <audio file> [more files...]   Transcribe files (writes <name>.txt next to each)
                                             Optional: --language <code|auto> (overrides .env LANGUAGE)
                                             Optional: --json (also write <name>.json with raw segments)
-                                            Optional: --no-convert (upload the original, never transcode)
                                             Optional: --no-wait (fail instead of waiting for a busy server)
   status                                    Check server/token connectivity
   voiceprints                               List speakers and voiceprints
@@ -54,9 +46,9 @@ USAGE = """Usage:
                                               snippets from this same file)
   voiceprint-refine <name>                  Rebuild a voiceprint from its snippets
 
-Video containers (.mp4/.mkv/.webm/...) and large files are converted to 16 kHz mono
-FLAC locally, so the transcript is identical but far less is uploaded. The converted
-file is kept next to the original so you can see what was sent.
+All inbound files are converted locally to 16 kHz mono FLAC (processable audio)
+before upload and streamed to the server; the temporary converted file is removed
+afterwards and never left behind.
 
 If the server is already transcribing something, this waits for it to finish
 (override with --no-wait). The server accepts one transcription at a time.
@@ -154,10 +146,9 @@ def _describe_http_error(code: int, body: str, headers=None) -> str:
     if detail is None and (code in (413, 414) or "Request Entity Too Large" in body):
         return (
             f"HTTP {code}: the reverse proxy rejected the upload before it reached "
-            f"the server (proxy limit is {PROXY_MAX_UPLOAD_BYTES // (1024 * 1024)} MB). "
-            "Video files are usually the cause — the client strips the video track with "
-            "ffmpeg and transcodes to 16 kHz mono FLAC before uploading, which usually "
-            "shrinks such a file several-fold; pass --no-convert to disable that."
+            "the server. The client converts all inbound files to 16 kHz mono FLAC "
+            "before upload to keep them small; if this still occurs, the file is too "
+            "long for the server/proxy limit."
         )
 
     # --- a 409 carries the running job, which is the actionable part --------
@@ -220,19 +211,98 @@ def request_json(method, url, *, data=None, headers=None, timeout=60):
     return resp.status, parsed
 
 
-def encode_multipart(file_field, file_path: Path, fields=None):
-    boundary = "asrclient7f3a9c2e" + format(abs(hash((str(file_path), file_path.stat().st_size))), "x")
-    body = bytearray()
-    for name, value in (fields or {}).items():
-        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
-                 f"{value}\r\n").encode("utf-8")
-    body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; "
-             f"filename=\"{file_path.name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-             ).encode("utf-8")
-    body += file_path.read_bytes()
-    body += b"\r\n"
-    body += f"--{boundary}--\r\n".encode("utf-8")
-    return bytes(body), f"multipart/form-data; boundary={boundary}"
+class _MultipartStream:
+    """Readable multipart/form-data body that streams the file content.
+
+    Implements __len__ so urllib can set Content-Length, and read() so the
+    file payload is read in chunks instead of buffering the whole upload.
+    """
+
+    def __init__(self, file_field, file_path: Path, fields=None, upload_name=None):
+        self._path = Path(file_path)
+        self._boundary = "asrclient7f3a9c2e" + format(
+            abs(hash((str(self._path), self._path.stat().st_size))), "x")
+        name = upload_name or self._path.name
+        head = bytearray()
+        for fname, value in (fields or {}).items():
+            head += (f"--{self._boundary}\r\n"
+                     f"Content-Disposition: form-data; name=\"{fname}\"\r\n\r\n"
+                     f"{value}\r\n").encode("utf-8")
+        head += (f"--{self._boundary}\r\n"
+                 f"Content-Disposition: form-data; name=\"{file_field}\"; "
+                 f"filename=\"{name}\"\r\n"
+                 "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+        self._head = bytes(head)
+        self._tail = f"\r\n--{self._boundary}--\r\n".encode("utf-8")
+        self._file_size = self._path.stat().st_size
+        self._length = len(self._head) + self._file_size + len(self._tail)
+        self._pos = 0
+        self._fh = None
+
+    @property
+    def content_type(self):
+        return f"multipart/form-data; boundary={self._boundary}"
+
+    def __len__(self):
+        return self._length
+
+    def _ensure_open(self):
+        if self._fh is None:
+            self._fh = open(self._path, "rb")
+
+    def read(self, size=-1):
+        if self._pos >= self._length:
+            return b""
+        if size is None or size < 0:
+            size = self._length - self._pos
+        out = bytearray()
+        while len(out) < size and self._pos < self._length:
+            want = size - len(out)
+            if self._pos < len(self._head):
+                take = self._head[self._pos:self._pos + want]
+                out += take
+                self._pos += len(take)
+                continue
+            file_end = len(self._head) + self._file_size
+            if self._pos < file_end:
+                self._ensure_open()
+                chunk = self._fh.read(min(want, file_end - self._pos))
+                if not chunk:
+                    # Should not happen if size/pos are consistent; advance to tail.
+                    self._pos = file_end
+                    continue
+                out += chunk
+                self._pos += len(chunk)
+                continue
+            tail_off = self._pos - file_end
+            take = self._tail[tail_off:tail_off + want]
+            out += take
+            self._pos += len(take)
+        if self._pos >= self._length and self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+        return bytes(out)
+
+    def close(self):
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+
+def encode_multipart(file_field, file_path: Path, fields=None, upload_name=None):
+    """Return a streaming multipart body and its Content-Type.
+
+    The body is streamed from disk in chunks (see _MultipartStream) so large
+    uploads do not need to be buffered in memory.
+    """
+    stream = _MultipartStream(file_field, file_path, fields=fields, upload_name=upload_name)
+    return stream, stream.content_type
 
 
 def _fmt_secs(sec):
@@ -488,76 +558,58 @@ def probe_has_video(path: Path) -> bool:
     return False
 
 
-def convert_to_audio(path: Path, dest: Path | None = None) -> Path:
-    """Transcode to 16 kHz mono FLAC — the format the server wants anyway.
+def convert_to_audio(path: Path) -> Path:
+    """Transcode an inbound file to a temporary 16 kHz mono FLAC.
 
-    This is what keeps large video files off the wire: the server extracts and
-    resamples to 16 kHz mono itself, so converting here is lossless with
-    respect to what it will actually decode, and typically shrinks a file
-    several-fold. Raises ClientError with an actionable message.
+    All inbound files are converted so the upload is compact and in a format
+    the server can process. The returned path is in a temporary location and
+    MUST be removed by the caller when no longer needed.
     """
     exe = find_ffmpeg()
     if not exe:
         raise ClientError(
             f"'{path.name}' needs converting but ffmpeg was not found. Install it "
             "(https://www.gyan.dev/ffmpeg/builds/, then put ffmpeg.exe beside this "
-            "script or on PATH), or pass --no-convert to upload the original."
+            "script or on PATH)."
         )
-    if dest is None:
-        dest = path.with_name(f"{path.stem}.16k.flac")
+    fd, tmp_name = tempfile.mkstemp(prefix="asr-upload-", suffix=".flac")
+    os.close(fd)
+    dest = Path(tmp_name)
     cmd = [exe, "-v", "error", "-y", "-i", str(path), "-vn",
-           "-ac", "1", "-ar", "16000", "-c:a", "flac", str(dest)]
+           "-ac", CONVERT_CHANNELS, "-ar", CONVERT_SAMPLE_RATE, "-c:a", CONVERT_CODEC, str(dest)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     except subprocess.TimeoutExpired:
+        try:
+            dest.unlink(missing_ok=True)
+        except Exception:
+            pass
         raise ClientError(f"Converting '{path.name}' timed out") from None
     if proc.returncode != 0 or not dest.is_file():
         tail = (proc.stderr or "").strip().splitlines()
+        try:
+            dest.unlink(missing_ok=True)
+        except Exception:
+            pass
         raise ClientError(
             f"Could not convert '{path.name}': {tail[-1] if tail else 'ffmpeg failed'}"
         )
     return dest
 
 
-def prepare_upload(path: Path, convert: bool = True) -> Path:
-    """Return the file to actually upload.
+def prepare_upload(path: Path) -> tuple[Path, Path | None]:
+    """Convert an inbound file to a temporary processable upload.
 
-    Converts when the container holds video, or when the file is large enough
-    that the transcoded form is clearly worth making. A file that is already
-    small audio is uploaded untouched so the common case stays fast.
+    Returns (upload_path, cleanup_path). cleanup_path is the temporary
+    converted file that must be deleted after use, or None if no temporary
+    file was created.
     """
-    size = path.stat().st_size
-    ext = path.suffix.lower()
-    needs = ext in VIDEO_CONTAINERS or size > TRANSCODE_ABOVE_BYTES
-    if not convert or not needs:
-        if size > PROXY_MAX_UPLOAD_BYTES:
-            # Nothing we can do automatically; say so precisely.
-            raise ClientError(
-                f"'{path.name}' is {size / (1024 * 1024):.0f} MB, over the "
-                f"{PROXY_MAX_UPLOAD_BYTES // (1024 * 1024)} MB proxy limit, and "
-                "--no-convert prevents the client from shrinking it."
-            )
-        return path
-
-    if size <= PROXY_MAX_UPLOAD_BYTES and ext not in VIDEO_CONTAINERS:
-        # Already fits; converting a big audio file is not worth the wait.
-        return path
-
-    if ext in VIDEO_CONTAINERS and not probe_has_video(path):
-        # A mislabelled container: treat it as plain audio if it fits.
-        if size <= PROXY_MAX_UPLOAD_BYTES:
-            return path
-
+    before = path.stat().st_size
     dest = convert_to_audio(path)
-    before, after = size, dest.stat().st_size
-    print(f"  converted for upload: {before / (1024 * 1024):.0f} MB -> "
-          f"{after / (1024 * 1024):.0f} MB ({dest.name})")
-    if after >= PROXY_MAX_UPLOAD_BYTES:
-        raise ClientError(
-            f"'{path.name}' is still {after / (1024 * 1024):.0f} MB after stripping the "
-            f"video, over the {PROXY_MAX_UPLOAD_BYTES // (1024 * 1024)} MB proxy limit."
-        )
-    return dest
+    after = dest.stat().st_size
+    print(f"  converted for upload: {before / (1024 * 1024):.1f} MB -> "
+          f"{after / (1024 * 1024):.1f} MB (16 kHz mono FLAC)")
+    return dest, dest
 
 
 def wait_for_idle(base, token, *, timeout=JOB_WAIT_TIMEOUT_SEC):
@@ -622,83 +674,98 @@ def wait_for_idle(base, token, *, timeout=JOB_WAIT_TIMEOUT_SEC):
             resp.close()
 
 
+def _post_upload(base, token, url, upload_path: Path, upload_name: str):
+    body, ctype = encode_multipart("file", upload_path, upload_name=upload_name)
+    try:
+        return open_request("POST", url, data=body,
+                            headers={"X-API-Key": token, "Content-Type": ctype},
+                            timeout=None)
+    finally:
+        try:
+            body.close()
+        except Exception:
+            pass
+
+
 def transcribe_file(base, token, path: Path, language: str = "auto", *,
-                    convert: bool = True, wait: bool = True):
+                    wait: bool = True):
     label = path.name
     if path.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
         raise ClientError(f"Unsupported file type '{path.suffix}' ({label})")
     if not path.is_file():
         raise ClientError(f"File not found: {path}")
 
-    upload_path = prepare_upload(path, convert=convert)
+    upload_path, cleanup_path = prepare_upload(path)
 
     url = (f"{base}/api/asr/transcribe/upload?save=false"
            f"&language={urllib.parse.quote(language or 'auto')}")
-    body, ctype = encode_multipart("file", upload_path)
+    upload_name = path.stem + ".flac"
     try:
-        resp = open_request("POST", url, data=body,
-                            headers={"X-API-Key": token, "Content-Type": ctype},
-                            timeout=None)
-    except ClientError as e:
-        # A 409 means another transcription owns the server; wait for it and
-        # retry once rather than losing the file.
-        if wait and "HTTP 409" in str(e):
-            print(f"  server is busy; {e}", file=sys.stderr)
-            wait_for_idle(base, token)
-            body, ctype = encode_multipart("file", upload_path)
-            resp = open_request("POST", url, data=body,
-                                headers={"X-API-Key": token, "Content-Type": ctype},
-                                timeout=None)
-        else:
-            raise
+        try:
+            resp = _post_upload(base, token, url, upload_path, upload_name)
+        except ClientError as e:
+            # A 409 means another transcription owns the server; wait for it and
+            # retry once rather than losing the file.
+            if wait and "HTTP 409" in str(e):
+                print(f"  server is busy; {e}", file=sys.stderr)
+                wait_for_idle(base, token)
+                resp = _post_upload(base, token, url, upload_path, upload_name)
+            else:
+                raise
 
-    content_type = resp.headers.get("Content-Type", "")
-    if "text/event-stream" not in content_type:
-        raw = resp.read(2048).decode("utf-8", "replace")
-        raise ClientError(f"Unexpected server response: {raw[:300]}")
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/event-stream" not in content_type:
+            raw = resp.read(2048).decode("utf-8", "replace")
+            raise ClientError(f"Unexpected server response: {raw[:300]}")
 
-    result = None
-    error = None
-    done_evt = None
-    pending_profiles = []
-    try:
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload:
-                continue
-            try:
-                evt = json.loads(payload)
-            except ValueError:
-                continue
-            stage = evt.get("stage")
-            # Learned speakers arrive on diarization_complete, BEFORE done --
-            # that is the only stream that carries them, so remember them.
-            if evt.get("pending_profiles"):
-                pending_profiles.extend(evt["pending_profiles"])
-            if stage == "error":
-                error = evt.get("error") or "unknown server error"
-                break
-            if stage == "cancelled":
-                error = evt.get("message") or "Cancelled from the web UI"
-                break
-            if stage == "done":
-                result = evt.get("result") or {}
-                done_evt = evt
-                render_progress(label, {"stage": "done", "progress": 1.0})
-                break
-            render_progress(label, evt)
-    except (OSError, http.client.HTTPException) as e:
-        raise ClientError(
-            "Connection lost while waiting for the result — the server keeps "
-            "processing; the transcript will be saved and can be downloaded "
-            "from the web UI (Transcription history)"
-        ) from e
+        result = None
+        error = None
+        done_evt = None
+        pending_profiles = []
+        try:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                try:
+                    evt = json.loads(payload)
+                except ValueError:
+                    continue
+                stage = evt.get("stage")
+                # Learned speakers arrive on diarization_complete, BEFORE done --
+                # that is the only stream that carries them, so remember them.
+                if evt.get("pending_profiles"):
+                    pending_profiles.extend(evt["pending_profiles"])
+                if stage == "error":
+                    error = evt.get("error") or "unknown server error"
+                    break
+                if stage == "cancelled":
+                    error = evt.get("message") or "Cancelled from the web UI"
+                    break
+                if stage == "done":
+                    result = evt.get("result") or {}
+                    done_evt = evt
+                    render_progress(label, {"stage": "done", "progress": 1.0})
+                    break
+                render_progress(label, evt)
+        except (OSError, http.client.HTTPException) as e:
+            raise ClientError(
+                "Connection lost while waiting for the result — the server keeps "
+                "processing; the transcript will be saved and can be downloaded "
+                "from the web UI (Transcription history)"
+            ) from e
+        finally:
+            finish_progress_line()
+            resp.close()
     finally:
-        finish_progress_line()
-        resp.close()
+        if cleanup_path is not None:
+            try:
+                cleanup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     if error:
         raise ClientError(str(error))
@@ -791,11 +858,23 @@ def cmd_voiceprint_add(name, file_path: Path, start, end):
         if end is not None:
             query += f"&end_sec={end}"
     quoted = urllib.parse.quote(name, safe="")
-    body, ctype = encode_multipart("file", file_path)
-    status, data = request_json(
-        "POST", f"{base}/api/voiceprint/speakers/{quoted}/upload{query}",
-        data=body, headers={"X-API-Key": token, "Content-Type": ctype},
-    )
+    upload_path, cleanup_path = prepare_upload(file_path)
+    body, ctype = encode_multipart("file", upload_path, upload_name=file_path.stem + ".flac")
+    try:
+        status, data = request_json(
+            "POST", f"{base}/api/voiceprint/speakers/{quoted}/upload{query}",
+            data=body, headers={"X-API-Key": token, "Content-Type": ctype},
+        )
+    finally:
+        try:
+            body.close()
+        except Exception:
+            pass
+        if cleanup_path is not None:
+            try:
+                cleanup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
     if status != 200 or data.get("error"):
         raise ClientError(f"Snippet upload failed: {data.get('error') or data}")
     print(f"Added snippet: {data.get('duration_sec', '?')}s ({data.get('file_path', '')})")
@@ -845,8 +924,10 @@ def cmd_transcribe(paths):
     if "--json" in args:
         _JSON_SIDECAR = True
         args = [a for a in args if a != "--json"]
-    convert = "--no-convert" not in args
-    args = [a for a in args if a != "--no-convert"]
+    if "--no-convert" in args:
+        print("  note: --no-convert ignored; all inbound files are converted to 16 kHz mono FLAC before upload",
+              file=sys.stderr)
+        args = [a for a in args if a != "--no-convert"]
     wait = "--no-wait" not in args
     args = [a for a in args if a != "--no-wait"]
     if not args:
@@ -860,7 +941,7 @@ def cmd_transcribe(paths):
         print(f"Transcribing {path.name} (language={language}) ...")
         try:
             written, status = transcribe_file(base, token, path, language=language,
-                                              convert=convert, wait=wait)
+                                              wait=wait)
             for p in written:
                 print(f"  saved {p}")
             if status != "ok":

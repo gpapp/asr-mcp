@@ -1334,16 +1334,22 @@ class LiveSession:
         fields = {"items": json.dumps(items, ensure_ascii=False)}
         try:
             body, ctype = encode_multipart("file", audio, fields=fields)
-            resp = request_json(
-                "POST",
-                f"{self.base}/api/asr/attribution/upload",
-                data=body,
-                headers={
-                    "X-API-Key": self.token,
-                    "Content-Type": ctype,
-                },
-                timeout=3600,
-            )
+            try:
+                resp = request_json(
+                    "POST",
+                    f"{self.base}/api/asr/attribution/upload",
+                    data=body,
+                    headers={
+                        "X-API-Key": self.token,
+                        "Content-Type": ctype,
+                    },
+                    timeout=3600,
+                )
+            finally:
+                try:
+                    body.close()
+                except Exception:
+                    pass
             # request_json returns (status, parsed) -- returning the tuple
             # straight through made final_result() die with
             # "'tuple' object has no attribute 'get'" and lose the .txt and
