@@ -18,12 +18,14 @@ ENV_PATH = SCRIPT_DIR / ".env"
 
 SUPPORTED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".webm", ".opus", ".mkv", ".mp4"}
 
-#: All inbound files are converted to 16 kHz mono FLAC before upload so the
-#: server receives a compact, processable format regardless of the original
-#: size or container. The converted file is temporary and is never left behind.
+#: All inbound files are converted to 16 kHz mono Opus (speech-optimized, lossy)
+#: before upload so the server receives a compact, processable format regardless
+#: of the original size or container. The converted file is temporary and is
+#: never left behind.
 CONVERT_SAMPLE_RATE = "16000"
 CONVERT_CHANNELS = "1"
-CONVERT_CODEC = "flac"
+CONVERT_SUFFIX = ".ogg"
+CONVERT_CODEC_ARGS = ["-c:a", "libopus", "-b:a", "24k", "-application", "voip", "-vbr", "on"]
 
 #: How long to wait for a running job to finish before giving up, and how often
 #: to re-check. The server runs one transcription at a time.
@@ -46,7 +48,7 @@ USAGE = """Usage:
                                               snippets from this same file)
   voiceprint-refine <name>                  Rebuild a voiceprint from its snippets
 
-All inbound files are converted locally to 16 kHz mono FLAC (processable audio)
+All inbound files are converted locally to 16 kHz mono Opus (processable audio)
 before upload and streamed to the server; the temporary converted file is removed
 afterwards and never left behind.
 
@@ -146,7 +148,7 @@ def _describe_http_error(code: int, body: str, headers=None) -> str:
     if detail is None and (code in (413, 414) or "Request Entity Too Large" in body):
         return (
             f"HTTP {code}: the reverse proxy rejected the upload before it reached "
-            "the server. The client converts all inbound files to 16 kHz mono FLAC "
+            "the server. The client converts all inbound files to 16 kHz mono Opus "
             "before upload to keep them small; if this still occurs, the file is too "
             "long for the server/proxy limit."
         )
@@ -559,7 +561,7 @@ def probe_has_video(path: Path) -> bool:
 
 
 def convert_to_audio(path: Path) -> Path:
-    """Transcode an inbound file to a temporary 16 kHz mono FLAC.
+    """Transcode an inbound file to a temporary 16 kHz mono Opus file.
 
     All inbound files are converted so the upload is compact and in a format
     the server can process. The returned path is in a temporary location and
@@ -572,11 +574,12 @@ def convert_to_audio(path: Path) -> Path:
             "(https://www.gyan.dev/ffmpeg/builds/, then put ffmpeg.exe beside this "
             "script or on PATH)."
         )
-    fd, tmp_name = tempfile.mkstemp(prefix="asr-upload-", suffix=".flac")
+    fd, tmp_name = tempfile.mkstemp(prefix="asr-upload-", suffix=CONVERT_SUFFIX)
     os.close(fd)
     dest = Path(tmp_name)
     cmd = [exe, "-v", "error", "-y", "-i", str(path), "-vn",
-           "-ac", CONVERT_CHANNELS, "-ar", CONVERT_SAMPLE_RATE, "-c:a", CONVERT_CODEC, str(dest)]
+           "-ac", CONVERT_CHANNELS, "-ar", CONVERT_SAMPLE_RATE,
+           *CONVERT_CODEC_ARGS, str(dest)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     except subprocess.TimeoutExpired:
@@ -608,7 +611,7 @@ def prepare_upload(path: Path) -> tuple[Path, Path | None]:
     dest = convert_to_audio(path)
     after = dest.stat().st_size
     print(f"  converted for upload: {before / (1024 * 1024):.1f} MB -> "
-          f"{after / (1024 * 1024):.1f} MB (16 kHz mono FLAC)")
+          f"{after / (1024 * 1024):.1f} MB (16 kHz mono Opus)")
     return dest, dest
 
 
@@ -699,7 +702,7 @@ def transcribe_file(base, token, path: Path, language: str = "auto", *,
 
     url = (f"{base}/api/asr/transcribe/upload?save=false"
            f"&language={urllib.parse.quote(language or 'auto')}")
-    upload_name = path.stem + ".flac"
+    upload_name = path.stem + CONVERT_SUFFIX
     try:
         try:
             resp = _post_upload(base, token, url, upload_path, upload_name)
@@ -859,7 +862,7 @@ def cmd_voiceprint_add(name, file_path: Path, start, end):
             query += f"&end_sec={end}"
     quoted = urllib.parse.quote(name, safe="")
     upload_path, cleanup_path = prepare_upload(file_path)
-    body, ctype = encode_multipart("file", upload_path, upload_name=file_path.stem + ".flac")
+    body, ctype = encode_multipart("file", upload_path, upload_name=file_path.stem + CONVERT_SUFFIX)
     try:
         status, data = request_json(
             "POST", f"{base}/api/voiceprint/speakers/{quoted}/upload{query}",
@@ -925,7 +928,7 @@ def cmd_transcribe(paths):
         _JSON_SIDECAR = True
         args = [a for a in args if a != "--json"]
     if "--no-convert" in args:
-        print("  note: --no-convert ignored; all inbound files are converted to 16 kHz mono FLAC before upload",
+        print("  note: --no-convert ignored; all inbound files are converted to 16 kHz mono Opus before upload",
               file=sys.stderr)
         args = [a for a in args if a != "--no-convert"]
     wait = "--no-wait" not in args

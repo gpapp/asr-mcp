@@ -78,18 +78,18 @@ established; the text was kept). Re-run if you need clean labels.
 
 ### Conversion and upload
 
-Every inbound file is **converted locally to 16 kHz mono FLAC** before upload
-and **streamed** to the server. This produces a compact, processable audio file
-regardless of the original container or size, and the temporary converted file
-is removed afterwards — no `.flac` artifacts are left behind next to your
-sources. Conversion requires `ffmpeg` on `PATH`, beside the script, or in
-`C:\Program Files\ffmpeg\bin`.
+Every inbound file is **converted locally to 16 kHz mono Opus** (speech-optimized,
+24 kbps) before upload and **streamed** to the server. This produces a compact,
+processable audio file regardless of the original container or size, and the
+temporary converted file is removed afterwards — no converted artifacts are left
+behind next to your sources. Conversion requires `ffmpeg` (with `libopus`) on
+`PATH`, beside the script, or in `C:\Program Files\ffmpeg\bin`.
 
 The server and reverse proxy may still enforce a maximum request size. Because
-all uploads are converted to 16 kHz mono FLAC first, most recordings fit well
-within typical limits; if a proxy refuses a very long upload before the
-application sees it, the client reports that clearly instead of printing the
-proxy's HTML error page.
+all uploads are converted to 16 kHz mono Opus first, recordings are typically a
+small fraction of their original size; if a proxy refuses a very long upload
+before the application sees it, the client reports that clearly instead of
+printing the proxy's HTML error page.
 
 ### One transcription at a time
 
