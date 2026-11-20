@@ -1886,6 +1886,7 @@ async def _attribute_items_against_audio(
                 "start": round(float(it["start"]), 3),
                 "end": round(float(it["end"]), 3),
                 "text": (it.get("text") or "").strip(),
+                "confidence": float(it.get("confidence") or 0.0),
             } for it in run["items"]],
         ))
     results = _merge_consecutive_same_speaker_results(results)

@@ -70,8 +70,22 @@ def _as_dict(msg: dict) -> dict:
     return msg
 
 
+def _turn_confidence(result: dict) -> float:
+    """Mean per-segment ASR confidence of a live turn (0.0 when none)."""
+    vals = []
+    for seg in (result.get("segments") or []):
+        if isinstance(seg, dict):
+            v = seg.get("confidence")
+        else:
+            v = getattr(seg, "confidence", None)
+        if v is not None:
+            vals.append(float(v))
+    return sum(vals) / len(vals) if vals else 0.0
+
+
 def _turn_message(turn: Turn, text: str, inference_sec: float, tokens: int,
-                  attribution: Optional[dict] = None) -> dict:
+                  attribution: Optional[dict] = None,
+                  confidence: float = 0.0) -> dict:
     msg = {
         "type": "transcript",
         "speaker": None,
@@ -83,6 +97,7 @@ def _turn_message(turn: Turn, text: str, inference_sec: float, tokens: int,
         "end_reason": turn.reason,
         "inference_time_sec": round(inference_sec, 3),
         "tokens_generated": tokens,
+        "confidence": round(float(confidence or 0.0), 3),
     }
     if attribution:
         msg.update(attribution)
@@ -418,6 +433,7 @@ async def handle_ws_stream(websocket: WebSocket, language: str = "auto",
             result.get("inference_time_sec", 0.0),
             result.get("tokens_generated", 0),
             attribution=attribution,
+            confidence=_turn_confidence(result),
         )
         msg["channel"] = int(channel)
         if trimmed_sec > 0:

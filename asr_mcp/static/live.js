@@ -769,6 +769,7 @@ class Session {
                 speaker_source: msg.speaker_source,
                 uncertain: !!msg.uncertain,
                 attribution_reason: msg.attribution_reason,
+                confidence: typeof msg.confidence === 'number' ? msg.confidence : 0,
             });
             this.transcriptCount += 1;
             this.opts.onTranscript(msg);
@@ -1076,7 +1077,11 @@ class Session {
     async reattribute() {
         const items = this.items
             .filter((it) => (it.text || '').trim())
-            .map((it) => ({ start: it.start, end: it.end, text: it.text }));
+            .map((it) => ({
+                start: it.start, end: it.end, text: it.text,
+                ...(typeof it.confidence === 'number' && it.confidence > 0
+                    ? { confidence: it.confidence } : {}),
+            }));
         if (!items.length) return null;
 
         const form = new FormData();
@@ -1191,7 +1196,12 @@ class UI {
         text.textContent = (msg.text || '').trim();
         block.appendChild(head);
         block.appendChild(text);
-        pane.appendChild(block);
+        // Keep the pane sorted by start: insert before the first block that
+        // starts later (blocks without a start go to the end).
+        block._start = typeof msg.start === 'number' ? msg.start : Infinity;
+        const ref = Array.from(pane.children).find(
+            (el) => typeof el._start === 'number' && el._start > block._start) || null;
+        pane.insertBefore(block, ref);
         // Autoscroll only when already at the bottom, so reading back is not
         // yanked away by each new line.
         const near = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
