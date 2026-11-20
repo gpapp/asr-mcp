@@ -316,7 +316,23 @@ def _fmt_secs(sec):
     return f"{minutes}:{seconds:02d}"
 
 
+_TERMINAL_WIDTH_TTL_SEC = 2.0
+_PROGRESS_FLUSH_MIN_SEC = 0.25
+_progress_width_cache = (0.0, 0)
+_progress_last_flush = 0.0
+
+
+def _terminal_width():
+    """Terminal columns, cached — the tty rarely changes, progress fires per event."""
+    global _progress_width_cache
+    now = time.monotonic()
+    if now - _progress_width_cache[0] > _TERMINAL_WIDTH_TTL_SEC:
+        _progress_width_cache = (now, shutil.get_terminal_size((120, 24)).columns)
+    return _progress_width_cache[1]
+
+
 def render_progress(label, evt):
+    global _progress_last_flush
     parts = [label]
     stage = evt.get("stage")
     if stage:
@@ -329,14 +345,19 @@ def render_progress(label, evt):
     if evt.get("predicted_remaining_sec") is not None:
         parts.append(f"~{_fmt_secs(evt['predicted_remaining_sec'])} left")
     line = " | ".join(parts)
-    width = shutil.get_terminal_size((120, 24)).columns
+    width = _terminal_width()
     sys.stdout.write("\r" + line[: width - 1].ljust(max(width - 1, 1)))
-    sys.stdout.flush()
+    now = time.monotonic()
+    if now - _progress_last_flush >= _PROGRESS_FLUSH_MIN_SEC:
+        sys.stdout.flush()
+        _progress_last_flush = now
 
 
 def finish_progress_line():
+    global _progress_last_flush
     sys.stdout.write("\n")
     sys.stdout.flush()
+    _progress_last_flush = time.monotonic()
 
 
 def _fmt_hms(sec):
@@ -615,6 +636,27 @@ def prepare_upload(path: Path) -> tuple[Path, Path | None]:
     return dest, dest
 
 
+def _sse_data_events(resp):
+    """Yield parsed event dicts from an SSE stream; skip non-data lines.
+
+    The common lines in these streams are keep-alive comments and blanks; they
+    are skipped at the byte level, before paying for a str decode.
+    """
+    for raw_line in resp:
+        line = raw_line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            evt = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(evt, dict):
+            yield evt
+
+
 def wait_for_idle(base, token, *, timeout=JOB_WAIT_TIMEOUT_SEC):
     """Block until the server has no transcription running.
 
@@ -634,19 +676,7 @@ def wait_for_idle(base, token, *, timeout=JOB_WAIT_TIMEOUT_SEC):
     resp = None
     try:
         resp = open_request("GET", url, headers={"X-API-Key": token}, timeout=None)
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", "replace").strip()
-            if line.startswith(":"):
-                continue  # keep-alive
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload:
-                continue
-            try:
-                evt = json.loads(payload)
-            except ValueError:
-                continue
+        for evt in _sse_data_events(resp):
             if not evt.get("active"):
                 return
             if not announced:
@@ -726,17 +756,7 @@ def transcribe_file(base, token, path: Path, language: str = "auto", *,
         done_evt = None
         pending_profiles = []
         try:
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if not payload:
-                    continue
-                try:
-                    evt = json.loads(payload)
-                except ValueError:
-                    continue
+            for evt in _sse_data_events(resp):
                 stage = evt.get("stage")
                 # Learned speakers arrive on diarization_complete, BEFORE done --
                 # that is the only stream that carries them, so remember them.
